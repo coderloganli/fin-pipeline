@@ -11,6 +11,3 @@ target/
 dbt_packages/
 logs/
 .DS_Store
-
-# Design document is local only, never committed
-产品文档.md
