@@ -15,9 +15,10 @@ entries it relied on. The hard problems here are time semantics — point-in-tim
 correctness, slowly changing dimensions, late-arriving corrections, idempotent
 replay — not volume.
 
-**Status: skeleton.** The directories exist and each carries a README stating what
-that layer is and is not responsible for, but no module has landed yet. Read the
-READMEs for intent; read this file for what is actually true today.
+**Status: early.** `generator/` has landed. The other directories exist and each
+carries a README stating what that layer is and is not responsible for, but no module
+has landed in them. Read the READMEs for intent; read this file for what is actually
+true today.
 
 ## Shape
 
@@ -29,7 +30,7 @@ generator ──▶ raw (Parquet) ──▶ staging (Parquet, PySpark) ──▶
 
 | Directory | Responsibility |
 |---|---|
-| `generator/` | Synthetic ledger data, with a switch for every failure mode the tests need |
+| `generator/` | Synthetic ledger data, with a switch for every failure mode the tests need. Writes CSV to `data/source/`, reproducible from a seed |
 | `ingest/` | Contract validation, watermarked incremental merge, run records |
 | `transform/spark/` | SCD2 loading, the point-in-time join, monthly aggregation |
 | `transform/dbt/` | Relational models, tests, lineage |
@@ -67,6 +68,14 @@ nobody yet. The task that first needs one of them is the task that makes it inst
 test reports success, and a green CI run that verified nothing defeats the point of
 having gates at all. The failure message names the command that starts the
 containers.
+
+**Test data is generated, never committed.** `generator/` writes the five source
+tables to `data/source/`, which is ignored — `raw/` is the layer that exists after
+ingest, and the two names are not interchangeable. The same seed gives byte-identical
+files, so a scenario test can plant a failure and assert on it. Each failure mode
+draws from its own random stream, so switching one on leaves the data belonging to the
+others where it was. Anomalies are constructed, never found by scanning: rows are
+streamed and forgotten, so nothing that requires holding them is possible.
 
 **Everything in this repository is written in English** — code, comments, commit
 messages, identifiers, configuration, and documents.
