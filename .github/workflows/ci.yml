@@ -8,10 +8,36 @@ on:
 jobs:
   test:
     runs-on: ubuntu-latest
+
+    services:
+      # The suite runs against a real database. A test that skipped when Postgres
+      # was missing would report success having verified nothing.
+      postgres:
+        image: postgres:18
+        env:
+          POSTGRES_DB: fin_pipeline
+          POSTGRES_USER: fin_pipeline
+          POSTGRES_PASSWORD: fin_pipeline
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U fin_pipeline -d fin_pipeline"
+          --health-interval 2s
+          --health-timeout 3s
+          --health-retries 15
+
+    env:
+      POSTGRES_HOST: 127.0.0.1
+      POSTGRES_PORT: 5432
+      POSTGRES_DB: fin_pipeline
+      POSTGRES_USER: fin_pipeline
+      POSTGRES_PASSWORD: fin_pipeline
+
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
         with:
-          python-version: '3.11'
-      - run: pip install pytest
+          # A test asserts this agrees with requires-python in pyproject.toml.
+          python-version: '3.13'
+      - run: pip install -e ".[dev]"
       - run: pytest -q

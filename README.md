@@ -56,6 +56,34 @@ tests/        pytest suites
 docs/         architecture decision records
 ```
 
+## Running it locally
+
+Requires Docker and Python 3.13.
+
+```
+docker compose up -d          # Postgres, on 127.0.0.1:5432
+pip install -e ".[dev]"
+pytest -q
+```
+
+Connection settings come from the environment. The defaults in `.env.example`
+match what `compose.yaml` starts, so nothing needs setting to run the suite; copy
+it to `.env` only if you want different values. A test asserts the two agree.
+
+Tests that need the database are marked `db` and **fail rather than skip** when it
+is absent — a skipped test reports success, and a CI run that verified nothing
+would come back green. The failure message names the command that starts it. To
+work without the containers running:
+
+```
+pytest -m "not db" -q
+```
+
+The heavy dependencies — PySpark, dbt, scikit-learn, Streamlit — are declared as
+optional groups in `pyproject.toml` but are not installed by `[dev]`, and are not
+yet known to install cleanly. The task that first needs one is the task that makes
+it work.
+
 ## Quality gates
 
 Three gates run in CI, and any one of them fails the build:

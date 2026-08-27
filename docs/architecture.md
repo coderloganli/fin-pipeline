@@ -1,0 +1,77 @@
+# Architecture
+
+<!-- Keep this under about 350 lines. Every task reads it in full, and a document
+     too long to read in one sitting stops being read. Detail that belongs to one
+     decision goes in docs/adr/ instead. -->
+
+## What this is
+
+A finance data platform. General-ledger entries land unchanged, are modelled in
+layers, are attributed against the account hierarchy and exchange rate that were in
+effect on the transaction date, and are served as query-ready tables. An anomaly
+model flags balances that fall outside its prediction interval, and an LLM layer
+investigates each flagged balance and writes an explanation that cites the source
+entries it relied on. The hard problems here are time semantics — point-in-time
+correctness, slowly changing dimensions, late-arriving corrections, idempotent
+replay — not volume.
+
+**Status: skeleton.** The directories exist and each carries a README stating what
+that layer is and is not responsible for, but no module has landed yet. Read the
+READMEs for intent; read this file for what is actually true today.
+
+## Shape
+
+```
+generator ──▶ raw (Parquet) ──▶ staging (Parquet, PySpark) ──▶ mart (Postgres, dbt)
+                                                                      │
+                                    anomaly model ──▶ LLM investigation ──▶ Streamlit
+```
+
+| Directory | Responsibility |
+|---|---|
+| `generator/` | Synthetic ledger data, with a switch for every failure mode the tests need |
+| `ingest/` | Contract validation, watermarked incremental merge, run records |
+| `transform/spark/` | SCD2 loading, the point-in-time join, monthly aggregation |
+| `transform/dbt/` | Relational models, tests, lineage |
+| `ml/` | Anomaly detection over monthly balances |
+| `insight/` | The LLM investigation loop and its golden-set evaluation |
+| `app/` | Streamlit application; queries the mart, computes nothing |
+| `dags/` | Airflow DAGs: daily run, backfill, evaluation |
+| `tests/` | pytest suites |
+
+## Boundaries
+
+**Postgres** is the only external service the repository talks to today. It runs in a
+container declared in `compose.yaml`, pinned to `postgres:18`. Connection parameters
+come from the environment; `.env.example` records the shape and `.env` is ignored.
+
+Every service this platform grows — Airflow, Spark — is added to the same
+`compose.yaml` by the task that needs it. The host machine edits code and runs tests;
+it does not run services. See `docs/adr/0004-services-run-in-containers.md`.
+
+**DeepSeek V4 Flash** is called by the insight layer once that layer exists. See
+`docs/adr/0001-llm-for-the-insight-layer.md`.
+
+## Conventions that are not obvious from the code
+
+**Python 3.13**, declared in `pyproject.toml` and mirrored in the CI workflow. A test
+asserts the two agree, because they had already drifted apart once before anything
+checked.
+
+**Dependencies live in `pyproject.toml` only**, installed with
+`pip install -e '.[dev]'` — the same command locally, in CI, and in any image. The
+core set is small; `spark`, `dbt`, `ml` and `app` are declared but installed by
+nobody yet. The task that first needs one of them is the task that makes it install.
+
+**Tests that need the database fail when it is absent — they never skip.** A skipped
+test reports success, and a green CI run that verified nothing defeats the point of
+having gates at all. The failure message names the command that starts the
+containers.
+
+**Everything in this repository is written in English** — code, comments, commit
+messages, identifiers, configuration, and documents.
+
+## Where decisions live
+
+Decision records are in `docs/adr/`, one decision per file. Search them rather
+than reading the directory.
