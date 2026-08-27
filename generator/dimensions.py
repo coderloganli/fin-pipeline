@@ -25,7 +25,18 @@ COST_CENTRE_COUNT = 12
 # dim_account_src - and so the entries it plants are never orphans.
 GROWTH_DEBIT_ACCOUNT = "6998"
 GROWTH_CREDIT_ACCOUNT = "6999"
-RESERVED_ACCOUNTS = (GROWTH_DEBIT_ACCOUNT, GROWTH_CREDIT_ACCOUNT)
+# Reserved for the long-tail anomaly. Unlike the growth accounts these carry entries
+# whether or not the switch is on: the anomaly raises their amounts, and a steady
+# entry count is the shape's diagnostic feature.
+LONG_TAIL_DEBIT_ACCOUNT = "6996"
+LONG_TAIL_CREDIT_ACCOUNT = "6995"
+
+RESERVED_ACCOUNTS = (
+    GROWTH_DEBIT_ACCOUNT,
+    GROWTH_CREDIT_ACCOUNT,
+    LONG_TAIL_DEBIT_ACCOUNT,
+    LONG_TAIL_CREDIT_ACCOUNT,
+)
 
 EPOCH = date(2020, 1, 1)
 

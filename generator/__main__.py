@@ -18,6 +18,7 @@ SWITCHES = (
     "unbalanced_vouchers",
     "growing_account",
     "amount_outliers",
+    "long_tail_anomaly",
 )
 
 

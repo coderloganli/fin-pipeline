@@ -57,6 +57,9 @@ def generate(config: Config) -> None:
 
     def all_entries():
         yield from entries.ordinary(config, months, ordinary_accounts, centre_codes)
+        # Unconditional: the long-tail account has entries in every run, and the
+        # switch changes their amounts rather than their number.
+        yield from entries.long_tail(config, months, centre_codes)
         yield from entries.planted(config, months, ordinary_accounts, centre_codes)
 
     _write(config, "gl_entry", all_entries())

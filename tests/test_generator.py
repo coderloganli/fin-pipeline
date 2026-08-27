@@ -391,6 +391,7 @@ ALL_SWITCHES = {
     "unbalanced_vouchers": "gl_entry",
     "growing_account": "gl_entry",
     "amount_outliers": "gl_entry",
+    "long_tail_anomaly": "gl_entry",
 }
 
 

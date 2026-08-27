@@ -77,6 +77,13 @@ draws from its own random stream, so switching one on leaves the data belonging 
 others where it was. Anomalies are constructed, never found by scanning: rows are
 streamed and forgotten, so nothing that requires holding them is possible.
 
+Two anomaly shapes exist and they are opposites. A concentrated one puts the increase
+into a few large entries; a long-tail one spreads it across hundreds of small ones, so
+the entry count stays flat and the largest twenty account for under a tenth of the
+rise. The long-tail switch therefore raises amounts on a dedicated account rather than
+appending rows — a steady count is the shape's diagnostic feature, not an accident of
+implementation. See docs/adr/0007-long-tail-anomaly-changes-amounts.md.
+
 **Everything in this repository is written in English** — code, comments, commit
 messages, identifiers, configuration, and documents.
 

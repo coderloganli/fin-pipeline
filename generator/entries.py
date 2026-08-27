@@ -22,6 +22,8 @@ from .dimensions import (
     CURRENCIES,
     GROWTH_CREDIT_ACCOUNT,
     GROWTH_DEBIT_ACCOUNT,
+    LONG_TAIL_CREDIT_ACCOUNT,
+    LONG_TAIL_DEBIT_ACCOUNT,
     RESERVED_ACCOUNTS,
 )
 from .streams import (
@@ -30,6 +32,7 @@ from .streams import (
     ENTRIES,
     GROWING_ACCOUNT,
     LATE_ENTRIES,
+    LONG_TAIL,
     RESTATEMENTS,
     UNBALANCED_VOUCHERS,
     stream_for,
@@ -46,6 +49,21 @@ GROWTH_FACTOR = Decimal("1.8")   # comfortably above the 1.5 the predicate looks
 GROWTH_MONTHS = 4                # four totals give three month-on-month steps
 
 OUTLIER_MULTIPLE = 30            # the predicate looks for 20x the median
+
+# The long tail. Its amounts sit in a narrower band than the ordinary entries, and
+# that is what makes the acceptance threshold reachable: under a uniform uplift the
+# top twenty's share of the increase equals their share of the total, so the worst
+# case is computable rather than something to sample.
+#
+#     20 x 350 / (20 x 350 + 280 x 250) =  9.09%   under the 10% threshold, always
+#     20 x 500 / (20 x 500 + 280 x 100) = 26.32%   the ordinary band would never pass
+#
+# It is also what the shape means: an account with a long tail is one full of similar
+# small claims. An account whose amounts vary fivefold has no tail to speak of.
+LONG_TAIL_VOUCHERS = 300
+LONG_TAIL_MIN_CENTS = 25_000
+LONG_TAIL_MAX_CENTS = 35_000
+LONG_TAIL_UPLIFT = Decimal("1.6")   # the predicate looks for 1.5
 
 
 def _cents(value: int) -> Decimal:
@@ -273,4 +291,52 @@ def adjustments(config, months: list[date], accounts: list[str], centres: list[s
                 restatement_rng.randrange(entry_count),
                 months[index % len(months)],
                 restatement_rng,
+            )
+
+
+def long_tail(config, months: list[date], centres: list[str]):
+    """The long-tail account's entries, present whether or not the switch is on.
+
+    The switch multiplies one period's amounts; it does not add rows. A long-tail
+    anomaly that changed the entry count would be the wrong shape — a flat count
+    against rising amounts is exactly how this is told apart from simply doing more
+    business, and it is the observation the insight layer is meant to make.
+
+    Ids carry an `L-` prefix rather than `X-`: `X-` marks rows that exist only while
+    a switch is on, and these exist always.
+    """
+    if config.long_tail_anomaly and len(months) < 2:
+        # With no other period there is nothing to compare the raised one against,
+        # so the switch would be on and the anomaly undetectable.
+        raise ValueError(
+            f"long_tail_anomaly needs at least 2 periods, got {len(months)} "
+            f"from {config.periods!r}"
+        )
+
+    rng = stream_for(config.seed, LONG_TAIL)
+    target = months[len(months) // 2]
+
+    for period_index, month in enumerate(months):
+        uplift = (
+            LONG_TAIL_UPLIFT
+            if config.long_tail_anomaly and month == target
+            else Decimal(1)
+        )
+        days = (schema.period_close(month) - month).days + 1
+        for index in range(LONG_TAIL_VOUCHERS):
+            booked = month + timedelta(days=rng.randrange(days))
+            # +1 because randrange's upper bound is exclusive; the band is
+            # inclusive of 350, which is the value the 9.09% bound assumes.
+            base = _cents(rng.randrange(LONG_TAIL_MIN_CENTS, LONG_TAIL_MAX_CENTS + 1))
+            yield from _voucher(
+                entry_id_debit=f"L-{period_index:03d}-{index:06d}-D",
+                entry_id_credit=f"L-{period_index:03d}-{index:06d}-C",
+                doc_id=f"L-{period_index:03d}-{index:06d}",
+                accounting_date=booked,
+                posted_at=booked + timedelta(days=rng.randrange(4)),
+                debit_account=LONG_TAIL_DEBIT_ACCOUNT,
+                credit_account=LONG_TAIL_CREDIT_ACCOUNT,
+                cost_centre=centres[index % len(centres)],
+                currency=BASE_CURRENCY,
+                debit=(base * uplift).quantize(schema.AMOUNT_PLACES),
             )
