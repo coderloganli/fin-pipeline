@@ -1,0 +1,32 @@
+# Services this platform needs, for local development and for CI.
+#
+# Postgres serves the mart. Later services - Airflow, Spark - are added here by
+# the task that needs them; the host machine edits code and runs tests, it does
+# not run services. See docs/adr/0004-services-run-in-containers.md.
+
+services:
+  postgres:
+    image: postgres:18
+    environment:
+      POSTGRES_DB: ${POSTGRES_DB:-fin_pipeline}
+      POSTGRES_USER: ${POSTGRES_USER:-fin_pipeline}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-fin_pipeline}
+    ports:
+      # Host side follows POSTGRES_PORT so that editing .env moves the database
+      # and the tests together; the container side is always Postgres's own port.
+      - "${POSTGRES_PORT:-5432}:5432"
+    volumes:
+      # postgres:18 stores data under a major-version-specific subdirectory and
+      # refuses to start if the volume is mounted at the old .../data path. The
+      # mount goes one level up. See docker-library/postgres#1259.
+      - postgres_data:/var/lib/postgresql
+    healthcheck:
+      # Without this, a test suite can reach the container before the database
+      # inside it is accepting connections.
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-fin_pipeline} -d ${POSTGRES_DB:-fin_pipeline}"]
+      interval: 2s
+      timeout: 3s
+      retries: 15
+
+volumes:
+  postgres_data:
