@@ -79,6 +79,11 @@ work without the containers running:
 pytest -m "not db" -q
 ```
 
+Run `pytest`, not `python -m pytest`. The `-m` form puts the working directory on
+`sys.path` and the bare form does not, so a test module that imports another one can
+pass locally and fail in CI, which runs the bare form. Matching the two is what makes
+a green local run mean something.
+
 The heavy dependencies — PySpark, dbt, scikit-learn, Streamlit — are declared as
 optional groups in `pyproject.toml` but are not installed by `[dev]`, and are not
 yet known to install cleanly. The task that first needs one is the task that makes

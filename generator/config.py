@@ -30,6 +30,7 @@ class Config:
     unbalanced_vouchers: bool = False
     growing_account: bool = False
     amount_outliers: bool = False
+    long_tail_anomaly: bool = False
 
     def __post_init__(self) -> None:
         self.out_dir = Path(self.out_dir)
