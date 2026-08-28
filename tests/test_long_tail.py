@@ -25,7 +25,11 @@ from generator.dimensions import (
 )
 from generator.streams import LONG_TAIL, stream_for
 
-from tests.test_generator import (  # the predicates are defined once and reused
+# Imported as a bare module name, the way conftest is, because pytest puts the tests
+# directory on sys.path. `from tests.test_generator import ...` additionally needs the
+# working directory there, which `python -m pytest` provides and a bare `pytest` does
+# not — a difference that passed locally and failed in CI.
+from test_generator import (  # the predicates are defined once and reused
     TABLES,
     amount,
     has_amount_outliers,
