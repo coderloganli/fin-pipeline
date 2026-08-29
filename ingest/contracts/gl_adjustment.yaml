@@ -1,0 +1,74 @@
+# Adjusting entries: corrections and restatements against entries already posted.
+#
+# Same shape as gl_entry plus two columns saying what is being adjusted and how. The
+# distinction matters downstream: a correction changes the period's figure, a
+# restatement keeps the as-reported view alongside the new one.
+
+table: gl_adjustment
+primary_key: [entry_id, version]
+
+columns:
+  - name: entry_id
+    type: string
+    nullable: false
+
+  - name: version
+    type: integer
+    nullable: false
+    min: 1
+
+  - name: accounting_date
+    type: date
+    nullable: false
+
+  - name: posted_at
+    type: date
+    nullable: false
+
+  - name: account_code
+    type: string
+    nullable: false
+
+  - name: cost_center_code
+    type: string
+    nullable: false
+
+  - name: currency
+    type: string
+    nullable: false
+    allowed: [CNY, EUR, USD, GBP]
+
+  - name: amount_dr
+    type: decimal
+    nullable: false
+    min: 0
+    scale: 2
+
+  - name: amount_cr
+    type: decimal
+    nullable: false
+    min: 0
+    scale: 2
+
+  - name: doc_id
+    type: string
+    nullable: false
+
+  # The entry this adjusts. That it names a real entry cannot be checked from this
+  # table alone, so no such rule is declared here.
+  - name: adjusts_entry_id
+    type: string
+    nullable: false
+
+  - name: adjustment_type
+    type: string
+    nullable: false
+    allowed: [correction, restatement]
+
+row_constraints:
+  - type: not_after
+    earlier: accounting_date
+    later: posted_at
+
+  - type: exactly_one_nonzero
+    columns: [amount_dr, amount_cr]

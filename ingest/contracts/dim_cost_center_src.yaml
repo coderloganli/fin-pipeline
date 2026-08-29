@@ -1,0 +1,26 @@
+# Cost centres and the department each belongs to, effective-dated.
+#
+# The primary key includes effective_date. A cost centre that moves to another
+# department mid-year has two rows, and that reorganisation is the scenario the
+# point-in-time join exists to handle - not a duplicate to reject. A key of cc_code
+# alone would call the project's own central example a contract violation.
+
+table: dim_cost_center_src
+primary_key: [cc_code, effective_date]
+
+columns:
+  - name: cc_code
+    type: string
+    nullable: false
+
+  - name: name
+    type: string
+    nullable: false
+
+  - name: dept_code
+    type: string
+    nullable: false
+
+  - name: effective_date
+    type: date
+    nullable: false

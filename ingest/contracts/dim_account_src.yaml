@@ -1,0 +1,32 @@
+# The chart of accounts, effective-dated.
+#
+# The primary key includes effective_date because an account's attributes change over
+# time and the old row stays. A key of account_code alone would reject the history
+# this dimension exists to keep.
+
+table: dim_account_src
+primary_key: [account_code, effective_date]
+
+columns:
+  - name: account_code
+    type: string
+    nullable: false
+
+  - name: name
+    type: string
+    nullable: false
+
+  # Empty for a top-level account: it has no parent. This is why the column is
+  # nullable, and why an empty CSV field has to mean null rather than the string "".
+  - name: parent_code
+    type: string
+    nullable: true
+
+  - name: account_type
+    type: string
+    nullable: false
+    allowed: [asset, liability, equity, revenue, expense]
+
+  - name: effective_date
+    type: date
+    nullable: false

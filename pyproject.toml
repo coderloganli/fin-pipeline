@@ -4,9 +4,11 @@ version = "0.1.0"
 description = "A finance data platform where the hard problems are data engineering ones"
 requires-python = ">=3.13"
 
-# Core: what the platform needs to talk to its own database.
+# Core: what the platform needs to talk to its own database, and to read the source
+# contracts, which are consulted at ingest time rather than only under test.
 dependencies = [
     "psycopg[binary]",
+    "pyyaml",
 ]
 
 # Declared, but installed by nobody yet. The task that first needs one of these
@@ -15,7 +17,6 @@ dependencies = [
 [project.optional-dependencies]
 dev = [
     "pytest",
-    "pyyaml",
 ]
 spark = ["pyspark>=4.2"]
 dbt = ["dbt-core>=1.10", "dbt-postgres"]
@@ -27,7 +28,11 @@ requires = ["setuptools>=68"]
 build-backend = "setuptools.build_meta"
 
 [tool.setuptools]
-packages = ["generator"]
+packages = ["generator", "ingest", "ingest.contracts"]
+
+[tool.setuptools.package-data]
+# The contracts are data the package reads at runtime, so they have to ship with it.
+"ingest.contracts" = ["*.yaml"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
