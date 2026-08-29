@@ -1,0 +1,29 @@
+# Exchange rates to the base currency, one row per currency per day.
+#
+# A March transaction is converted at March's rate, so the rate is looked up by the
+# transaction's accounting date rather than by today.
+
+table: fx_rate
+primary_key: [currency, rate_date]
+
+columns:
+  - name: currency
+    type: string
+    nullable: false
+    allowed: [CNY, EUR, USD, GBP]
+
+  - name: rate_date
+    type: date
+    nullable: false
+
+  # Strictly positive: a rate of zero would silently zero out every converted amount
+  # rather than fail, which is the kind of error that reaches a report.
+  #
+  # No `scale` is declared. A rate is not a currency amount: real rates carry four to
+  # six decimal places, and pinning two here would make the contract demand a
+  # precision that is wrong for the domain. The generator currently emits two, which
+  # is a defect in the generator rather than something for this contract to enshrine.
+  - name: rate_to_base
+    type: decimal
+    nullable: false
+    min: 0.000001

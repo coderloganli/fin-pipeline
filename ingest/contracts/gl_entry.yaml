@@ -1,0 +1,72 @@
+# General-ledger entries as the source system exports them.
+#
+# One row is one side of a voucher: a debit or a credit, never both. Two rows sharing
+# a doc_id make a balanced voucher — but that is a rule about a group of rows, so the
+# dbt tests own it, not this contract.
+
+table: gl_entry
+primary_key: [entry_id, version]
+
+columns:
+  - name: entry_id
+    type: string
+    nullable: false
+
+  # A corrected entry arrives as a new version of the same entry_id. The merge is
+  # keyed on the pair, which is what makes a rerun idempotent.
+  - name: version
+    type: integer
+    nullable: false
+    min: 1
+
+  # When the entry belongs, in accounting terms. Everything is attributed against
+  # this date, not against when it happened to arrive.
+  - name: accounting_date
+    type: date
+    nullable: false
+
+  # When it actually landed. May be long after accounting_date closed: that is a late
+  # arrival, an ordinary event, and no upper bound is declared on the gap.
+  - name: posted_at
+    type: date
+    nullable: false
+
+  - name: account_code
+    type: string
+    nullable: false
+
+  - name: cost_center_code
+    type: string
+    nullable: false
+
+  - name: currency
+    type: string
+    nullable: false
+    allowed: [CNY, EUR, USD, GBP]
+
+  # Amounts are unsigned and always written to two places. The direction is carried by
+  # which of the two columns is populated, so no upper bound is declared - an unusually
+  # large entry is an anomaly for the model to flag, not a malformed row.
+  - name: amount_dr
+    type: decimal
+    nullable: false
+    min: 0
+    scale: 2
+
+  - name: amount_cr
+    type: decimal
+    nullable: false
+    min: 0
+    scale: 2
+
+  - name: doc_id
+    type: string
+    nullable: false
+
+row_constraints:
+  - type: not_after
+    earlier: accounting_date
+    later: posted_at
+
+  - type: exactly_one_nonzero
+    columns: [amount_dr, amount_cr]

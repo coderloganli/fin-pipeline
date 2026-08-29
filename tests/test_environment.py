@@ -191,11 +191,13 @@ def test_core_and_dev_dependencies_are_declared():
     project = read_pyproject()["project"]
 
     core = {distribution_name(r) for r in project["dependencies"]}
-    assert "psycopg" in core, f"core dependencies do not carry psycopg: {sorted(core)}"
+    for package in ("psycopg", "pyyaml"):
+        # pyyaml moved here when the source contracts landed: they are read at ingest
+        # time, not only under test.
+        assert package in core, f"core dependencies do not carry {package!r}: {sorted(core)}"
 
     dev = {distribution_name(r) for r in project["optional-dependencies"]["dev"]}
-    for package in ("pytest", "pyyaml"):
-        assert package in dev, f"the dev group does not carry {package!r}: {sorted(dev)}"
+    assert "pytest" in dev, f"the dev group does not carry pytest: {sorted(dev)}"
 
 
 def test_ci_installs_the_same_way_the_readme_says_to():

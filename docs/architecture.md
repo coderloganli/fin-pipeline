@@ -84,6 +84,15 @@ rise. The long-tail switch therefore raises amounts on a dedicated account rathe
 appending rows — a steady count is the shape's diagnostic feature, not an accident of
 implementation. See docs/adr/0007-long-tail-anomaly-changes-amounts.md.
 
+**What ingest expects is stated separately from what the generator emits.**
+`generator/schema.py` is the truth for the one, `ingest/contracts/*.yaml` for the
+other, and nothing under `contracts/` imports the generator. A contract derived from
+its producer cannot catch the producer changing; two independent statements can
+disagree, and a test that compares them is what turns a drift into a decision. The
+contracts' business rules are checked against data with every failure-mode switch on,
+because a late entry or a cost centre that moved department is a legitimate business
+event, not malformed input. See docs/adr/0008-contracts-are-written-by-hand.md.
+
 **Everything in this repository is written in English** — code, comments, commit
 messages, identifiers, configuration, and documents.
 
