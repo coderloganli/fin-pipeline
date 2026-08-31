@@ -8,18 +8,22 @@ failure unconditionally, which would poison every downstream test with a dirty
 baseline.
 """
 
+import ast
 import csv
+import random
+from calendar import monthrange
 import subprocess
 import sys
 import tracemalloc
 from collections import defaultdict
+from datetime import date
 from decimal import Decimal
 from pathlib import Path
 
 import pytest
 
 from generator import Config, generate
-from generator import schema
+from generator import dimensions, schema
 from generator.streams import stream_for
 
 TABLES = ("gl_entry", "gl_adjustment", "dim_account_src", "dim_cost_center_src", "fx_rate")
@@ -367,14 +371,22 @@ def test_the_csv_bytes_do_not_depend_on_the_platform(tmp_path):
         with (out / f"{table}.csv").open(encoding="utf-8", newline="") as handle:
             assert next(csv.reader(handle)) == list(schema.COLUMNS[table])
 
-    numeric = {"amount_dr", "amount_cr", "rate_to_base"}
+    # Amounts and rates are different quantities with different widths. Asserting one
+    # rule over both is what let a rate sit at two decimal places, which is a 0.06%
+    # error on every conversion. See docs/adr/0013-a-rate-is-not-an-amount.md.
+    amounts = {"amount_dr", "amount_cr"}
+    rates = {"rate_to_base"}
     dated = {"accounting_date", "posted_at", "effective_date", "rate_date"}
     for table in TABLES:
         for row in rows(out, table):
             for column, value in row.items():
-                if column in numeric:
+                if column in amounts:
                     assert value == str(Decimal(value).quantize(Decimal("0.01"))), (
                         f"{table}.{column}={value!r} is not at a fixed two decimal places"
+                    )
+                if column in rates:
+                    assert value == str(Decimal(value).quantize(schema.RATE_PLACES)), (
+                        f"{table}.{column}={value!r} is not at a fixed six decimal places"
                     )
                 if column in dated:
                     assert schema.format_date(schema.parse_date(value)) == value, (
@@ -484,3 +496,271 @@ def test_growing_account_refuses_a_range_too_short_to_show_growth(tmp_path):
             seed=42, out_dir=tmp_path / "short",
             periods="2026-01:2026-02", growing_account=True,
         ))
+
+
+# --- Exchange-rate precision ------------------------------------------------
+#
+# A rate is not a currency amount. Two decimal places on a rate near 7.87 is a
+# quantisation error of 0.06% on every foreign-currency conversion the platform will
+# compute, and a rerun reproduces it faithfully rather than exposing it. See
+# docs/adr/0013-a-rate-is-not-an-amount.md.
+
+NON_BASE_CURRENCIES = ("EUR", "USD", "GBP")
+
+# The exact reachable bounds, not a rounded band. RATE_MAX_MICROS is exclusive and the
+# drift is applied with floor division, so the ceiling is 8_999_999 * 1_020_000 //
+# 1_000_000 = 9_179_998 rather than 9.18.
+RATE_FLOOR = Decimal("4.900000")
+RATE_CEILING = Decimal("9.179998")
+
+
+def rates_by_currency(out: Path) -> dict[str, list[str]]:
+    found: dict[str, list[str]] = defaultdict(list)
+    for row in rows(out, "fx_rate"):
+        found[row["currency"]].append(row["rate_to_base"])
+    return found
+
+
+def test_every_rate_is_written_to_six_decimal_places(tmp_path):
+    """Case 1. Asserted on the text in the file: the width is the point, and a numeric
+    comparison would be satisfied by Decimal("7.87")."""
+    for value in (row["rate_to_base"] for row in rows(run(tmp_path), "fx_rate")):
+        fraction = value.partition(".")[2]
+        assert len(fraction) == 6, f"rate_to_base={value!r} is not at six decimal places"
+
+
+def test_the_base_currency_is_written_as_one_at_full_width(tmp_path):
+    """Case 2. One shape for the column, so no reader special-cases the identity."""
+    written = rates_by_currency(run(tmp_path))["CNY"]
+    assert written, "no CNY rows were generated"
+    assert set(written) == {"1.000000"}, f"CNY rates are {sorted(set(written))}"
+
+
+@pytest.mark.parametrize("currency", NON_BASE_CURRENCIES)
+def test_the_extra_digits_carry_information(tmp_path, currency):
+    """Case 3. The one that makes this a fix rather than a wider column.
+
+    A format_rate that padded 7.87 to 7.870000 satisfies cases 1 and 2 while leaving
+    the 0.06% error exactly where it was. Asserted per currency: pooled over the
+    column, one currency with real six-place variation would carry two others still
+    padded from two places, and two thirds of the defect would pass.
+    """
+    written = rates_by_currency(run(tmp_path))[currency]
+    assert written, f"no {currency} rows were generated"
+
+    distinct = {Decimal(value) for value in written}
+    rounded = {value.quantize(Decimal("0.01")) for value in distinct}
+    assert len(distinct) > len(rounded), (
+        f"{currency} has {len(distinct)} distinct rates but only {len(rounded)} "
+        f"distinct values at two decimal places; the extra digits carry nothing"
+    )
+
+
+def test_every_rate_lands_in_the_reachable_band(tmp_path):
+    """Case 4. Exact bounds, so an off-by-one at the top of the centre range fails
+    here rather than looking like a plausible number three layers downstream. Also
+    the floor the contract declares: fx_rate.yaml says min 0.000001."""
+    contract_floor = Decimal("0.000001")
+    for currency, written in rates_by_currency(run(tmp_path)).items():
+        for value in written:
+            rate = Decimal(value)
+            assert rate >= contract_floor, f"{currency} rate {value} is below the contract minimum"
+            if currency == "CNY":
+                continue
+            assert RATE_FLOOR <= rate <= RATE_CEILING, (
+                f"{currency} rate {value} is outside the reachable band "
+                f"[{RATE_FLOOR}, {RATE_CEILING}]"
+            )
+
+
+@pytest.mark.parametrize("currency", NON_BASE_CURRENCIES)
+def test_a_rate_moves_from_day_to_day(tmp_path, currency):
+    """Case 5. Guards a refactor that gets the centre right and drops the daily term."""
+    written = rates_by_currency(run(tmp_path))[currency]
+    assert len(set(written)) > 1, f"{currency} held one rate for every day: {written[0]}"
+
+
+class NoFloats(random.Random):
+    """A stream that refuses to produce a float.
+
+    randrange reaches getrandbits rather than random(), so an integer draw is
+    unaffected. That is CPython's implementation rather than a documented guarantee;
+    the project pins CPython 3.13 (docs/adr/0002-python-version.md), and if it stopped
+    holding this fails loudly rather than passing quietly.
+    """
+
+    FLOAT_METHODS = (
+        "random", "uniform", "gauss", "normalvariate", "lognormvariate", "triangular",
+        "betavariate", "expovariate", "paretovariate", "weibullvariate",
+        "vonmisesvariate",
+    )
+
+
+def _refuse(name):
+    def method(self, *args, **kwargs):
+        raise AssertionError(f"the rate path drew a float through {name}()")
+    return method
+
+
+for _name in NoFloats.FLOAT_METHODS:
+    setattr(NoFloats, _name, _refuse(_name))
+
+
+def test_the_rate_path_draws_no_float(monkeypatch):
+    """Case 6. Both a float draw and an integer draw produce six-place strings, so no
+    output distinguishes them. Refusing the whole float half of the Random API is a
+    property of the behaviour rather than of the source text - unlike a ban on the
+    word `uniform`, which `rng.random()` walks straight past.
+    """
+    monkeypatch.setattr(
+        dimensions, "stream_for", lambda seed, name: NoFloats(hash((seed, name)) & 0xFFFF)
+    )
+    produced = dimensions.fx_rates(42, [date(2026, 1, 1)])
+    assert produced, "fx_rates produced no rows"
+    assert all(row["rate_to_base"] for row in produced)
+
+
+def _function_source(module, name: str) -> ast.AST:
+    tree = ast.parse(Path(module.__file__).read_text(encoding="utf-8"))
+    for node in ast.walk(tree):
+        if isinstance(node, ast.FunctionDef) and node.name == name:
+            return node
+    raise AssertionError(f"{module.__name__} defines no {name}")
+
+
+@pytest.mark.parametrize("module,function", [
+    (dimensions, "fx_rates"),
+    (dimensions, "_rate"),
+    (schema, "format_rate"),
+])
+def test_no_float_reaches_the_rate_arithmetic(module, function):
+    """Case 6b. What case 6 cannot see: a stream can hand back honest integers and the
+    code can still multiply one of them by 1.02."""
+    node = _function_source(module, function)
+
+    for child in ast.walk(node):
+        if isinstance(child, ast.Constant) and isinstance(child.value, float):
+            raise AssertionError(
+                f"{module.__name__}.{function} contains the float literal {child.value!r}"
+            )
+        # Both spellings: `float(x)` and `builtins.float(x)`. The second is only
+        # reachable on purpose, but a check that names one and not the other invites
+        # exactly that.
+        if isinstance(child, ast.Call):
+            called = getattr(child.func, "id", None) or getattr(child.func, "attr", None)
+            assert called != "float", (
+                f"{module.__name__}.{function} calls float()"
+            )
+
+
+def test_a_rate_has_its_own_formatter_and_the_generator_uses_it():
+    """Case 7. The last assertion is the one that matters: an inline
+    .quantize(schema.RATE_PLACES) in dimensions.py satisfies every behavioural case
+    while bypassing the formatter this change exists to introduce."""
+    assert schema.format_rate is not schema.format_amount
+    assert schema.format_rate(Decimal(1)) == "1.000000"
+    assert schema.format_amount(Decimal(1)) == "1.00"
+
+    called = {
+        child.func.attr
+        for child in ast.walk(_function_source(dimensions, "fx_rates"))
+        if isinstance(child, ast.Call) and isinstance(child.func, ast.Attribute)
+    }
+    assert "format_rate" in called, "fx_rates does not call format_rate"
+
+
+# --- Added at stage 8 -------------------------------------------------------
+
+
+class ScriptedStream(random.Random):
+    """Records every randrange call, and answers from a script while it lasts.
+
+    The generated sample cannot reach the edges of the draw range on its own, and the
+    draw *pattern* leaves no trace in the output at all - so both are asserted by
+    driving fx_rates with a stream that is watched and, where it matters, dictated.
+    """
+
+    def __init__(self, values=None):
+        super().__init__(0)
+        self.calls: list[tuple] = []
+        self._scripted = list(values or [])
+
+    def randrange(self, *args, **kwargs):
+        self.calls.append(args)
+        if self._scripted:
+            return self._scripted.pop(0)
+        return super().randrange(*args, **kwargs)
+
+
+DRIVEN_MONTH = date(2026, 1, 1)
+DRIVEN_DAYS = monthrange(DRIVEN_MONTH.year, DRIVEN_MONTH.month)[1]
+
+
+def drive(monkeypatch, values=None) -> tuple[ScriptedStream, list[dict]]:
+    stream = ScriptedStream(values)
+    monkeypatch.setattr(dimensions, "stream_for", lambda seed, name: stream)
+    return stream, dimensions.fx_rates(42, [DRIVEN_MONTH])
+
+
+@pytest.mark.parametrize("centre,drift,expected", [
+    # The top of the range: RATE_MAX_MICROS is exclusive and the division floors, so
+    # the highest reachable rate is 8_999_999 * 1_020_000 // 1_000_000 = 9_179_998.
+    # An off-by-one that made the centre bound inclusive would produce 9.180000 here.
+    (dimensions.RATE_MAX_MICROS - 1, dimensions.DRIFT_PPM, "9.179998"),
+    # The bottom, which is exact.
+    (dimensions.RATE_MIN_MICROS, -dimensions.DRIFT_PPM, "4.900000"),
+])
+def test_the_edges_of_the_draw_range_land_where_the_band_says(
+    monkeypatch, centre, drift, expected
+):
+    """Case 9. Case 4 asserts the band over a seed-42 sample, which cannot reach its
+    own edges: an inclusive upper bound would pass there unless the sample happened to
+    draw it. This dictates the boundary draw instead of waiting for it.
+
+    The script feeds CNY's discarded drift for every day of the month - the base
+    currency takes one per day, not one per month - and then EUR's centre and its
+    first drift.
+    """
+    _, produced = drive(monkeypatch, [0] * DRIVEN_DAYS + [centre, drift])
+    eur = [row for row in produced if row["currency"] == "EUR"]
+    assert eur[0]["rate_to_base"] == expected
+
+
+def test_the_draws_taken_per_currency_are_exactly_the_documented_ones(monkeypatch):
+    """Case 10. The stream cursor is a contract, and it is invisible in the output.
+
+    CNY takes no centre draw and a discarded drift draw every day. Dropping either
+    would shift EUR, USD and GBP - silently, because every rate would still be a
+    well-formed six-place number inside the band. See
+    docs/adr/0013-a-rate-is-not-an-amount.md.
+    """
+    stream, produced = drive(monkeypatch)
+
+    centre_bounds = (dimensions.RATE_MIN_MICROS, dimensions.RATE_MAX_MICROS)
+    drift_bounds = (-dimensions.DRIFT_PPM, dimensions.DRIFT_PPM + 1)
+
+    days = len({row["rate_date"] for row in produced})
+    non_base = [c for c in dimensions.CURRENCIES if c != dimensions.BASE_CURRENCY]
+
+    assert stream.calls.count(centre_bounds) == len(non_base), (
+        f"expected one centre draw per non-base currency, got {stream.calls}"
+    )
+    assert stream.calls.count(drift_bounds) == len(dimensions.CURRENCIES) * days, (
+        "expected a drift draw for every currency on every day, including the base "
+        f"currency whose value is discarded; got {stream.calls}"
+    )
+    assert len(stream.calls) == len(non_base) + len(dimensions.CURRENCIES) * days
+
+    # And the base currency's first draw is a drift, not a centre: it takes no centre.
+    assert stream.calls[0] == drift_bounds
+
+
+def test_the_rate_written_is_the_one_the_formatter_returned(monkeypatch):
+    """Case 11. Case 7 asserts that a call named format_rate appears somewhere in
+    fx_rates, which a dead call alongside an inline quantize would satisfy. This
+    asserts the value in the row came through the formatter."""
+    monkeypatch.setattr(schema, "format_rate", lambda value: "through-the-formatter")
+    _, produced = drive(monkeypatch)
+
+    assert produced
+    assert {row["rate_to_base"] for row in produced} == {"through-the-formatter"}
