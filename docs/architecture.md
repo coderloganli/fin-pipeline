@@ -15,11 +15,11 @@ entries it relied on. The hard problems here are time semantics — point-in-tim
 correctness, slowly changing dimensions, late-arriving corrections, idempotent
 replay — not volume.
 
-**Status: early.** `generator/` has landed, and `ingest/` has its source-table
-contracts and the validator that applies them. The remaining directories exist and
-each carries a README stating what that layer is and is not responsible for, but no
-module has landed in them. Read the READMEs for intent; read this file for what is
-actually true today.
+**Status: early.** `generator/` has landed. `ingest/` has its source-table
+contracts, the validator that applies them, and the watermarked incremental load that
+lands entries in the raw layer. The remaining directories exist and each carries a
+README stating what that layer is and is not responsible for, but no module has landed
+in them. Read the READMEs for intent; read this file for what is actually true today.
 
 ## Shape
 
@@ -62,8 +62,9 @@ checked.
 
 **Dependencies live in `pyproject.toml` only**, installed with
 `pip install -e '.[dev]'` — the same command locally, in CI, and in any image. The
-core set is small; `spark`, `dbt`, `ml` and `app` are declared but installed by
-nobody yet. The task that first needs one of them is the task that makes it install.
+core set is small — `psycopg`, `pyyaml`, and `pyarrow`, which ingest writes the raw
+layer with; `spark`, `dbt`, `ml` and `app` are declared but installed by nobody yet.
+The task that first needs one of them is the task that makes it install.
 
 **Tests that need the database fail when it is absent — they never skip.** A skipped
 test reports success, and a green CI run that verified nothing defeats the point of
@@ -96,6 +97,29 @@ is what turns an incompatible report into a non-zero exit. Rows stream and findi
 are capped per table, so the gate can guard a table it could not hold. Until dbt
 lands there is no lineage graph, so a failure says the downstream impact is unknown
 rather than omitting it. See docs/adr/0009, 0010, 0011 and 0012.
+
+**The raw layer holds text, and only the columns the contract declares.** Entries
+land under `data/raw/<table>/accounting_period=YYYY-MM/part-0000.parquet`, one file
+per period, every column written as a Parquet string and an empty field written as an
+empty string. Retyping is `staging`'s line in the table above, and a raw layer that
+already reinterpreted cannot answer the question it exists for — whether the source
+really said that.
+
+**The load is watermarked, and the merge is what makes a rerun free.** Each contract
+names the column its table advances on: `gl_entry` and `gl_adjustment` advance on
+`posted_at`, and a table that names none is loaded in full instead. A run reads the
+source rows at or above the stored watermark less an overlap window, applies them to
+the accounting periods they touch by primary key, and writes the watermark only after
+every partition is written — so an interrupted run re-reads its window next time and
+converges rather than leaving a hole. Periods the batch does not touch are never
+opened. There is no `updated_at` anywhere in the source; the plan said there was, and
+`posted_at` is the column that already means it. See docs/adr/0014, 0015, 0016.
+
+**A rerun is checked by row count and checksum, and the checksum is over rows.** It
+renders the declared columns of every row as text, sorts them, and hashes that — not
+the Parquet bytes, which carry the writer's version, and not any ingestion metadata,
+which will differ on every run once `record-every-pipeline-run` lands. See
+docs/adr/0017.
 
 **What ingest expects is stated separately from what the generator emits.**
 `generator/schema.py` is the truth for the one, `ingest/contracts/*.yaml` for the
