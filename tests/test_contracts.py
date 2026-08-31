@@ -11,20 +11,17 @@ has now slipped through three tickets, so it is separated deliberately.
 """
 
 import ast
-import csv
-import re
 import importlib
 import subprocess
 import sys
 import tomllib
-from datetime import datetime
-from decimal import Decimal, InvalidOperation
 from pathlib import Path
 
 import pytest
 
 from generator import Config, generate, schema
 from ingest import contracts
+from ingest.validate import check_value, check_row_constraint, validate_source
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 CONTRACT_DIR = REPO_ROOT / "ingest" / "contracts"
@@ -68,123 +65,6 @@ def generated(tmp_path: Path, **switches) -> Path:
     out = tmp_path / f"data_{len(list(tmp_path.iterdir()))}"
     generate(Config(seed=42, out_dir=out, **switches))
     return out
-
-
-def rows(out: Path, table: str) -> list[dict[str, str]]:
-    with (out / f"{table}.csv").open(encoding="utf-8", newline="") as handle:
-        return list(csv.DictReader(handle))
-
-
-# --- a deliberately simple rule executor, used only by cases 7 and 8 --------
-#
-# Not production code: it is not exported and nothing outside this module uses it. It
-# exists because "the contracts agree with what the generator produces" is this
-# ticket's acceptance criterion, and that cannot be claimed without checking it. The
-# validator that classifies drift and fails the run is the next ticket.
-
-DATE_FORMAT = contracts.DATE_FORMAT   # the format the contracts declare
-DATE_PATTERN = re.compile(r"\d{4}-\d{2}-\d{2}")
-
-
-# The loader's definition, not a copy: a second definition here could drift from it
-# and the tests would still pass.
-is_null = contracts.is_null
-
-
-def check_value(spec: dict, value: str) -> str | None:
-    """Check one non-null field against its column spec. None means it is fine."""
-    kind = spec["type"]
-
-    if kind == "date":
-        # The pattern first: strptime alone accepts "2026-1-5", which is not the
-        # format the contracts declare and not what the pipeline parses downstream.
-        if not DATE_PATTERN.fullmatch(value):
-            return f"{value!r} is not a date in {DATE_FORMAT}"
-        try:
-            datetime.strptime(value, DATE_FORMAT)
-        except ValueError:
-            return f"{value!r} is not a real date"
-        return None
-
-    if kind == "integer":
-        if not value.lstrip("-").isdigit():
-            return f"{value!r} is not an integer"
-        number = Decimal(value)
-    elif kind == "decimal":
-        try:
-            number = Decimal(value)
-        except InvalidOperation:
-            return f"{value!r} is not a number"
-        # NaN and Infinity parse happily, and comparing NaN raises rather than
-        # returning False - so the validator would crash instead of reporting.
-        if not number.is_finite():
-            return f"{value!r} is not a finite number"
-        if "scale" in spec:
-            fraction = value.partition(".")[2]
-            if len(fraction) != spec["scale"]:
-                return f"{value!r} is not written to {spec['scale']} decimal places"
-    else:  # string
-        number = None
-
-    if number is not None and "min" in spec and number < spec["min"]:
-        return f"{value!r} is below the minimum {spec['min']}"
-    if "allowed" in spec and value not in spec["allowed"]:
-        return f"{value!r} is not one of {spec['allowed']}"
-    return None
-
-
-def check_row_constraint(constraint: dict, row: dict[str, str]) -> str | None:
-    """Check one cross-column rule against one row. None means it is fine."""
-    kind = constraint["type"]
-
-    if kind == "not_after":
-        earlier, later = constraint["earlier"], constraint["later"]
-        if row[later] < row[earlier]:
-            return f"{later} ({row[later]}) is before {earlier} ({row[earlier]})"
-        return None
-
-    if kind == "exactly_one_nonzero":
-        columns = constraint["columns"]
-        nonzero = [name for name in columns if Decimal(row[name]) != 0]
-        if len(nonzero) != 1:
-            return f"exactly one of {columns} should be non-zero, found {nonzero}"
-        return None
-
-    raise AssertionError(f"unknown row constraint {kind!r}")
-
-
-def violations(contract: dict, table_rows: list[dict[str, str]]) -> list[str]:
-    found: list[str] = []
-
-    for spec in contract["columns"]:
-        name = spec["name"]
-        for index, row in enumerate(table_rows):
-            value = row.get(name)
-            if value is None:
-                found.append(f"{name}: column missing from row {index}")
-                break
-            if is_null(value):
-                if not spec.get("nullable", False):
-                    found.append(f"{name}: empty at row {index} but declared not null")
-                continue
-            problem = check_value(spec, value)
-            if problem:
-                found.append(f"{name}: row {index}: {problem}")
-
-    seen = set()
-    for index, row in enumerate(table_rows):
-        key = tuple(row[name] for name in contract["primary_key"])
-        if key in seen:
-            found.append(f"primary key {key} repeats at row {index}")
-        seen.add(key)
-
-    for constraint in contract.get("row_constraints", []):
-        for index, row in enumerate(table_rows):
-            problem = check_row_constraint(constraint, row)
-            if problem:
-                found.append(f"row {index}: {problem}")
-
-    return found
 
 
 # --- Cases 1-3: the contract files themselves ------------------------------
@@ -298,16 +178,18 @@ def test_the_primary_keys_are_effective_dated_where_they_must_be():
 
 def test_parent_code_is_nullable_and_empty_means_null():
     assert column(contracts.load("dim_account_src"), "parent_code")["nullable"] is True
-    assert is_null("")
-    assert not is_null("6100")
+    assert contracts.is_null("")
+    assert not contracts.is_null("6100")
 
 
 # --- Cases 7-8: the rules hold against real data ---------------------------
 
 def test_the_contracts_hold_for_clean_data(tmp_path):
-    out = generated(tmp_path)
-    for table in TABLES:
-        assert violations(contracts.load(table), rows(out, table)) == []
+    """Through the validator, which is what production does with these files. That
+    covers the header classification and the primary-key check too, neither of which
+    the rule executor this replaced could reach."""
+    report = validate_source(generated(tmp_path))
+    assert report.findings == [], report.describe()
 
 
 def test_the_contracts_hold_with_every_business_switch_on(tmp_path):
@@ -319,10 +201,11 @@ def test_the_contracts_hold_with_every_business_switch_on(tmp_path):
     violating the column contract is the point of it.
     """
     out = generated(tmp_path, **{switch: True for switch in BUSINESS_SWITCHES})
-    for table in TABLES:
-        assert violations(contracts.load(table), rows(out, table)) == [], (
-            f"{table}: a legitimate business scenario was reported as a violation"
-        )
+    report = validate_source(out)
+    assert report.findings == [], (
+        f"a legitimate business scenario was reported as a violation:\n"
+        f"{report.describe()}"
+    )
 
 
 # --- Cases 9-10: the boundary and the packaging ----------------------------
@@ -332,7 +215,7 @@ def test_the_loader_does_not_import_the_generator():
     # Parse the imports rather than grep for the word. The loader's docstring
     # explains why it does not import the generator, and a substring check cannot
     # tell that prose from an import statement.
-    for name in ("ingest", "ingest.contracts"):
+    for name in ("ingest", "ingest.contracts", "ingest.validate"):
         module = importlib.import_module(name)
         tree = ast.parse(Path(module.__file__).read_text(encoding="utf-8"))
         imported = set()

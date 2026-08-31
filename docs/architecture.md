@@ -15,10 +15,11 @@ entries it relied on. The hard problems here are time semantics — point-in-tim
 correctness, slowly changing dimensions, late-arriving corrections, idempotent
 replay — not volume.
 
-**Status: early.** `generator/` has landed. The other directories exist and each
-carries a README stating what that layer is and is not responsible for, but no module
-has landed in them. Read the READMEs for intent; read this file for what is actually
-true today.
+**Status: early.** `generator/` has landed, and `ingest/` has its source-table
+contracts and the validator that applies them. The remaining directories exist and
+each carries a README stating what that layer is and is not responsible for, but no
+module has landed in them. Read the READMEs for intent; read this file for what is
+actually true today.
 
 ## Shape
 
@@ -83,6 +84,18 @@ the entry count stays flat and the largest twenty account for under a tenth of t
 rise. The long-tail switch therefore raises amounts on a dedicated account rather than
 appending rows — a steady count is the shape's diagnostic feature, not an accident of
 implementation. See docs/adr/0007-long-tail-anomaly-changes-amounts.md.
+
+**The first quality gate is contract validation, and it is the only one that exists.**
+`ingest/validate.py` applies a contract to a source file: an added column warns and
+the run continues, and a missing column, a reordering, a value that no longer fits its
+declared type or rule, a repeated primary key, or a broken row constraint fails it.
+That asymmetry is one rule for all five tables and it lives with the validator, not in
+the contracts. The library returns a report rather than raising, because a warning and
+a failure have to reach the caller through the same call; `python -m ingest.validate`
+is what turns an incompatible report into a non-zero exit. Rows stream and findings
+are capped per table, so the gate can guard a table it could not hold. Until dbt
+lands there is no lineage graph, so a failure says the downstream impact is unknown
+rather than omitting it. See docs/adr/0009, 0010, 0011 and 0012.
 
 **What ingest expects is stated separately from what the generator emits.**
 `generator/schema.py` is the truth for the one, `ingest/contracts/*.yaml` for the

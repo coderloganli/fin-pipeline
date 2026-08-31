@@ -7,9 +7,12 @@ one.
 
 This module loads those files and checks that the *contract itself* is well formed.
 **It does not look at data.** Applying a contract to rows — and deciding that an added
-column is compatible while a dropped one is not — belongs to the validator, which is
-the next task. The rule primitives currently live in the tests, and move here when
-that task needs them in production.
+column is compatible while a dropped one is not — belongs to `ingest.validate`, which
+now exists and owns the rule primitives. They did not move into this package: it would
+have made the paragraph above false and left one module doing two unrelated jobs. What
+stays here is what a contract *means* rather than how to check it — `is_null` and
+`DATE_FORMAT` — and the validator imports both from here rather than restating them.
+See docs/adr/0010-the-validator-owns-the-rule-primitives.md.
 
 Nothing here imports the generator. A contract derived from its producer cannot catch
 the producer changing; two independently written statements can disagree, and that
