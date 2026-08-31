@@ -15,6 +15,14 @@ from decimal import Decimal
 DATE_FORMAT = "%Y-%m-%d"
 AMOUNT_PLACES = Decimal("0.01")
 
+# A rate is not a currency amount, and does not share its width. Two decimal places
+# on a rate near 7.87 is a 0.06% error on every conversion, and one that a rerun
+# reproduces faithfully rather than exposing. The contract's `min: 0.000001` already
+# commits to six places; this agrees with it rather than choosing a second number.
+# See docs/adr/0013-a-rate-is-not-an-amount.md.
+RATE_PLACES = Decimal("0.000001")
+RATE_MICROS = 1_000_000   # millionths of a unit: the resolution a rate is drawn at
+
 COLUMNS: dict[str, tuple[str, ...]] = {
     "gl_entry": (
         "entry_id",
@@ -95,6 +103,17 @@ def format_amount(value: Decimal) -> str:
     """Fixed two places, always from Decimal. float repr is not stable enough to
     compare bytes against."""
     return str(value.quantize(AMOUNT_PLACES))
+
+
+def format_rate(value: Decimal) -> str:
+    """Fixed six places, always from Decimal.
+
+    Deliberately a separate function rather than a `places` argument on
+    `format_amount`: the two are different quantities with different rules, and a
+    shared formatter with a parameter is how the confusion got in - the rate path
+    reached for the amount formatter because it was there.
+    """
+    return str(value.quantize(RATE_PLACES))
 
 
 def period_of(value: date) -> str:

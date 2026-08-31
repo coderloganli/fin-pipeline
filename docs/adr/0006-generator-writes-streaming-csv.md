@@ -38,6 +38,9 @@ tests compare files byte for byte and the machine this is developed on is Window
 - `lineterminator` set explicitly to the single character LF
 - column order taken from `schema.py`
 - amounts rendered from `Decimal` at a fixed two decimal places, never from float
+- exchange rates likewise from `Decimal`, but at six places and through their own
+  formatter: a rate is not a currency amount, and two places on one is a ±0.06% error
+  on every conversion. See docs/adr/0013-a-rate-is-not-an-amount.md
 - dates as `YYYY-MM-DD`
 
 Left to its defaults, Python's csv module ends rows with CRLF on Windows, and with

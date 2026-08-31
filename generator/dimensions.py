@@ -13,6 +13,15 @@ from .streams import COST_CENTRE_MOVE, DIMENSIONS, stream_for
 BASE_CURRENCY = "CNY"
 CURRENCIES = ("CNY", "EUR", "USD", "GBP")
 
+# A rate is drawn at the resolution it is written at - an integer number of
+# millionths - and stays integral until one exact division. No float participates,
+# for the reason amounts draw whole cents: a float has no exact decimal value, and
+# once the pipeline multiplies amounts by rates, where the rounding happened becomes
+# a question somebody has to answer. See docs/adr/0013-a-rate-is-not-an-amount.md.
+RATE_MIN_MICROS = 5_000_000   # 5.000000
+RATE_MAX_MICROS = 9_000_000   # 9.000000, exclusive
+DRIFT_PPM = 20_000            # the daily jitter, +/- 2 per cent in parts per million
+
 ACCOUNT_TYPES = ("asset", "liability", "equity", "revenue", "expense")
 
 # Enough breadth for the anomalies to hide in, small enough to read.
@@ -104,22 +113,39 @@ def cost_centres(seed: int, move: bool) -> list[dict[str, object]]:
     return rows
 
 
+def _rate(micros: int) -> Decimal:
+    """Millionths to a rate. The division is exact, so the quantize fixes the width
+    and never rounds. Mirrors `_cents` in entries.py."""
+    return (Decimal(micros) / schema.RATE_MICROS).quantize(schema.RATE_PLACES)
+
+
 def fx_rates(seed: int, months: list[date]) -> list[dict[str, object]]:
     """A rate per currency per day of the generated range."""
     rng = stream_for(seed, DIMENSIONS)
     rows = []
     for currency in CURRENCIES:
-        centre = Decimal("1.0") if currency == BASE_CURRENCY else Decimal(rng.uniform(5.0, 9.0))
+        centre = (
+            schema.RATE_MICROS
+            if currency == BASE_CURRENCY
+            else rng.randrange(RATE_MIN_MICROS, RATE_MAX_MICROS)
+        )
         for month in months:
             day = month
             while day.month == month.month:
-                drift = Decimal(rng.uniform(-0.02, 0.02))
-                rate = Decimal("1.0") if currency == BASE_CURRENCY else centre * (1 + drift)
+                # Drawn for every currency, including the base, whose value is then
+                # discarded. CNY is first in CURRENCIES, so dropping these draws would
+                # shift EUR, USD and GBP for a reason unrelated to precision.
+                drift = rng.randrange(-DRIFT_PPM, DRIFT_PPM + 1)
+                micros = (
+                    schema.RATE_MICROS
+                    if currency == BASE_CURRENCY
+                    else centre * (schema.RATE_MICROS + drift) // schema.RATE_MICROS
+                )
                 rows.append(
                     {
                         "currency": currency,
                         "rate_date": schema.format_date(day),
-                        "rate_to_base": schema.format_amount(rate),
+                        "rate_to_base": schema.format_rate(_rate(micros)),
                     }
                 )
                 day += timedelta(days=1)
