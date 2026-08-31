@@ -50,8 +50,16 @@ REQUIRED_CONSTRAINT_KEYS: dict[str, frozenset[str]] = {
     "exactly_one_nonzero": frozenset({"columns"}),
 }
 
-TOP_LEVEL = frozenset({"table", "primary_key", "columns", "row_constraints"})
+TOP_LEVEL = frozenset({
+    "table", "primary_key", "columns", "row_constraints", "watermark", "partition_by",
+})
 REQUIRED = frozenset({"table", "primary_key", "columns"})
+
+# Both name a column the load reads as a date and must be able to compare: `watermark`
+# is what the incremental load advances on, `partition_by` is what the raw layer
+# partitions by. Absence is meaningful - a table that declares no watermark is loaded
+# in full. See docs/adr/0014-the-contract-declares-the-watermark-column.md.
+DATE_KEYS = ("watermark", "partition_by")
 
 
 class ContractError(ValueError):
@@ -125,6 +133,22 @@ def _validate(contract: dict, source: str) -> dict:
         for key in spec:
             if key not in permitted:
                 fail(f"{name}: {spec['type']} columns cannot take {key!r}")
+
+    for key in DATE_KEYS:
+        if key not in contract:
+            continue
+        named = contract[key]
+        if not isinstance(named, str) or not named:
+            fail(f"{key} must be a column name, got {named!r}")
+        spec = next((entry for entry in contract["columns"] if entry["name"] == named), None)
+        if spec is None:
+            fail(f"{key} names {named!r}, which is not a column")
+        if spec["type"] != "date":
+            fail(f"{key} names {named!r}, which is a {spec['type']} rather than a date")
+        # A watermark that can be absent cannot be compared, and the failure is not an
+        # error: the row is silently left out of every window it belonged in.
+        if spec["nullable"]:
+            fail(f"{key} names {named!r}, which is nullable")
 
     primary_key = contract["primary_key"]
     if not isinstance(primary_key, list) or not primary_key:

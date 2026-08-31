@@ -244,3 +244,15 @@ def test_settings_fall_back_to_the_dotenv_file(monkeypatch, tmp_path):
     # A real environment variable still wins, the way Compose resolves it.
     monkeypatch.setenv("POSTGRES_DB", "from_environment")
     assert conftest.settings()["POSTGRES_DB"] == "from_environment"
+
+
+# --- Added at stage 6 of merge-entries-idempotently -------------------------
+
+def test_pyarrow_is_a_core_dependency():
+    """Case 41. The raw layer is Parquet, and ingest writes it on every run - so
+    pyarrow installs with the package rather than with an optional group. Per
+    docs/adr/0003, the task that first needs a dependency is the one that adds it."""
+    core = {distribution_name(r) for r in read_pyproject()["project"]["dependencies"]}
+    assert "pyarrow" in core, f"core dependencies do not carry pyarrow: {sorted(core)}"
+
+    import pyarrow  # noqa: F401  - declared is not installed until it imports

@@ -84,8 +84,10 @@ def test_every_contract_is_structurally_valid():
     for table in TABLES:
         contract = contracts.load(table)   # load() validates, or raises
 
-        assert set(contract) <= {"table", "primary_key", "columns", "row_constraints"}
-        assert {"table", "primary_key", "columns"} <= set(contract)
+        # The permitted set itself is pinned by test_the_top_level_whitelist_did_not_widen;
+        # this asserts each real contract stays inside it, whatever it currently is.
+        assert set(contract) <= contracts.TOP_LEVEL
+        assert contracts.REQUIRED <= set(contract)
 
         names = [spec["name"] for spec in contract["columns"]]
         assert len(names) == len(set(names)), f"{table} repeats a column name"
@@ -395,3 +397,90 @@ def test_the_contract_data_is_reachable_through_the_package():
 
     for table in TABLES:
         assert resources.files("ingest.contracts").joinpath(f"{table}.yaml").is_file()
+
+
+# --- Added at stage 6 of merge-entries-idempotently -------------------------
+#
+# A contract now says which column its table advances its watermark on, and which
+# column the raw layer partitions by. Cases 1-8 of task.md.
+
+DATED = {
+    "table": "t",
+    "primary_key": ["a"],
+    "columns": [
+        {"name": "a", "type": "string", "nullable": False},
+        {"name": "d", "type": "date", "nullable": False},
+        {"name": "maybe", "type": "date", "nullable": True},
+    ],
+}
+
+
+def dated(**changes) -> dict:
+    import copy
+    contract = copy.deepcopy(DATED)
+    contract.update(changes)
+    return contract
+
+
+INCREMENTAL = {
+    "gl_entry": ("posted_at", "accounting_date"),
+    "gl_adjustment": ("posted_at", "accounting_date"),
+}
+
+@pytest.mark.parametrize("table,expected", sorted(INCREMENTAL.items()))
+def test_the_entry_tables_declare_their_watermark_and_partition(table, expected):
+    """Case 1. The source has no `updated_at`; `posted_at` is the column that already
+    means when a row landed. See docs/adr/0014."""
+    contract = contracts.load(table)
+    watermark, partition_by = expected
+    assert contract["watermark"] == watermark
+    assert contract["partition_by"] == partition_by
+
+
+@pytest.mark.parametrize("key", ["watermark", "partition_by"])
+@pytest.mark.parametrize("value,expected", [
+    # Case 3: names a column that does not exist.
+    ("nope", "nope"),
+    # Case 4: names a column that is not a date.
+    ("a", "date"),
+    # Case 5: names a column that may be null.
+    ("maybe", "nullable"),
+])
+def test_a_watermark_that_cannot_be_compared_is_refused(key, value, expected):
+    """Cases 3-5, and case 6 which is the same three for `partition_by`.
+
+    A nullable watermark is the one that matters: it does not raise, it silently
+    leaves a row out of every window it should have been in."""
+    with pytest.raises(contracts.ContractError, match=expected):
+        validated(dated(**{key: value}))
+
+
+@pytest.mark.parametrize("key", ["watermark", "partition_by"])
+def test_a_watermark_that_is_not_a_column_name_is_refused(key):
+    """Case 7. A bare `7` would otherwise reach the column lookup as an int."""
+    with pytest.raises(contracts.ContractError, match="column name"):
+        validated(dated(**{key: 7}))
+
+
+FULL_RELOAD = ("dim_account_src", "dim_cost_center_src", "fx_rate")
+
+
+@pytest.mark.parametrize("table", FULL_RELOAD)
+def test_the_other_tables_declare_neither(table):
+    """Case 2, pinned here beside the other declarations as well as behaviourally in
+    tests/test_load.py. It could not live here alone: before the loader knew these keys,
+    a bare `not in` was satisfied by a loader that had never heard of them."""
+    contract = contracts.load(table)
+    assert "watermark" not in contract
+    assert "partition_by" not in contract
+
+
+def test_the_top_level_whitelist_did_not_widen():
+    """Case 8. Two keys were added to TOP_LEVEL; the guard against a third that
+    nobody declared has to still be there."""
+    assert contracts.TOP_LEVEL == {
+        "table", "primary_key", "columns", "row_constraints",
+        "watermark", "partition_by",
+    }
+    with pytest.raises(contracts.ContractError, match="unknown top-level"):
+        validated(dated(watermarkk="d"))

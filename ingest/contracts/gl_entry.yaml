@@ -7,6 +7,15 @@
 table: gl_entry
 primary_key: [entry_id, version]
 
+# The incremental load advances on posted_at - when the row actually landed.
+# There is no updated_at in this source; see
+# docs/adr/0014-the-contract-declares-the-watermark-column.md.
+watermark: posted_at
+
+# The raw layer partitions by the accounting period the entry belongs to, so a
+# late correction to March rewrites March and opens nothing else.
+partition_by: accounting_date
+
 columns:
   - name: entry_id
     type: string

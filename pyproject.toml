@@ -4,10 +4,12 @@ version = "0.1.0"
 description = "A finance data platform where the hard problems are data engineering ones"
 requires-python = ">=3.13"
 
-# Core: what the platform needs to talk to its own database, and to read the source
-# contracts, which are consulted at ingest time rather than only under test.
+# Core: what the platform needs to talk to its own database, to read the source
+# contracts, which are consulted at ingest time rather than only under test, and to
+# write the raw layer, which is Parquet.
 dependencies = [
     "psycopg[binary]",
+    "pyarrow",
     "pyyaml",
 ]
 
