@@ -27,18 +27,21 @@ DAG runs the two in order. See docs/adr/0014 and 0016.
 
 import argparse
 import csv
+import hashlib
 import json
 import logging
 import os
 import sys
+import time
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta
 from pathlib import Path
 
-from . import contracts, raw, validate
+from . import contracts, raw, runs, validate
 
 __all__ = [
     "DEFAULT_OVERLAP_DAYS",
+    "digest_of",
     "Watermarks",
     "TableLoad",
     "LoadReport",
@@ -189,6 +192,7 @@ class TableLoad:
     """What one table's load did. The CLI's summary line is rendered from these."""
 
     table: str
+    source_sha256: str = ""
     rows_scanned: int = 0
     rows_inserted: int = 0
     rows_updated: int = 0
@@ -209,9 +213,43 @@ class TableLoad:
 @dataclass
 class LoadReport:
     tables: list[TableLoad] = field(default_factory=list)
+    run_id: str = ""
 
     def describe(self) -> str:
         return "\n".join(table.describe() for table in self.tables)
+
+    def as_table_runs(self) -> list[runs.TableRun]:
+        """The report as the run record holds it. The two say the same thing about the
+        same run, so neither gets to drift from the other."""
+        return [
+            runs.TableRun(
+                table=table.table,
+                source_sha256=table.source_sha256,
+                rows_scanned=table.rows_scanned,
+                rows_inserted=table.rows_inserted,
+                rows_updated=table.rows_updated,
+                rows_evicted=table.rows_evicted,
+                partitions_written=table.partitions_written,
+                watermark_from=table.watermark_from,
+                watermark_to=table.watermark_to,
+            )
+            for table in self.tables
+        ]
+
+
+def digest_of(path) -> str:
+    """The SHA-256 of a source file, read a megabyte at a time.
+
+    A second sequential pass over a file the load is about to stream anyway. It is the
+    only answer to whether the extract that was ingested is the bytes that were sent,
+    and it is scoped to the run that read it rather than stamped onto rows a later
+    rewrite may mix with others. See docs/adr/0020.
+    """
+    digest = hashlib.sha256()
+    with Path(path).open("rb") as handle:
+        for block in iter(lambda: handle.read(1024 * 1024), b""):
+            digest.update(block)
+    return digest.hexdigest()
 
 
 # --- the walk --------------------------------------------------------------
@@ -221,6 +259,12 @@ def select_rows(contract: dict, path, bound: str | None):
 
     Rows stream and are yielded one at a time; what the caller then holds is the batch,
     which the window bounds. Nothing here holds the file.
+
+    An added column is a compatible change, so a source is free to grow one called
+    `_first_run_id`. It does not get to be one: the run identifiers are ingest's, they
+    are written by `raw.write_partition` and by nothing else, and a source column of
+    that name is dropped here rather than being carried into the batch and stamped onto
+    a row as though raw had said it. See docs/adr/0018.
     """
     path = Path(path)
     column = contract.get("watermark")
@@ -257,40 +301,50 @@ def select_rows(contract: dict, path, bound: str | None):
                     f"{contract['table']}: {path} row {number} has {len(values)} "
                     f"fields, but the header declares {len(header)}"
                 )
-            row = dict(zip(header, values))
+            row = {name: value for name, value in zip(header, values)
+                   if name not in raw.METADATA}
             if bound is None or column is None or row[column] >= bound:
                 yield row
 
 
-def merge_partition(contract: dict, path, incoming) -> tuple[int, int]:
+def merge_partition(contract: dict, path, incoming, *, run_id: str) -> tuple[int, int]:
     """Apply `incoming` to one partition by primary key. Returns (inserted, updated).
 
     The incoming row wins, which is what makes the result a function of the union
     rather than of the order the writes happened in - and therefore what makes a rerun
     reach the same file.
+
+    The partition is read with its run identifiers, and an incoming row that replaces a
+    key already here inherits that key's `_first_run_id`: the run that brought the key
+    is not the run that restated it. Rows the batch never mentions are carried across
+    with theirs intact, which is what stops a partition reopened for one row from
+    claiming this run landed all of them. See docs/adr/0018.
     """
     key_columns = contract["primary_key"]
 
     def key(row):
         return tuple(row[name] for name in key_columns)
 
-    existing = {key(row): row for row in raw.read_partition(contract, path)}
+    existing = {key(row): row for row in raw.read_partition(contract, path, metadata=True)}
     held = set(existing)
     # Counted over the keys the batch carries, not the rows: two incoming rows for one
     # key produce one row, and reporting two insertions would make the summary line
     # disagree with the partition it describes. `load_table` already collapses a
     # repeated key before it gets here, and this does not depend on that.
     for row in incoming:
-        existing[key(row)] = row
+        landed = key(row)
+        first = existing.get(landed, {}).get(raw.FIRST_RUN_ID)
+        existing[landed] = {**row, raw.FIRST_RUN_ID: first} if first else dict(row)
     touched = {key(row) for row in incoming}
     updated = len(touched & held)
     inserted = len(touched) - updated
 
-    raw.write_partition(contract, path, list(existing.values()))
+    raw.write_partition(contract, path, list(existing.values()), run_id=run_id)
     return inserted, updated
 
 
-def evict_moved_keys(contract: dict, raw_dir, home: dict[tuple[str, ...], str]) -> tuple[int, int]:
+def evict_moved_keys(contract: dict, raw_dir, home: dict[tuple[str, ...], str],
+                     *, run_id: str) -> tuple[int, int]:
     """Remove each key in `home` from every partition except the one it now belongs to.
 
     A row's partition comes from its accounting date, which is not part of its primary
@@ -319,14 +373,14 @@ def evict_moved_keys(contract: dict, raw_dir, home: dict[tuple[str, ...], str]) 
         if not moved:
             continue
 
-        rows = raw.read_partition(contract, path)
+        rows = raw.read_partition(contract, path, metadata=True)
         kept = [row for row in rows if tuple(row[name] for name in key_columns) not in moved]
         # Rows, not keys. A partition already holding two rows for one key is exactly
         # the state this repairs, so saying "1" would understate what it did.
         evicted += len(rows) - len(kept)
         rewritten += 1
         if kept:
-            raw.write_partition(contract, path, kept)
+            raw.write_partition(contract, path, kept, run_id=run_id)
         else:
             # The period emptied out. A zero-row file would make the layout claim a
             # period exists that holds nothing.
@@ -344,6 +398,7 @@ def load_table(
     overlap_days: int = DEFAULT_OVERLAP_DAYS,
     full: bool = False,
     watermarks: Watermarks,
+    run_id: str,
 ) -> TableLoad:
     """Load one source table into the raw layer."""
     table = contract["table"]
@@ -357,7 +412,12 @@ def load_table(
 
     watermark_column = contract.get("watermark")
     stored = watermarks.get(table)
-    result = TableLoad(table=table, watermark_from=stored, watermark_to=stored)
+    result = TableLoad(
+        table=table,
+        source_sha256=digest_of(source),
+        watermark_from=stored,
+        watermark_to=stored,
+    )
 
     bound = None if (full or watermark_column is None) else lower_bound(stored, overlap_days)
 
@@ -376,7 +436,7 @@ def load_table(
                 highest = value
 
     if watermark_column is None:
-        raw.write_table(contract, raw_dir, list(batch.values()))
+        raw.write_table(contract, raw_dir, list(batch.values()), run_id=run_id)
         result.rows_inserted = len(batch)
         result.partitions_written = 1
         return result
@@ -384,13 +444,25 @@ def load_table(
     if not batch:
         return result
 
+    # Which run first landed each key this table already holds, looked up before the
+    # batch is grouped. `merge_partition` reads the partition it is about to write, so
+    # it recovers the identifier for every key already in that partition - but a row
+    # whose accounting date moved arrives in a partition that has never seen it, and
+    # the copy carrying its identifier is in the partition it is about to be evicted
+    # from. This is the same table-wide scan of key columns that `evict_moved_keys`
+    # already makes on every run, one column wider. See docs/adr/0018.
+    prior = raw.prior_first_run_ids(contract, raw_dir)
+
     grouped: dict[str, list[dict[str, str]]] = {}
-    for row in batch.values():
+    for key, row in batch.items():
+        first = prior.get(key)
+        if first:
+            row = {**row, raw.FIRST_RUN_ID: first}
         grouped.setdefault(raw.partition_of(row[contract["partition_by"]]), []).append(row)
 
     for period, rows in sorted(grouped.items()):
         inserted, updated = merge_partition(
-            contract, raw.partition_path(raw_dir, contract, period), rows
+            contract, raw.partition_path(raw_dir, contract, period), rows, run_id=run_id
         )
         result.rows_inserted += inserted
         result.rows_updated += updated
@@ -399,7 +471,7 @@ def load_table(
     home = {
         key: raw.partition_of(row[contract["partition_by"]]) for key, row in batch.items()
     }
-    evicted, rewritten = evict_moved_keys(contract, raw_dir, home)
+    evicted, rewritten = evict_moved_keys(contract, raw_dir, home, run_id=run_id)
     result.rows_evicted = evicted
     result.partitions_written += rewritten
 
@@ -419,27 +491,51 @@ def load_source(
     overlap_days: int = DEFAULT_OVERLAP_DAYS,
     full: bool = False,
 ) -> LoadReport:
-    """Load a source directory into a raw layer.
+    """Load a source directory into a raw layer, and record that the run happened.
 
     Raises only for what is not about the data - a `source_dir` that is not a
     directory, a contract that does not load.
+
+    The run record is opened before any table is read and closed whatever happens: a
+    failure is written down, naming the table it happened on, and then re-raised
+    unchanged, so the exit code is decided exactly where it was before. A record
+    written only on the paths that worked would be missing from the run somebody is
+    investigating. See docs/adr/0019.
     """
     source = Path(source_dir)
     if not source.is_dir():
+        # Before the run opens: there was nothing here to run against, and a record
+        # saying a run started would be a record of something that did not happen.
         raise NotADirectoryError(f"no source directory at {source}")
 
-    watermarks = Watermarks.load(raw_dir)
     names = list(tables) if tables is not None else contracts.tables()
-    report = LoadReport(
-        tables=[
-            load_table(
+    run_id = runs.new_run_id()
+    log = runs.RunLog(raw_dir)
+    log.start(run_id, command="load", source=str(source), raw=str(Path(raw_dir)),
+              tables=names, overlap_days=overlap_days, full=full)
+
+    started = time.monotonic()
+    report = LoadReport(run_id=run_id)
+    failed_table = None
+    try:
+        watermarks = Watermarks.load(raw_dir)
+        for name in names:
+            failed_table = name
+            report.tables.append(load_table(
                 contracts.load(name), source, raw_dir,
                 overlap_days=overlap_days, full=full, watermarks=watermarks,
-            )
-            for name in names
-        ]
-    )
-    watermarks.save()
+                run_id=run_id,
+            ))
+            failed_table = None
+        watermarks.save()
+    except Exception as failure:
+        log.finish(run_id, status=runs.FAILED, duration_seconds=time.monotonic() - started,
+                   tables=report.as_table_runs(), failed_table=failed_table,
+                   error=f"{type(failure).__name__}: {failure}")
+        raise
+
+    log.finish(run_id, status=runs.SUCCEEDED, duration_seconds=time.monotonic() - started,
+               tables=report.as_table_runs())
     return report
 
 
@@ -498,6 +594,7 @@ def main(argv: list[str] | None = None) -> int:
         )
         return 2
 
+    print(f"run {report.run_id}")
     print(report.describe())
     return 0
 

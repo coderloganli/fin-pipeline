@@ -26,6 +26,12 @@ DIM_ACCOUNT = contracts.load("dim_account_src")
 
 PART_FILE = "part-0000.parquet"
 
+# Two runs, for the tests that need to tell them apart. Every write needs one:
+# `write_partition` stamps the row with it. See docs/adr/0018.
+RUN_A = "20260901T031500Z-aaaaaa"
+RUN_B = "20260902T031500Z-bbbbbb"
+METADATA = ("_first_run_id", "_last_run_id")
+
 
 def entry(entry_id: str, version: str, accounting_date: str, **overrides) -> dict[str, str]:
     """One gl_entry row, every declared column present and every value a string."""
@@ -56,7 +62,7 @@ THREE_PERIODS = [
 def test_a_batch_lands_one_file_per_accounting_period(tmp_path):
     """Case 9. The partition is what lets a late correction to March rewrite March
     and open nothing else."""
-    raw.write_table(GL_ENTRY, tmp_path, THREE_PERIODS)
+    raw.write_table(GL_ENTRY, tmp_path, THREE_PERIODS, run_id=RUN_A)
 
     directories = sorted(path.name for path in (tmp_path / "gl_entry").iterdir())
     assert directories == [
@@ -78,17 +84,18 @@ def test_a_partition_carries_the_declared_columns_as_strings(tmp_path):
     import pyarrow as pa
     import pyarrow.parquet as pq
 
-    raw.write_table(GL_ENTRY, tmp_path, THREE_PERIODS)
+    raw.write_table(GL_ENTRY, tmp_path, THREE_PERIODS, run_id=RUN_A)
     schema = pq.read_schema(tmp_path / "gl_entry" / "accounting_period=2026-01" / PART_FILE)
 
-    assert schema.names == [spec["name"] for spec in GL_ENTRY["columns"]]
+    declared = [spec["name"] for spec in GL_ENTRY["columns"]]
+    assert schema.names == declared + list(METADATA)
     for name in schema.names:
         assert schema.field(name).type == pa.string(), f"{name} is not a string"
 
 
 def test_rows_round_trip_unchanged(tmp_path):
     """Case 11."""
-    raw.write_table(GL_ENTRY, tmp_path, THREE_PERIODS)
+    raw.write_table(GL_ENTRY, tmp_path, THREE_PERIODS, run_id=RUN_A)
     landed = sorted(raw.read_table(GL_ENTRY, tmp_path), key=lambda row: row["entry_id"])
 
     assert landed == sorted(THREE_PERIODS, key=lambda row: row["entry_id"])
@@ -105,7 +112,7 @@ def test_an_empty_field_stays_an_empty_string(tmp_path):
         {"account_code": "1000", "name": "Assets", "parent_code": "",
          "account_type": "asset", "effective_date": "2026-01-01"},
     ]
-    raw.write_table(DIM_ACCOUNT, tmp_path, rows)
+    raw.write_table(DIM_ACCOUNT, tmp_path, rows, run_id=RUN_A)
 
     landed = list(raw.read_table(DIM_ACCOUNT, tmp_path))
     assert landed == rows
@@ -119,7 +126,7 @@ def test_a_table_with_no_partition_column_is_one_file(tmp_path):
         {"currency": "EUR", "rate_date": "2026-01-01", "rate_to_base": "7.654321"},
         {"currency": "USD", "rate_date": "2026-01-01", "rate_to_base": "7.123456"},
     ]
-    raw.write_table(FX_RATE, tmp_path, rows)
+    raw.write_table(FX_RATE, tmp_path, rows, run_id=RUN_A)
 
     assert (tmp_path / "fx_rate" / PART_FILE).is_file()
     assert [path.name for path in (tmp_path / "fx_rate").iterdir()] == [PART_FILE]
@@ -135,8 +142,8 @@ def test_a_partition_is_sorted_by_primary_key_whatever_order_it_arrived_in(tmp_p
     ]
     backwards = list(reversed(forwards))
 
-    raw.write_table(GL_ENTRY, tmp_path / "a", forwards)
-    raw.write_table(GL_ENTRY, tmp_path / "b", backwards)
+    raw.write_table(GL_ENTRY, tmp_path / "a", forwards, run_id=RUN_A)
+    raw.write_table(GL_ENTRY, tmp_path / "b", backwards, run_id=RUN_A)
 
     partition = f"gl_entry/accounting_period=2026-01/{PART_FILE}"
     one = raw.read_partition(GL_ENTRY, tmp_path / "a" / partition)
@@ -149,7 +156,7 @@ def test_a_partition_is_sorted_by_primary_key_whatever_order_it_arrived_in(tmp_p
 
 def test_row_count_spans_every_partition(tmp_path):
     """Case 15."""
-    raw.write_table(GL_ENTRY, tmp_path, THREE_PERIODS)
+    raw.write_table(GL_ENTRY, tmp_path, THREE_PERIODS, run_id=RUN_A)
     assert raw.row_count(GL_ENTRY, tmp_path) == len(THREE_PERIODS)
 
 
@@ -157,25 +164,25 @@ def test_the_checksum_does_not_depend_on_order_or_batching(tmp_path):
     """Case 16. The same rows, written in a different order and in a different number
     of calls, must produce the same digest - otherwise the acceptance criterion is
     measuring the load's shape rather than its result."""
-    raw.write_table(GL_ENTRY, tmp_path / "one_go", THREE_PERIODS)
+    raw.write_table(GL_ENTRY, tmp_path / "one_go", THREE_PERIODS, run_id=RUN_A)
 
     second = tmp_path / "in_two"
-    raw.write_table(GL_ENTRY, second, list(reversed(THREE_PERIODS[:2])))
+    raw.write_table(GL_ENTRY, second, list(reversed(THREE_PERIODS[:2])), run_id=RUN_A)
     for row in THREE_PERIODS[2:]:
         path = raw.partition_path(second, GL_ENTRY, raw.partition_of(row["accounting_date"]))
         existing = raw.read_partition(GL_ENTRY, path) if path.is_file() else []
-        raw.write_partition(GL_ENTRY, path, existing + [row])
+        raw.write_partition(GL_ENTRY, path, existing + [row], run_id=RUN_A)
 
     assert raw.checksum(GL_ENTRY, tmp_path / "one_go") == raw.checksum(GL_ENTRY, second)
 
 
 def test_the_checksum_notices_a_changed_field(tmp_path):
     """Case 17. An instrument that never moves is not an instrument."""
-    raw.write_table(GL_ENTRY, tmp_path / "before", THREE_PERIODS)
+    raw.write_table(GL_ENTRY, tmp_path / "before", THREE_PERIODS, run_id=RUN_A)
 
     changed = [dict(row) for row in THREE_PERIODS]
     changed[0]["amount_dr"] = "100.01"
-    raw.write_table(GL_ENTRY, tmp_path / "after", changed)
+    raw.write_table(GL_ENTRY, tmp_path / "after", changed, run_id=RUN_A)
 
     assert raw.checksum(GL_ENTRY, tmp_path / "before") != raw.checksum(
         GL_ENTRY, tmp_path / "after"
@@ -190,7 +197,7 @@ def test_the_checksum_ignores_a_column_the_contract_does_not_declare(tmp_path):
     import pyarrow as pa
     import pyarrow.parquet as pq
 
-    raw.write_table(GL_ENTRY, tmp_path, THREE_PERIODS)
+    raw.write_table(GL_ENTRY, tmp_path, THREE_PERIODS, run_id=RUN_A)
     before = raw.checksum(GL_ENTRY, tmp_path)
 
     path = tmp_path / "gl_entry" / "accounting_period=2026-01" / PART_FILE
@@ -222,8 +229,8 @@ def test_the_checksum_separates_fields_it_cannot_be_fooled_across(tmp_path):
     right = [entry("A", "1", "2026-01-01",
                    account_code="6001", cost_center_code=f"X{separator}CC01")]
 
-    raw.write_table(GL_ENTRY, tmp_path / "left", left)
-    raw.write_table(GL_ENTRY, tmp_path / "right", right)
+    raw.write_table(GL_ENTRY, tmp_path / "left", left, run_id=RUN_A)
+    raw.write_table(GL_ENTRY, tmp_path / "right", right, run_id=RUN_A)
 
     assert raw.checksum(GL_ENTRY, tmp_path / "left") != raw.checksum(
         GL_ENTRY, tmp_path / "right"
@@ -260,7 +267,7 @@ def test_read_keys_on_an_absent_partition_is_empty(tmp_path):
 
 
 def test_read_keys_reads_the_keys_and_not_the_rest(tmp_path):
-    raw.write_table(GL_ENTRY, tmp_path, THREE_PERIODS)
+    raw.write_table(GL_ENTRY, tmp_path, THREE_PERIODS, run_id=RUN_A)
     path = tmp_path / "gl_entry" / "accounting_period=2026-03" / PART_FILE
 
     assert raw.read_keys(GL_ENTRY, path) == {("E3", "1"), ("E4", "1")}
@@ -271,7 +278,7 @@ def test_a_parquet_write_that_fails_leaves_no_temporary_file(tmp_path, monkeypat
     Debris beside a partition would be picked up by nothing and explained by nobody."""
     import pyarrow.parquet as pq
 
-    raw.write_table(GL_ENTRY, tmp_path, THREE_PERIODS)
+    raw.write_table(GL_ENTRY, tmp_path, THREE_PERIODS, run_id=RUN_A)
     path = tmp_path / "gl_entry" / "accounting_period=2026-01" / PART_FILE
     before = path.read_bytes()
 
@@ -281,7 +288,7 @@ def test_a_parquet_write_that_fails_leaves_no_temporary_file(tmp_path, monkeypat
 
     monkeypatch.setattr(pq, "write_table", fails_after_opening)
     with pytest.raises(OSError):
-        raw.write_partition(GL_ENTRY, path, [entry("E9", "1", "2026-01-05")])
+        raw.write_partition(GL_ENTRY, path, [entry("E9", "1", "2026-01-05")], run_id=RUN_A)
     monkeypatch.undo()
 
     assert path.read_bytes() == before
@@ -292,10 +299,102 @@ def test_a_partitioned_table_reloaded_with_nothing_keeps_its_directory(tmp_path)
     """The table still exists, it just holds no periods. Removing the directory as well
     would make `partitions` and `checksum` unable to tell a table that was emptied from
     one that was never loaded - and the acceptance check reads both."""
-    raw.write_table(GL_ENTRY, tmp_path, THREE_PERIODS)
-    raw.write_table(GL_ENTRY, tmp_path, [])
+    raw.write_table(GL_ENTRY, tmp_path, THREE_PERIODS, run_id=RUN_A)
+    raw.write_table(GL_ENTRY, tmp_path, [], run_id=RUN_A)
 
     assert (tmp_path / "gl_entry").is_dir()
     assert list((tmp_path / "gl_entry").iterdir()) == []
     assert raw.partitions(GL_ENTRY, tmp_path) == []
     assert raw.row_count(GL_ENTRY, tmp_path) == 0
+
+
+# --- the two run identifiers -----------------------------------------------
+#
+# Cases 14, 22, 23, 23a and 25 of task.md. The stamping happens in
+# `write_partition` and nowhere else, so these pin it at the layer that does it.
+# See docs/adr/0018.
+
+
+def test_a_row_landing_for_the_first_time_carries_the_same_run_twice(tmp_path):
+    """Case 14, at the layer that writes it. Nothing came before, so the run that
+    landed the row is also the run that last wrote it."""
+    path = tmp_path / "gl_entry" / "accounting_period=2026-01" / PART_FILE
+    raw.write_partition(GL_ENTRY, path, [entry("E1", "1", "2026-01-15")], run_id=RUN_A)
+
+    landed = raw.read_partition(GL_ENTRY, path, metadata=True)
+    assert [row["_first_run_id"] for row in landed] == [RUN_A]
+    assert [row["_last_run_id"] for row in landed] == [RUN_A]
+
+
+def test_a_rewrite_keeps_the_first_run_and_moves_the_last(tmp_path):
+    """Case 14, continued. A row carried back in from the partition keeps the run that
+    landed it; the run doing the writing owns only `_last_run_id`."""
+    path = tmp_path / "gl_entry" / "accounting_period=2026-01" / PART_FILE
+    raw.write_partition(GL_ENTRY, path, [entry("E1", "1", "2026-01-15")], run_id=RUN_A)
+
+    carried = raw.read_partition(GL_ENTRY, path, metadata=True)
+    raw.write_partition(GL_ENTRY, path, carried, run_id=RUN_B)
+
+    landed = raw.read_partition(GL_ENTRY, path, metadata=True)
+    assert [row["_first_run_id"] for row in landed] == [RUN_A]
+    assert [row["_last_run_id"] for row in landed] == [RUN_B]
+
+
+def test_write_partition_will_not_run_without_a_run_identifier(tmp_path):
+    """Case 22. Required rather than defaulted: a default would let a write path that
+    forgot to thread the identifier drop it silently, which is the failure this whole
+    ticket exists to prevent."""
+    path = tmp_path / "gl_entry" / "accounting_period=2026-01" / PART_FILE
+    with pytest.raises(TypeError):
+        raw.write_partition(GL_ENTRY, path, [entry("E1", "1", "2026-01-15")])
+
+
+def test_write_table_will_not_run_without_a_run_identifier(tmp_path):
+    """Case 22. The whole-table replacement path, for the same reason."""
+    with pytest.raises(TypeError):
+        raw.write_table(GL_ENTRY, tmp_path, THREE_PERIODS)
+
+
+def test_read_partition_hides_the_metadata_unless_it_is_asked_for(tmp_path):
+    """Case 23. The default is the declared columns and nothing else, so every caller
+    that was reading rows before this landed still sees what the source said."""
+    path = tmp_path / "gl_entry" / "accounting_period=2026-01" / PART_FILE
+    raw.write_partition(GL_ENTRY, path, [entry("E1", "1", "2026-01-15")], run_id=RUN_A)
+
+    declared = [spec["name"] for spec in GL_ENTRY["columns"]]
+    plain = raw.read_partition(GL_ENTRY, path)
+    assert list(plain[0]) == declared
+
+    with_metadata = raw.read_partition(GL_ENTRY, path, metadata=True)
+    assert set(with_metadata[0]) - set(plain[0]) == set(METADATA)
+
+
+def test_the_written_schema_is_the_declared_columns_then_the_two_identifiers(tmp_path):
+    """Case 23a. Position and type, not just presence: the identifiers are strings like
+    everything else in raw, and they come after the columns the contract declares."""
+    import pyarrow as pa
+    import pyarrow.parquet as pq
+
+    path = tmp_path / "gl_entry" / "accounting_period=2026-01" / PART_FILE
+    raw.write_partition(GL_ENTRY, path, [entry("E1", "1", "2026-01-15")], run_id=RUN_A)
+
+    schema = pq.read_schema(path)
+    declared = [spec["name"] for spec in GL_ENTRY["columns"]]
+    assert schema.names == declared + list(METADATA)
+    assert all(field.type == pa.string() for field in schema)
+
+
+def test_the_checksum_does_not_see_the_run_identifiers(tmp_path):
+    """Case 25. Two raw layers holding the same rows from different runs are the same
+    raw layer as far as the acceptance criterion is concerned - which is what makes
+    `record-every-pipeline-run` and the three-run stability property compatible at
+    all. See docs/adr/0017."""
+    raw.write_table(GL_ENTRY, tmp_path / "left", THREE_PERIODS, run_id=RUN_A)
+    raw.write_table(GL_ENTRY, tmp_path / "right", THREE_PERIODS, run_id=RUN_B)
+
+    assert raw.checksum(GL_ENTRY, tmp_path / "left") == raw.checksum(
+        GL_ENTRY, tmp_path / "right"
+    )
+    assert raw.row_count(GL_ENTRY, tmp_path / "left") == raw.row_count(
+        GL_ENTRY, tmp_path / "right"
+    )

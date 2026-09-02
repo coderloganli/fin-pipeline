@@ -11,9 +11,14 @@ ingest convert `amount_dr` to a decimal and `posted_at` to a date on the way in?
 
 ## Decision
 
-Every column is written as Parquet `string`, in the order the contract declares, and
-nothing else is written beside them. An empty CSV field lands as an empty string, not
-as a Parquet null.
+Every column is written as Parquet `string`, in the order the contract declares. An
+empty CSV field lands as an empty string, not as a Parquet null.
+
+Nothing else from the source is written beside them. The two run identifiers
+`_first_run_id` and `_last_run_id` are, and they are the only exception: they belong
+to ingest rather than to the source, they are underscore-prefixed to say so, and they
+are outside the checksum. See
+`docs/adr/0018-raw-rows-carry-two-run-identifiers.md`.
 
 Each partition is one file:
 `data/raw/<table>/accounting_period=YYYY-MM/part-0000.parquet`. A table with no

@@ -19,7 +19,7 @@ from pathlib import Path
 
 import pytest
 
-from ingest import contracts, load, raw
+from ingest import contracts, load, raw, runs
 
 GL_ENTRY = contracts.load("gl_entry")
 GL_ADJUSTMENT = contracts.load("gl_adjustment")
@@ -27,6 +27,8 @@ FX_RATE = contracts.load("fx_rate")
 
 PART_FILE = "part-0000.parquet"
 
+# Two runs, for the tests that need to tell them apart. Every write needs one:
+# `write_partition` stamps the row with it. See docs/adr/0018.
 
 # --- building a source directory -------------------------------------------
 
@@ -267,13 +269,13 @@ def test_merge_partition_reports_what_it_inserted_and_updated(raw_dir):
     """Case 26."""
     path = raw.partition_path(raw_dir, GL_ENTRY, "2026-03")
     first = [entry("E3", "1", "2026-03-15", "2026-03-20")]
-    assert load.merge_partition(GL_ENTRY, path, first) == (1, 0)
+    assert load.merge_partition(GL_ENTRY, path, first, run_id=RUN_A) == (1, 0)
 
     again = [
         entry("E3", "1", "2026-03-15", "2026-03-20", amount_dr="5.00"),
         entry("E9", "1", "2026-03-18", "2026-03-19"),
     ]
-    assert load.merge_partition(GL_ENTRY, path, again) == (1, 1)
+    assert load.merge_partition(GL_ENTRY, path, again, run_id=RUN_B) == (1, 1)
 
 
 def test_merge_partition_counts_keys_rather_than_rows(raw_dir):
@@ -286,7 +288,7 @@ def test_merge_partition_counts_keys_rather_than_rows(raw_dir):
         entry("E3", "1", "2026-03-15", "2026-03-20", amount_dr="2.00"),
     ]
 
-    assert load.merge_partition(GL_ENTRY, path, twice) == (1, 0)
+    assert load.merge_partition(GL_ENTRY, path, twice, run_id=RUN_A) == (1, 0)
     assert raw.read_partition(GL_ENTRY, path) == [twice[1]]
 
 
@@ -335,7 +337,7 @@ def test_a_failed_replacement_leaves_the_existing_partition_intact(raw_dir, monk
     before it opens anything proves nothing about the replacement, which is the step
     the case exists to cover."""
     path = raw.partition_path(raw_dir, GL_ENTRY, "2026-03")
-    raw.write_partition(GL_ENTRY, path, [entry("E3", "1", "2026-03-15", "2026-03-20")])
+    raw.write_partition(GL_ENTRY, path, [entry("E3", "1", "2026-03-15", "2026-03-20")], run_id=RUN_A)
     before = path.read_bytes()
 
     def refuses_to_move(source, destination):
@@ -343,7 +345,7 @@ def test_a_failed_replacement_leaves_the_existing_partition_intact(raw_dir, monk
 
     monkeypatch.setattr(raw.os, "replace", refuses_to_move)
     with pytest.raises(OSError):
-        raw.write_partition(GL_ENTRY, path, [entry("E9", "1", "2026-03-18", "2026-03-19")])
+        raw.write_partition(GL_ENTRY, path, [entry("E9", "1", "2026-03-18", "2026-03-19")], run_id=RUN_A)
     monkeypatch.undo()
 
     assert path.read_bytes() == before
@@ -354,13 +356,13 @@ def test_a_row_missing_a_declared_column_never_reaches_the_disk(raw_dir):
     """The other half of case 26b: a batch that cannot be serialised must fail before
     the existing partition is opened, not halfway through replacing it."""
     path = raw.partition_path(raw_dir, GL_ENTRY, "2026-03")
-    raw.write_partition(GL_ENTRY, path, [entry("E3", "1", "2026-03-15", "2026-03-20")])
+    raw.write_partition(GL_ENTRY, path, [entry("E3", "1", "2026-03-15", "2026-03-20")], run_id=RUN_A)
     before = path.read_bytes()
 
     incomplete = dict(entry("E9", "1", "2026-03-18", "2026-03-19"))
     del incomplete["doc_id"]
     with pytest.raises(KeyError):
-        raw.write_partition(GL_ENTRY, path, [incomplete])
+        raw.write_partition(GL_ENTRY, path, [incomplete], run_id=RUN_A)
 
     assert path.read_bytes() == before
     assert [p.name for p in path.parent.iterdir()] == [PART_FILE]
@@ -488,11 +490,11 @@ def test_an_interrupted_run_leaves_the_watermark_alone_and_the_next_one_converge
     written = []
     real = raw.write_partition
 
-    def fails_on_the_second(contract, path, rows):
+    def fails_on_the_second(contract, path, rows, *, run_id):
         written.append(path)
         if len(written) == 2:
             raise OSError("disk went away")
-        return real(contract, path, rows)
+        return real(contract, path, rows, run_id=run_id)
 
     monkeypatch.setattr(raw, "write_partition", fails_on_the_second)
     with pytest.raises(OSError):
@@ -527,11 +529,11 @@ def test_an_interrupted_incremental_run_leaves_the_stored_watermark_where_it_was
     written = []
     real = raw.write_partition
 
-    def fails_on_the_second(contract, path, rows):
+    def fails_on_the_second(contract, path, rows, *, run_id):
         written.append(path)
         if len(written) == 2:
             raise OSError("disk went away")
-        return real(contract, path, rows)
+        return real(contract, path, rows, run_id=run_id)
 
     monkeypatch.setattr(raw, "write_partition", fails_on_the_second)
     with pytest.raises(OSError):
@@ -570,7 +572,8 @@ def test_eviction_counts_the_rows_it_removed(source, raw_dir):
     twice = [row for row in duplicated if row["entry_id"] == "E3"] * 2
     others = [row for row in duplicated if row["entry_id"] != "E3"]
     raw.write_partition(
-        GL_ENTRY, raw.partition_path(raw_dir, GL_ENTRY, "2026-03"), others + twice
+        GL_ENTRY, raw.partition_path(raw_dir, GL_ENTRY, "2026-03"), others + twice,
+        run_id=RUN_A,
     )
 
     # Only the moved row is in this batch, so March is never merged - and a merge
@@ -608,7 +611,9 @@ def test_the_watermark_temporary_file_is_cleaned_up_when_the_write_fails(
     monkeypatch.undo()
 
     assert state.read_text(encoding="utf-8") == before
-    assert [path.name for path in (raw_dir / "_state").iterdir()] == ["watermarks.json"]
+    assert sorted(path.name for path in (raw_dir / "_state").iterdir()) == [
+        "runs.jsonl", "watermarks.json"
+    ]
 
 
 # --- tables that declare no watermark --------------------------------------
@@ -679,7 +684,9 @@ def test_the_command_prints_one_line_per_table(tmp_path, raw_dir, capsys):
                       "--table", "gl_entry", "--table", "fx_rate"])
 
     assert code == 0
-    assert capsys.readouterr().out.splitlines() == [
+    printed = capsys.readouterr().out.splitlines()
+    assert printed[0].startswith("run ")
+    assert printed[1:] == [
         "gl_entry: scanned 4, inserted 4, updated 0, evicted 0, partitions 3, "
         f"watermark none -> {HIGHEST_ARRIVAL}",
         "fx_rate: scanned 2, inserted 2, updated 0, evicted 0, partitions 1, "
@@ -792,7 +799,9 @@ def test_the_command_with_no_table_flag_loads_every_contract(tmp_path, raw_dir, 
 
     assert load.main(["--source", str(source), "--raw", str(raw_dir)]) == 0
 
-    assert capsys.readouterr().out.splitlines() == [
+    printed = capsys.readouterr().out.splitlines()
+    assert printed[0].startswith("run ")
+    assert printed[1:] == [
         "dim_account_src: scanned 1, inserted 1, updated 0, evicted 0, partitions 1, "
         "watermark none -> none",
         "dim_cost_center_src: scanned 1, inserted 1, updated 0, evicted 0, partitions 1, "
@@ -938,10 +947,10 @@ def test_a_full_reload_of_a_partitioned_table_drops_the_periods_it_no_longer_has
     """`raw.write_table` is the full-reload primitive, and on a partitioned table it has
     to remove the period directories the new batch does not carry - otherwise a shrunk
     reload leaves rows nothing accounts for."""
-    raw.write_table(GL_ENTRY, raw_dir, SOURCE_ROWS)
+    raw.write_table(GL_ENTRY, raw_dir, SOURCE_ROWS, run_id=RUN_A)
     assert len(list((raw_dir / "gl_entry").glob("accounting_period=*"))) == 3
 
-    raw.write_table(GL_ENTRY, raw_dir, SOURCE_ROWS[:1])
+    raw.write_table(GL_ENTRY, raw_dir, SOURCE_ROWS[:1], run_id=RUN_A)
 
     assert [path.name for path in (raw_dir / "gl_entry").glob("accounting_period=*")] == [
         "accounting_period=2026-01"
@@ -953,13 +962,13 @@ def test_a_batch_that_cannot_be_written_does_not_delete_what_is_there(raw_dir):
     """The new partitions go down before the stale ones come up. The other order would
     delete February and then raise while writing January, losing a period to a batch
     that never landed."""
-    raw.write_table(GL_ENTRY, raw_dir, SOURCE_ROWS)
+    raw.write_table(GL_ENTRY, raw_dir, SOURCE_ROWS, run_id=RUN_A)
     before = raw.checksum(GL_ENTRY, raw_dir)
 
     incomplete = dict(entry("E9", "1", "2026-01-05", "2026-01-06"))
     del incomplete["doc_id"]
     with pytest.raises(KeyError):
-        raw.write_table(GL_ENTRY, raw_dir, [incomplete])
+        raw.write_table(GL_ENTRY, raw_dir, [incomplete], run_id=RUN_A)
 
     assert raw.checksum(GL_ENTRY, raw_dir) == before
 
@@ -979,7 +988,9 @@ def test_the_watermark_file_is_replaced_rather_than_rewritten_in_place(source, r
     monkeypatch.undo()
 
     assert (raw_dir / "_state" / "watermarks.json").read_text(encoding="utf-8") == before
-    assert [p.name for p in (raw_dir / "_state").iterdir()] == ["watermarks.json"]
+    assert sorted(p.name for p in (raw_dir / "_state").iterdir()) == [
+        "runs.jsonl", "watermarks.json"
+    ]
 
 
 def test_a_source_that_lost_its_watermark_column_is_refused(source, raw_dir):
@@ -1012,10 +1023,10 @@ def test_a_corrupt_watermark_file_is_a_usage_error_at_the_command(source, raw_di
 
 def test_a_full_reload_with_no_rows_leaves_no_periods_behind(raw_dir):
     """The empty edge of the shrinking reload: every period goes, not all but one."""
-    raw.write_table(GL_ENTRY, raw_dir, SOURCE_ROWS)
+    raw.write_table(GL_ENTRY, raw_dir, SOURCE_ROWS, run_id=RUN_A)
     assert len(list((raw_dir / "gl_entry").glob("accounting_period=*"))) == 3
 
-    raw.write_table(GL_ENTRY, raw_dir, [])
+    raw.write_table(GL_ENTRY, raw_dir, [], run_id=RUN_A)
 
     assert list((raw_dir / "gl_entry").glob("accounting_period=*")) == []
     assert raw.row_count(GL_ENTRY, raw_dir) == 0
@@ -1035,3 +1046,298 @@ def test_an_overlap_window_that_is_not_a_whole_number_says_so(value, capsys):
     say what would have been acceptable."""
     assert load.main(["--overlap-days", value]) == 2
     assert "whole number of days" in capsys.readouterr().err
+
+
+# --- the two run identifiers, through the load ------------------------------
+#
+# Cases 15-21, 22, 23b, 23c, 24, 26 and 26a of task.md. `_first_run_id` is the run
+# that first landed the key and survives every rewrite; `_last_run_id` belongs to
+# whichever run wrote the file. See docs/adr/0018.
+
+RUN_A = "20260901T031500Z-aaaaaa"
+RUN_B = "20260902T031500Z-bbbbbb"
+
+# Per whole-table-replacement table: the rows the first run lands, and the row the
+# second run adds. The key of each is what case 20 looks up.
+FULL_RELOAD_ROWS = {
+    "fx_rate": (
+        [{"currency": "CNY", "rate_date": "2026-01-01", "rate_to_base": "1.000000"}],
+        [{"currency": "EUR", "rate_date": "2026-01-01", "rate_to_base": "7.800000"}],
+    ),
+    "dim_account_src": (
+        [{"account_code": "6001", "name": "Cost of sales", "parent_code": "",
+          "account_type": "expense", "effective_date": "2026-01-01"}],
+        [{"account_code": "6002", "name": "Freight", "parent_code": "6001",
+          "account_type": "expense", "effective_date": "2026-01-01"}],
+    ),
+    "dim_cost_center_src": (
+        [{"cc_code": "CC01", "name": "Sales North", "dept_code": "D1",
+          "effective_date": "2026-01-01"}],
+        [{"cc_code": "CC02", "name": "Sales South", "dept_code": "D1",
+          "effective_date": "2026-01-01"}],
+    ),
+}
+
+
+def stamped(raw_dir, contract=GL_ENTRY):
+    """Every landed row, keyed by primary key, with the two identifiers on it."""
+    rows = {}
+    for path in raw.partitions(contract, raw_dir):
+        for row in raw.read_partition(contract, path, metadata=True):
+            rows[tuple(row[name] for name in contract["primary_key"])] = row
+    return rows
+
+
+def identifiers(raw_dir, contract=GL_ENTRY):
+    return {key: (row["_first_run_id"], row["_last_run_id"])
+            for key, row in stamped(raw_dir, contract).items()}
+
+
+def test_a_first_load_stamps_the_same_run_on_every_row(source, raw_dir):
+    """Case 14, through the load."""
+    first = run(source, raw_dir).run_id
+
+    assert set(identifiers(raw_dir).values()) == {(first, first)}
+
+
+def test_an_updated_row_keeps_the_run_that_first_landed_it(source, raw_dir):
+    """Case 15. The key arrived in the first run; the second run only restated it."""
+    first = run(source, raw_dir).run_id
+    write_source(source, GL_ENTRY, SOURCE_ROWS[:2] + [
+        entry("E3", "1", "2026-03-15", INSIDE_THE_WINDOW, amount_dr="999.00"),
+        SOURCE_ROWS[3],
+    ])
+    second = run(source, raw_dir).run_id
+
+    assert identifiers(raw_dir)[("E3", "1")] == (first, second)
+    assert stamped(raw_dir)[("E3", "1")]["amount_dr"] == "999.00"
+
+
+def test_a_row_the_batch_did_not_touch_keeps_its_first_run(source, raw_dir):
+    """Case 16. E4 shares the March partition with E3 and is rewritten along with it,
+    which is what makes a single `run_id` column unable to answer where a row came
+    from. E1 is in January, which this batch never opens."""
+    first = run(source, raw_dir).run_id
+    write_source(source, GL_ENTRY, SOURCE_ROWS[:2] + [
+        entry("E3", "1", "2026-03-15", INSIDE_THE_WINDOW, amount_dr="999.00"),
+        SOURCE_ROWS[3],
+    ])
+    second = run(source, raw_dir).run_id
+
+    assert identifiers(raw_dir)[("E4", "1")] == (first, second)
+    assert identifiers(raw_dir)[("E1", "1")] == (first, first)
+
+
+def test_a_full_reload_does_not_restamp_the_first_run(source, raw_dir):
+    """Case 17. `--full` is the one command that rewrites everything, and it is where a
+    single-column design would erase the whole history in one go."""
+    first = run(source, raw_dir).run_id
+    second = run(source, raw_dir, full=True).run_id
+
+    assert set(identifiers(raw_dir).values()) == {(first, second)}
+
+
+def test_a_row_that_moves_period_carries_its_first_run_with_it(source, raw_dir):
+    """Case 18. The row leaves one partition and lands in another; it is the same row,
+    and the run that brought it has not changed."""
+    first = run(source, raw_dir).run_id
+    moved = entry("E4", "1", "2026-04-16", INSIDE_THE_WINDOW)
+    write_source(source, GL_ENTRY, SOURCE_ROWS[:3] + [moved])
+    second = run(source, raw_dir).run_id
+
+    landed = stamped(raw_dir)[("E4", "1")]
+    assert landed["accounting_date"] == "2026-04-16"
+    assert (landed["_first_run_id"], landed["_last_run_id"]) == (first, second)
+
+
+def test_the_rows_left_behind_by_an_eviction_keep_their_first_run(source, raw_dir):
+    """Case 19. Evicting E4 rewrites the March partition, and E3 is still in it."""
+    first = run(source, raw_dir).run_id
+    write_source(source, GL_ENTRY, SOURCE_ROWS[:3] + [
+        entry("E4", "1", "2026-04-16", INSIDE_THE_WINDOW),
+    ])
+    second = run(source, raw_dir).run_id
+
+    assert identifiers(raw_dir)[("E3", "1")] == (first, second)
+
+
+@pytest.mark.parametrize("table", ["fx_rate", "dim_account_src", "dim_cost_center_src"])
+def test_a_whole_table_replacement_keeps_the_first_run(tmp_path, raw_dir, table):
+    """Case 20. All three of them: this path does not read the old file to merge, so it
+    has to read it for this. A `prior_first_run_ids` that only worked for one table
+    would pass if only `fx_rate` were tested."""
+    contract = contracts.load(table)
+    source = tmp_path / "source"
+    existing, arriving = FULL_RELOAD_ROWS[table]
+
+    write_source(source, contract, existing)
+    first = load.load_source(source, raw_dir, tables=[table]).run_id
+    write_source(source, contract, existing + arriving)
+    second = load.load_source(source, raw_dir, tables=[table]).run_id
+
+    landed = identifiers(raw_dir, contract)
+    key = tuple(existing[0][name] for name in contract["primary_key"])
+    newcomer = tuple(arriving[0][name] for name in contract["primary_key"])
+    assert landed[key] == (first, second)
+    assert landed[newcomer] == (second, second)
+
+
+def test_a_whole_table_replacement_does_not_resurrect_a_removed_row(tmp_path, raw_dir):
+    """Case 21. Reading the old file for its identifiers must not turn the read into a
+    merge: a row the source dropped is gone, which is what `write_table` means."""
+    source = tmp_path / "source"
+    existing, arriving = FULL_RELOAD_ROWS["fx_rate"]
+
+    write_source(source, FX_RATE, existing + arriving)
+    load.load_source(source, raw_dir, tables=["fx_rate"])
+    write_source(source, FX_RATE, arriving)
+    load.load_source(source, raw_dir, tables=["fx_rate"])
+
+    landed = identifiers(raw_dir, FX_RATE)
+    assert tuple(existing[0][name] for name in FX_RATE["primary_key"]) not in landed
+    assert len(landed) == len(arriving)
+
+
+def test_merge_partition_will_not_run_without_a_run_identifier(raw_dir):
+    """Case 22. The third write entry point, for the reason the other two have it."""
+    path = raw.partition_path(raw_dir, GL_ENTRY, "2026-01")
+    with pytest.raises(TypeError):
+        load.merge_partition(GL_ENTRY, path, [entry("E1", "1", "2026-01-15", "2026-01-20")])
+
+
+def test_merge_partition_carries_the_first_run_across(raw_dir):
+    """Case 23b. Called directly, without the load around it: this is the read that has
+    to ask for the metadata, and the failure it prevents is the whole partition being
+    restamped as landed by the run that merely reopened it."""
+    path = raw.partition_path(raw_dir, GL_ENTRY, "2026-01")
+    raw.write_partition(GL_ENTRY, path, [
+        entry("E1", "1", "2026-01-15", "2026-01-20"),
+        entry("E2", "1", "2026-01-16", "2026-01-21"),
+    ], run_id=RUN_A)
+
+    load.merge_partition(GL_ENTRY, path, [
+        entry("E2", "1", "2026-01-16", "2026-01-21", amount_dr="999.00"),
+    ], run_id=RUN_B)
+
+    landed = {row["entry_id"]: row for row in raw.read_partition(GL_ENTRY, path, metadata=True)}
+    assert (landed["E1"]["_first_run_id"], landed["E1"]["_last_run_id"]) == (RUN_A, RUN_B)
+    assert (landed["E2"]["_first_run_id"], landed["E2"]["_last_run_id"]) == (RUN_A, RUN_B)
+
+
+def test_evict_moved_keys_keeps_the_first_run_on_the_rows_it_leaves(raw_dir):
+    """Case 23c. The other read that has to ask for the metadata. The kept row is
+    rewritten by a run that was only cleaning up after a different row."""
+    january = raw.partition_path(raw_dir, GL_ENTRY, "2026-01")
+    raw.write_partition(GL_ENTRY, january, [
+        entry("E1", "1", "2026-01-15", "2026-01-20"),
+        entry("E2", "1", "2026-01-16", "2026-01-21"),
+    ], run_id=RUN_A)
+
+    evicted, rewritten = load.evict_moved_keys(
+        GL_ENTRY, raw_dir, {("E2", "1"): "2026-02"}, run_id=RUN_B
+    )
+
+    assert (evicted, rewritten) == (1, 1)
+    kept = raw.read_partition(GL_ENTRY, january, metadata=True)
+    assert [row["entry_id"] for row in kept] == ["E1"]
+    assert (kept[0]["_first_run_id"], kept[0]["_last_run_id"]) == (RUN_A, RUN_B)
+
+
+def test_three_runs_still_leave_the_row_count_and_checksum_alone(source, raw_dir):
+    """Case 24. The acceptance criterion of the previous ticket, re-asserted now that
+    every row carries metadata that changes between runs. If this fails, the
+    identifiers reached the checksum."""
+    measurements = []
+    for _ in range(3):
+        run(source, raw_dir)
+        measurements.append(
+            (raw.row_count(GL_ENTRY, raw_dir), raw.checksum(GL_ENTRY, raw_dir))
+        )
+
+    assert len(set(measurements)) == 1
+
+
+def test_after_three_runs_the_identifiers_say_first_and_third(source, raw_dir):
+    """Case 26. The other half of case 24: the checksum is unchanged, and the metadata
+    outside it did move.
+
+    Every row was landed by the first run. Which run last wrote it depends on whether
+    its partition was reopened: March is inside the overlap window and is rewritten
+    every time, January and February are not touched again. That asymmetry is
+    docs/adr/0016 made visible - a batch rewrites the periods it touches and opens no
+    others - so it is asserted rather than filtered out."""
+    identities = [run(source, raw_dir).run_id for _ in range(3)]
+
+    landed = identifiers(raw_dir)
+    assert set(landed) == {("E1", "1"), ("E2", "1"), ("E3", "1"), ("E4", "1")}
+    assert {key: value for key, value in landed.items() if key[0] in {"E3", "E4"}} == {
+        ("E3", "1"): (identities[0], identities[2]),
+        ("E4", "1"): (identities[0], identities[2]),
+    }
+    assert {key: value for key, value in landed.items() if key[0] in {"E1", "E2"}} == {
+        ("E1", "1"): (identities[0], identities[0]),
+        ("E2", "1"): (identities[0], identities[0]),
+    }
+
+
+def test_a_real_failure_inside_a_table_is_recorded_the_same_way(tmp_path, raw_dir):
+    """Case 8, through a failure the load raises itself rather than a stand-in. The
+    stand-in pins the re-raise; this pins that a genuine failure - one that happens
+    after the run is already under way - reaches the record with the right table on
+    it."""
+    source = tmp_path / "source"
+    write_source(source, GL_ENTRY, SOURCE_ROWS)
+
+    with pytest.raises(FileNotFoundError):
+        load.load_source(source, raw_dir, tables=["gl_entry", "gl_adjustment"])
+
+    record = runs.RunLog(raw_dir).read()[0]
+    assert record.status == "failed"
+    assert record.failed_table == "gl_adjustment"
+    assert "gl_adjustment" in record.error
+    # gl_entry got as far as it did before the run failed, and the record says so.
+    assert [table.table for table in record.tables] == ["gl_entry"]
+    assert record.tables[0].rows_scanned == 4
+
+
+def test_a_source_column_named_like_a_run_identifier_is_ignored(tmp_path, raw_dir):
+    """An added column is a compatible change, so a source can grow one called
+    `_first_run_id`. Carrying it into the batch would let an extract stamp a raw row
+    with a run that never happened - and the checksum would not notice, because the
+    identifiers are outside it by construction."""
+    source = tmp_path / "source"
+    source.mkdir(parents=True, exist_ok=True)
+    columns = [spec["name"] for spec in GL_ENTRY["columns"]] + ["_first_run_id"]
+    with (source / "gl_entry.csv").open("w", encoding="utf-8", newline="") as handle:
+        writer = csv.writer(handle, lineterminator="\n")
+        writer.writerow(columns)
+        for row in SOURCE_ROWS:
+            writer.writerow([row[name] for name in columns[:-1]] + ["a-run-that-never-ran"])
+
+    landed = load.load_source(source, raw_dir, tables=["gl_entry"]).run_id
+
+    assert set(identifiers(raw_dir).values()) == {(landed, landed)}
+
+
+def test_a_partitioned_whole_table_replacement_keeps_the_first_run(raw_dir):
+    """Case 20, on the branch of `write_table` a contract does not reach today.
+    `write_table` is the full-reload primitive and takes a partitioned table; nothing
+    declares `partition_by` without a watermark, so the load never sends one down this
+    branch - which is exactly why it needs a test of its own."""
+    raw.write_table(GL_ENTRY, raw_dir, SOURCE_ROWS, run_id=RUN_A)
+    raw.write_table(GL_ENTRY, raw_dir, SOURCE_ROWS, run_id=RUN_B)
+
+    assert set(identifiers(raw_dir).values()) == {(RUN_A, RUN_B)}
+
+
+def test_the_command_prints_the_run_identifier_first(source, raw_dir, capsys):
+    """Case 26a. The identifier is how anything else about the run is looked up, so the
+    command that produces it has to say what it was."""
+    assert load.main(["--source", str(source), "--raw", str(raw_dir),
+                      "--table", "gl_entry"]) == 0
+
+    printed = capsys.readouterr().out.splitlines()
+    assert printed[0].startswith("run ")
+
+    run_id = printed[0].removeprefix("run ").strip()
+    assert [record.run_id for record in runs.RunLog(raw_dir).read()] == [run_id]
