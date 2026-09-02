@@ -17,7 +17,8 @@ Because the anomalies are planted deliberately, the golden set used to evaluate 
 ## Using it
 
 ```
-python -m generator --seed 42 --periods 2026-01:2026-12                     --entries-per-period 100000 --out data/source
+python -m generator --seed 42 --periods 2026-01:2026-12 \
+    --entries-per-period 100000 --out data/source
 ```
 
 Each failure mode has a flag — `--enable-late-entries`, `--enable-restatements`,
