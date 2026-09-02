@@ -13,10 +13,16 @@ holding identical rows may differ, and the criterion would then be measuring the
 build environment.
 
 There is a second pressure. `record-every-pipeline-run` will stamp ingestion metadata
-onto the raw layer: run identifier, ingestion time, source file hash. Ingestion time
-differs on every run by construction. A checksum that covered it would be guaranteed
-to change on every rerun, and the property this ticket exists to establish would be
-unverifiable the moment that ticket lands.
+onto the raw layer. A checksum that covered it would be guaranteed to change on every
+rerun, and the property this ticket exists to establish would be unverifiable the
+moment that ticket lands.
+
+That ticket has since landed two run identifiers on the row and put the ingestion time
+and the source file digest in the run record instead, reachable from either identifier
+- see `docs/adr/0018-raw-rows-carry-two-run-identifiers.md` and
+`docs/adr/0020-the-source-file-hash-belongs-to-the-run.md`. The argument here does not
+depend on which of them ended up where: `_last_run_id` changes on any rerun that
+rewrites the partition, so a checksum covering it would change too.
 
 ## Decision
 

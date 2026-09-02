@@ -43,8 +43,25 @@ Lands source extracts into the raw layer and keeps the load replayable.
 
   An update that arrives after the overlap window has passed is missed. That is what a
   watermarked load is, and `--full` is what recovers from it.
-- **Run records.** Every run writes its identifier, watermark range, row counts, and
-  duration; downstream artefacts carry that run identifier. Not landed yet - the other
-  three bullets describe what this package does today, this one describes what it is
-  still for. The load reports its watermark range and row counts to its caller
-  already; nothing writes them down.
+- **Run records.** Every run appends two lines to `data/raw/_state/runs.jsonl`: a
+  `started` event naming the run, its tables and its window, and a `finished` event
+  carrying each table's row counts, watermark range and source file digest, the
+  duration, and whether it succeeded. The record is opened before any table is read, so
+  a run that failed is written down - naming the table it failed on - and a run that
+  was killed leaves its first line and reads back as `interrupted`.
+
+  ```
+  python -m ingest.runs
+  python -m ingest.runs --run 20260901T031500Z-a7f3c1
+  ```
+
+  Exit 0 when the log reads, 2 for a usage error or a log that does not. `--limit` sets
+  how many runs the listing shows. See `docs/adr/0019-the-run-record-is-an-append-only-event-log.md`.
+- **Run identifiers on the row.** Every raw row carries `_first_run_id`, the run that
+  first landed its primary key, and `_last_run_id`, the run that last wrote the file it
+  is in. The first survives every rewrite - a merge that reopened the partition for
+  some other row, an eviction, a move to another accounting period, the whole-table
+  replacement an unwatermarked table gets. Neither is a contract column, so neither
+  reaches the checksum. The ingestion time and the source digest are not on the row;
+  they are reached from either identifier through the run record. See
+  `docs/adr/0018-raw-rows-carry-two-run-identifiers.md` and `docs/adr/0020-the-source-file-hash-belongs-to-the-run.md`.

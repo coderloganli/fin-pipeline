@@ -16,10 +16,11 @@ correctness, slowly changing dimensions, late-arriving corrections, idempotent
 replay — not volume.
 
 **Status: early.** `generator/` has landed. `ingest/` has its source-table
-contracts, the validator that applies them, and the watermarked incremental load that
-lands entries in the raw layer. The remaining directories exist and each carries a
-README stating what that layer is and is not responsible for, but no module has landed
-in them. Read the READMEs for intent; read this file for what is actually true today.
+contracts, the validator that applies them, the watermarked incremental load that lands
+entries in the raw layer, and the run record every load writes. The remaining
+directories exist and each carries a README stating what that layer is and is not
+responsible for, but no module has landed in them. Read the READMEs for intent; read
+this file for what is actually true today.
 
 ## Shape
 
@@ -98,8 +99,8 @@ are capped per table, so the gate can guard a table it could not hold. Until dbt
 lands there is no lineage graph, so a failure says the downstream impact is unknown
 rather than omitting it. See docs/adr/0009, 0010, 0011 and 0012.
 
-**The raw layer holds text, and only the columns the contract declares.** Entries
-land under `data/raw/<table>/accounting_period=YYYY-MM/part-0000.parquet`, one file
+**The raw layer holds text: the columns the contract declares, and two run
+identifiers.** Entries land under `data/raw/<table>/accounting_period=YYYY-MM/part-0000.parquet`, one file
 per period, every column written as a Parquet string and an empty field written as an
 empty string. Retyping is `staging`'s line in the table above, and a raw layer that
 already reinterpreted cannot answer the question it exists for — whether the source
@@ -118,8 +119,25 @@ opened. There is no `updated_at` anywhere in the source; the plan said there was
 **A rerun is checked by row count and checksum, and the checksum is over rows.** It
 renders the declared columns of every row as text, sorts them, and hashes that — not
 the Parquet bytes, which carry the writer's version, and not any ingestion metadata,
-which will differ on every run once `record-every-pipeline-run` lands. See
-docs/adr/0017.
+which differs between runs. See docs/adr/0017.
+
+**Every run leaves a record, and it is written before the run is over.**
+`data/raw/_state/runs.jsonl` is appended to twice per run: a `started` event naming the
+run, its tables and its window, and a `finished` event carrying each table's row
+counts, watermark range and source file digest, the duration, and whether it
+succeeded. A run that dies leaves only its first line and is reported as
+`interrupted` — a record written only on the paths that worked would be missing from
+exactly the run someone is investigating. `python -m ingest.runs` reads the log. See
+docs/adr/0019.
+
+**A raw row says which run first landed it and which run last wrote it.**
+`_first_run_id` survives every rewrite — a merge that reopened the partition for some
+other row, an eviction, the whole-table replacement an unwatermarked table gets —
+and `_last_run_id` is set by whichever run wrote the file. One column cannot answer
+both "where did this row come from" and "which run wrote this file", and the second
+question is the one asked while something is broken. Ingestion time and the source
+digest are not on the row; they are reached from either identifier through the run
+record. See docs/adr/0018 and 0020.
 
 **What ingest expects is stated separately from what the generator emits.**
 `generator/schema.py` is the truth for the one, `ingest/contracts/*.yaml` for the
