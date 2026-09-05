@@ -44,6 +44,8 @@ def entry(entry_id, version, accounting_date, posted_at, **overrides):
         "amount_dr": "100.00",
         "amount_cr": "0.00",
         "doc_id": f"DOC-{entry_id}",
+        "vendor_code": "V-0001",
+        "description": "Office supplies purchase",
     }
     row.update(overrides)
     return row
@@ -624,7 +626,7 @@ FX_ROWS = [
 ]
 
 
-FULL_RELOAD = ("dim_account_src", "dim_cost_center_src", "fx_rate")
+FULL_RELOAD = ("dim_account_src", "dim_cost_center_src", "dim_vendor", "fx_rate")
 
 
 def test_a_table_that_declares_no_watermark_is_loaded_in_full(tmp_path, raw_dir):
@@ -782,9 +784,15 @@ COST_CENTER_ROWS = [
 ]
 
 
+VENDOR_ROWS = [
+    {"vendor_code": "V-0001", "name": "Northwind Office Supplies", "category": "office"},
+]
+
+
 def write_every_table(source_dir):
     write_source(source_dir, DIM_ACCOUNT, ACCOUNT_ROWS)
     write_source(source_dir, DIM_COST_CENTER, COST_CENTER_ROWS)
+    write_source(source_dir, contracts.load("dim_vendor"), VENDOR_ROWS)
     write_source(source_dir, FX_RATE, FX_ROWS)
     write_source(source_dir, GL_ADJUSTMENT, [adjustment("A1", "1", "2026-01-15", "2026-01-25")])
     write_source(source_dir, GL_ENTRY, SOURCE_ROWS)
@@ -805,6 +813,8 @@ def test_the_command_with_no_table_flag_loads_every_contract(tmp_path, raw_dir, 
         "dim_account_src: scanned 1, inserted 1, updated 0, evicted 0, partitions 1, "
         "watermark none -> none",
         "dim_cost_center_src: scanned 1, inserted 1, updated 0, evicted 0, partitions 1, "
+        "watermark none -> none",
+        "dim_vendor: scanned 1, inserted 1, updated 0, evicted 0, partitions 1, "
         "watermark none -> none",
         "fx_rate: scanned 2, inserted 2, updated 0, evicted 0, partitions 1, watermark none -> none",
         "gl_adjustment: scanned 1, inserted 1, updated 0, evicted 0, partitions 1, "
@@ -1060,6 +1070,11 @@ RUN_B = "20260902T031500Z-bbbbbb"
 # Per whole-table-replacement table: the rows the first run lands, and the row the
 # second run adds. The key of each is what case 20 looks up.
 FULL_RELOAD_ROWS = {
+    "dim_vendor": (
+        [{"vendor_code": "V-0001", "name": "Northwind Office Supplies",
+          "category": "office"}],
+        [{"vendor_code": "V-0002", "name": "Bluebird Materials", "category": "materials"}],
+    ),
     "fx_rate": (
         [{"currency": "CNY", "rate_date": "2026-01-01", "rate_to_base": "1.000000"}],
         [{"currency": "EUR", "rate_date": "2026-01-01", "rate_to_base": "7.800000"}],
@@ -1161,7 +1176,7 @@ def test_the_rows_left_behind_by_an_eviction_keep_their_first_run(source, raw_di
     assert identifiers(raw_dir)[("E3", "1")] == (first, second)
 
 
-@pytest.mark.parametrize("table", ["fx_rate", "dim_account_src", "dim_cost_center_src"])
+@pytest.mark.parametrize("table", sorted(FULL_RELOAD_ROWS))
 def test_a_whole_table_replacement_keeps_the_first_run(tmp_path, raw_dir, table):
     """Case 20. All three of them: this path does not read the old file to merge, so it
     has to read it for this. A `prior_first_run_ids` that only worked for one table
@@ -1341,3 +1356,47 @@ def test_the_command_prints_the_run_identifier_first(source, raw_dir, capsys):
 
     run_id = printed[0].removeprefix("run ").strip()
     assert [record.run_id for record in runs.RunLog(raw_dir).read()] == [run_id]
+
+
+# --- the new columns reach the raw layer -------------------------------------
+#
+# Cases 30 and 31 of task.md. Everything else in this module builds its rows by
+# hand; these two go through the generator, because what they check is that adding a
+# column to the source needs no change in the loader at all.
+
+def test_the_vendor_columns_reach_the_raw_layer(tmp_path, raw_dir):
+    """Case 30. The loader was not touched by this ticket: the contract declares the
+    columns and they land, which is the whole claim."""
+    from generator import Config, generate
+
+    source = tmp_path / "source"
+    generate(Config(seed=42, periods="2026-01:2026-02", entries_per_period=40, out_dir=source))
+    load.load_source(source, raw_dir)
+
+    landed = list(raw.read_table(GL_ENTRY, raw_dir))
+    assert landed, "nothing landed"
+    assert all("vendor_code" in row and "description" in row for row in landed)
+    assert any(row["vendor_code"] for row in landed), "every vendor came back empty"
+    assert all(row["description"] for row in landed)
+
+    from_source = {
+        row["entry_id"]: (row["vendor_code"], row["description"])
+        for row in csv.DictReader((source / "gl_entry.csv").open(encoding="utf-8", newline=""))
+    }
+    for row in landed:
+        assert (row["vendor_code"], row["description"]) == from_source[row["entry_id"]]
+
+
+def test_dim_vendor_lands_as_a_whole_table(tmp_path, raw_dir):
+    """Case 31. No watermark and no partition column, so it is one file - the same
+    path the two dimensions and the rate table take."""
+    from generator import Config, generate
+    from generator import dimensions
+
+    source = tmp_path / "source"
+    generate(Config(seed=42, periods="2026-01:2026-01", entries_per_period=20, out_dir=source))
+    load.load_source(source, raw_dir)
+
+    contract = contracts.load("dim_vendor")
+    assert [path.name for path in (raw_dir / "dim_vendor").iterdir()] == [PART_FILE]
+    assert raw.row_count(contract, raw_dir) == dimensions.VENDOR_COUNT

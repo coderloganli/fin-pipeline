@@ -16,7 +16,7 @@ import re
 from datetime import date, timedelta
 from decimal import Decimal
 
-from . import schema
+from . import dimensions, schema
 from .dimensions import (
     BASE_CURRENCY,
     CURRENCIES,
@@ -66,6 +66,46 @@ LONG_TAIL_MAX_CENTS = 35_000
 LONG_TAIL_UPLIFT = Decimal("1.6")   # the predicate looks for 1.5
 
 
+class Books:
+    """The account pools a voucher is built from, and the suppliers behind them.
+
+    A voucher is one of two shapes. An invoice debits an expense detail account,
+    credits a payables detail account and carries a vendor; a sale debits receivables,
+    credits a revenue detail account and carries none. Revenue is earned from
+    customers rather than paid to suppliers, which is why the second shape has no
+    vendor to carry. See docs/adr/0022.
+
+    The vendor is chosen by position within its account's category rather than drawn,
+    so a voucher's supplier is a function of where it sits and of nothing else - which
+    is what makes the long tail spread evenly across thirty suppliers and the
+    concentrated anomalies land on one.
+    """
+
+    def __init__(self, seed: int):
+        self.expense = list(dimensions.EXPENSE_DETAIL)
+        self.payable = list(dimensions.PAYABLE_DETAIL)
+        self.revenue = list(dimensions.REVENUE_DETAIL)
+        self.receivable = dimensions.RECEIVABLE
+        self.vendors = dimensions.vendors_by_category(seed)
+
+    def invoice(self, account: str, index: int) -> tuple[str, str]:
+        """The supplier and the wording for a voucher debiting `account`."""
+        category = dimensions.CATEGORY_OF_ACCOUNT[account]
+        codes = self.vendors[category]
+        phrases = dimensions.PHRASES[category]
+        return codes[index % len(codes)], phrases[index % len(phrases)]
+
+    def vendor_in(self, category: str, index: int) -> str:
+        return self.vendors[category][index % len(self.vendors[category])]
+
+    def payable_for(self, account: str) -> str:
+        """The payable an invoice on `account` is owed into."""
+        return dimensions.PAYABLE_FOR_CATEGORY[dimensions.CATEGORY_OF_ACCOUNT[account]]
+
+    def sale(self, account: str) -> str:
+        return dimensions.SALE_PHRASES[account]
+
+
 def _cents(value: int) -> Decimal:
     return (Decimal(value) / 100).quantize(schema.AMOUNT_PLACES)
 
@@ -82,9 +122,16 @@ def _voucher(
     currency: str,
     debit: Decimal,
     credit: Decimal | None = None,
+    vendor_code: str = "",
+    description: str = "",
 ) -> list[dict[str, object]]:
     """Two lines sharing a doc_id. `credit` differs from `debit` only when a caller
-    is deliberately producing an unbalanced voucher."""
+    is deliberately producing an unbalanced voucher.
+
+    The vendor and the description belong to the voucher, so both lines carry the
+    same values - one purchase invoice is from one supplier, and an aggregate taken
+    from the credit side has to reach it too. See docs/adr/0022.
+    """
     credit = debit if credit is None else credit
     common = {
         "version": 1,
@@ -93,6 +140,8 @@ def _voucher(
         "cost_center_code": cost_centre,
         "currency": currency,
         "doc_id": doc_id,
+        "vendor_code": vendor_code,
+        "description": description,
     }
     return [
         {
@@ -137,14 +186,17 @@ def months_in(periods: str) -> list[date]:
     return out
 
 
-def ordinary(config, months: list[date], accounts: list[str], centres: list[str]):
+def ordinary(config, months: list[date], books: "Books", centres: list[str]):
     """The clean ledger: balanced vouchers, posted within days of being booked.
 
-    Accounts are assigned round-robin rather than at random so each one receives a
-    similar number of lines every month. Random assignment would make monthly totals
-    jump around, and a jump of fifty per cent three months running is exactly what
-    the growth predicate looks for — the negative half of test case 6 would then fail
-    for no reason.
+    Accounts are assigned round-robin within their pool rather than at random so each
+    one receives a similar number of lines every month. Random assignment would make
+    monthly totals jump around, and a jump of fifty per cent three months running is
+    exactly what the growth predicate looks for — the negative half of test case 6
+    would then fail for no reason.
+
+    The two voucher shapes alternate for the same reason: which shape a position gets
+    is fixed, so the monthly count per account does not move either.
     """
     rng = stream_for(config.seed, ENTRIES)
     vouchers_per_period = max(1, config.entries_per_period // 2)
@@ -154,22 +206,36 @@ def ordinary(config, months: list[date], accounts: list[str], centres: list[str]
         days = (schema.period_close(month) - month).days + 1
         for index in range(vouchers_per_period):
             booked = month + timedelta(days=rng.randrange(days))
+            # The slot, not the index: the two shapes alternate, so an index-based
+            # rotation only ever reaches the even or the odd positions of its pool.
+            # With two revenue accounts that meant one of them was never used.
+            slot = index // 2
+            if index % 2 == 0:
+                debit_account = books.expense[slot % len(books.expense)]
+                credit_account = books.payable_for(debit_account)
+                vendor_code, description = books.invoice(debit_account, slot)
+            else:
+                debit_account = books.receivable
+                credit_account = books.revenue[slot % len(books.revenue)]
+                vendor_code, description = "", books.sale(credit_account)
             yield from _voucher(
                 entry_id_debit=f"E-{counter:09d}",
                 entry_id_credit=f"E-{counter + 1:09d}",
                 doc_id=f"D-{counter // 2:09d}",
                 accounting_date=booked,
                 posted_at=booked + timedelta(days=rng.randrange(4)),
-                debit_account=accounts[index % len(accounts)],
-                credit_account=accounts[(index + 1) % len(accounts)],
+                debit_account=debit_account,
+                credit_account=credit_account,
                 cost_centre=centres[index % len(centres)],
                 currency=CURRENCIES[index % len(CURRENCIES)],
                 debit=_cents(rng.randrange(MIN_CENTS, MAX_CENTS)),
+                vendor_code=vendor_code,
+                description=description,
             )
             counter += 2
 
 
-def planted(config, months: list[date], accounts: list[str], centres: list[str]):
+def planted(config, months: list[date], books: "Books", centres: list[str]):
     """Everything the switches add. Ids carry an `X-` prefix so the ordinary
     sequence above is untouched whichever switches are on."""
 
@@ -186,11 +252,15 @@ def planted(config, months: list[date], accounts: list[str], centres: list[str])
                 doc_id=f"X-LATE-{index:06d}",
                 accounting_date=booked,
                 posted_at=schema.period_close(booked) + timedelta(days=45),
-                debit_account=accounts[index % len(accounts)],
-                credit_account=accounts[(index + 1) % len(accounts)],
+                debit_account=books.expense[index % len(books.expense)],
+                credit_account=books.payable_for(books.expense[index % len(books.expense)]),
                 cost_centre=centres[index % len(centres)],
                 currency=BASE_CURRENCY,
                 debit=_cents(rng.randrange(MIN_CENTS, MAX_CENTS)),
+                **dict(zip(
+                    ("vendor_code", "description"),
+                    books.invoice(books.expense[index % len(books.expense)], index),
+                )),
             )
 
     if config.unbalanced_vouchers:
@@ -202,12 +272,13 @@ def planted(config, months: list[date], accounts: list[str], centres: list[str])
             doc_id="X-UNBAL-000000",
             accounting_date=months[0] + timedelta(days=3),
             posted_at=months[0] + timedelta(days=4),
-            debit_account=accounts[0],
-            credit_account=accounts[1],
+            debit_account=books.expense[0],
+            credit_account=books.payable_for(books.expense[0]),
             cost_centre=centres[0],
             currency=BASE_CURRENCY,
             debit=debit,
             credit=debit + _cents(rng.randrange(1_000, 5_000)),
+            **dict(zip(("vendor_code", "description"), books.invoice(books.expense[0], 0))),
         )
 
     if config.growing_account:
@@ -234,6 +305,13 @@ def planted(config, months: list[date], accounts: list[str], centres: list[str])
                 cost_centre=centres[0],
                 currency=BASE_CURRENCY,
                 debit=_cents(amount_cents),
+                # One supplier, not a rotation: the measure that separates a
+                # concentrated rise from a long tail is the top supplier's share of
+                # the increase, and a pair splitting it evenly would sit near a half.
+                **dict(zip(
+                    ("vendor_code", "description"),
+                    books.invoice(GROWTH_DEBIT_ACCOUNT, 0),
+                )),
             )
             amount_cents = int(amount_cents * GROWTH_FACTOR)
 
@@ -246,31 +324,39 @@ def planted(config, months: list[date], accounts: list[str], centres: list[str])
             doc_id="X-OUTLIER-000000",
             accounting_date=months[len(months) // 2] + timedelta(days=rng.randrange(5)),
             posted_at=months[len(months) // 2] + timedelta(days=6),
-            debit_account=accounts[0],
-            credit_account=accounts[1],
+            debit_account=books.expense[0],
+            credit_account=books.payable_for(books.expense[0]),
             cost_centre=centres[0],
             currency=BASE_CURRENCY,
             debit=_cents(typical * OUTLIER_MULTIPLE),
+            # The other concentrated shape, and concentrated the same way.
+            **dict(zip(("vendor_code", "description"), books.invoice(books.expense[0], 0))),
         )
 
 
-def adjustments(config, months: list[date], accounts: list[str], centres: list[str], entry_count: int):
+def adjustments(config, months: list[date], books: "Books", centres: list[str], entry_count: int):
     """Corrections always; restatements only when the switch is on.
 
     The entries they point at are named rather than remembered: ids are formulaic and
     the count is known up front, so referencing them costs no memory.
+
+    An adjustment is a standalone row rather than a voucher, so the per-voucher vendor
+    rule cannot apply to it: the vendor is decided by the row's own account instead.
+    They post to expense detail accounts, so they carry one.
     """
     rng = stream_for(config.seed, ADJUSTMENTS)
     restatement_rng = stream_for(config.seed, RESTATEMENTS)
 
     def row(index: int, kind: str, target: int, month: date, drawn) -> dict[str, object]:
         booked = month + timedelta(days=drawn.randrange(20))
+        account = books.expense[index % len(books.expense)]
+        vendor_code, description = books.invoice(account, index)
         return {
             "entry_id": f"A-{kind[:4].upper()}-{index:06d}",
             "version": 2,
             "accounting_date": schema.format_date(booked),
             "posted_at": schema.format_date(schema.period_close(booked) + timedelta(days=20)),
-            "account_code": accounts[index % len(accounts)],
+            "account_code": account,
             "cost_center_code": centres[index % len(centres)],
             "currency": BASE_CURRENCY,
             "amount_dr": schema.format_amount(_cents(drawn.randrange(MIN_CENTS, MAX_CENTS))),
@@ -278,6 +364,8 @@ def adjustments(config, months: list[date], accounts: list[str], centres: list[s
             "doc_id": f"A-{kind[:4].upper()}-{index:06d}",
             "adjusts_entry_id": f"E-{target:09d}",
             "adjustment_type": kind,
+            "vendor_code": vendor_code,
+            "description": description,
         }
 
     for index in range(3):
@@ -294,7 +382,7 @@ def adjustments(config, months: list[date], accounts: list[str], centres: list[s
             )
 
 
-def long_tail(config, months: list[date], centres: list[str]):
+def long_tail(config, months: list[date], books: "Books", centres: list[str]):
     """The long-tail account's entries, present whether or not the switch is on.
 
     The switch multiplies one period's amounts; it does not add rows. A long-tail
@@ -339,4 +427,10 @@ def long_tail(config, months: list[date], centres: list[str]):
                 cost_centre=centres[index % len(centres)],
                 currency=BASE_CURRENCY,
                 debit=(base * uplift).quantize(schema.AMOUNT_PLACES),
+                # Rotated across the office suppliers, so the uplift arrives spread
+                # thinly - which is the whole point of the shape.
+                **dict(zip(
+                    ("vendor_code", "description"),
+                    books.invoice(LONG_TAIL_DEBIT_ACCOUNT, index),
+                )),
             )

@@ -72,6 +72,17 @@ columns:
     type: string
     nullable: false
 
+  # Empty on a sale: revenue is earned from customers, not paid to suppliers. This is
+  # why the column is nullable, and an empty CSV field means null.
+  - name: vendor_code
+    type: string
+    nullable: true
+
+  # Never empty. What the voucher was for, in the wording its account's category uses.
+  - name: description
+    type: string
+    nullable: false
+
 row_constraints:
   - type: not_after
     earlier: accounting_date

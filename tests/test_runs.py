@@ -3,7 +3,7 @@
 Two lines per run, appended and never rewritten. The `started` event records the
 intent - this run, these tables, this window - and the `finished` event records what
 came of it. The pair is what answers the morning question: something started at
-03:15, said it would read these five tables, and never said anything again. A record
+03:15, said it would read these six tables, and never said anything again. A record
 written only on the paths that worked would be missing from exactly the run somebody
 is investigating. See docs/adr/0019.
 
@@ -29,6 +29,7 @@ from test_load import GL_ADJUSTMENT, GL_ENTRY, adjustment, entry, write_source
 
 DIM_ACCOUNT = contracts.load("dim_account_src")
 DIM_COST_CENTER = contracts.load("dim_cost_center_src")
+DIM_VENDOR = contracts.load("dim_vendor")
 FX_RATE = contracts.load("fx_rate")
 
 RUN_ID = re.compile(r"^\d{8}T\d{6}Z-[0-9a-f]{6}$")
@@ -47,12 +48,15 @@ COST_CENTERS = [{
     "effective_date": "2026-01-01",
 }]
 RATES = [{"currency": "CNY", "rate_date": "2026-01-01", "rate_to_base": "1.000000"}]
+VENDORS = [{"vendor_code": "V-0001", "name": "Northwind Office Supplies",
+            "category": "office"}]
 
 EVERY_TABLE = {
     GL_ENTRY["table"]: (GL_ENTRY, ENTRIES),
     GL_ADJUSTMENT["table"]: (GL_ADJUSTMENT, ADJUSTMENTS),
     DIM_ACCOUNT["table"]: (DIM_ACCOUNT, ACCOUNTS),
     DIM_COST_CENTER["table"]: (DIM_COST_CENTER, COST_CENTERS),
+    DIM_VENDOR["table"]: (DIM_VENDOR, VENDORS),
     FX_RATE["table"]: (FX_RATE, RATES),
 }
 
@@ -64,7 +68,7 @@ def raw_dir(tmp_path):
 
 @pytest.fixture
 def source(tmp_path):
-    """A source directory holding all five tables, so one run touches both the
+    """A source directory holding all six tables, so one run touches both the
     incremental path and the whole-table replacement one."""
     directory = tmp_path / "source"
     for contract, rows in EVERY_TABLE.values():
@@ -172,7 +176,7 @@ def test_each_table_records_what_the_load_report_says_it_did(source, raw_dir):
 
 
 def test_every_table_records_the_digest_of_the_file_it_read(source, raw_dir):
-    """Case 7. All five tables, incremental and whole-table replacement alike - this is
+    """Case 7. All six tables, incremental and whole-table replacement alike - this is
     the only answer to whether the extract ingested was the bytes that were sent."""
     report = load.load_source(source, raw_dir)
 

@@ -72,6 +72,8 @@ GL_ENTRY = {
     "amount_dr": "100.00",
     "amount_cr": "0.00",
     "doc_id": "D1",
+    "vendor_code": "V-0001",
+    "description": "Office supplies purchase",
 }
 
 ACCOUNT = {
@@ -858,3 +860,29 @@ def test_the_contract_tests_go_through_the_validator():
         }
         assert "validate_source" in called, f"{name} does not go through the validator"
         assert "violations" not in called, f"{name} still uses the local rule executor"
+
+
+# --- the drift switch has to know every table --------------------------------
+#
+# Case 29b of task.md.
+
+def test_every_generated_table_has_a_column_the_drift_switch_can_drop():
+    """A table added to schema.COLUMNS becomes a legal --schema-drift-table
+    immediately, and writers.columns_for() then indexes DRIFT_DROP_COLUMN by table
+    name. A table missing from that map does not fail an assertion - it raises
+    KeyError from inside the generator, which is how dim_vendor would have arrived."""
+    assert set(schema.DRIFT_DROP_COLUMN) == set(schema.COLUMNS)
+    for table, dropped in schema.DRIFT_DROP_COLUMN.items():
+        assert dropped in schema.COLUMNS[table], f"{table} cannot drop {dropped}"
+
+
+def test_an_empty_vendor_passes_and_an_empty_description_does_not(tmp_path):
+    """Case 29. A sale has no supplier, so an empty vendor_code is a null the contract
+    allows; a description is never absent. The two columns were added together and only
+    one of them is nullable, which is the kind of pair that gets copied wrong."""
+    report = report_for(tmp_path, "gl_entry", [entry(vendor_code="")])
+    assert not report.incompatible, [f.message for f in report.findings]
+
+    report = report_for(tmp_path, "gl_entry", [entry(description="")])
+    assert report.incompatible
+    assert "description" in report.findings[0].message

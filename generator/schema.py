@@ -1,4 +1,4 @@
-"""Column names, order and formatting for the five source tables.
+"""Column names, order and formatting for the six source tables.
 
 This module is the single truth for what the generator emits. Writers take their
 column order from here and tests assert against these constants, so an implementation
@@ -35,6 +35,8 @@ COLUMNS: dict[str, tuple[str, ...]] = {
         "amount_dr",
         "amount_cr",
         "doc_id",
+        "vendor_code",
+        "description",
     ),
     "gl_adjustment": (
         "entry_id",
@@ -49,6 +51,13 @@ COLUMNS: dict[str, tuple[str, ...]] = {
         "doc_id",
         "adjusts_entry_id",
         "adjustment_type",
+        "vendor_code",
+        "description",
+    ),
+    "dim_vendor": (
+        "vendor_code",
+        "name",
+        "category",
     ),
     "dim_account_src": (
         "account_code",
@@ -87,6 +96,10 @@ DRIFT_DROP_COLUMN: dict[str, str] = {
     "dim_account_src": "account_type",
     "dim_cost_center_src": "name",
     "fx_rate": "rate_to_base",
+    # Every table in COLUMNS is a legal --schema-drift-table, and writers.columns_for
+    # indexes this map by table name, so a table missing here raises KeyError from
+    # inside the generator rather than failing an assertion.
+    "dim_vendor": "category",
 }
 
 

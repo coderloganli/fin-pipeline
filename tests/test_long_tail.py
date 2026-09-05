@@ -350,3 +350,124 @@ def test_a_single_period_is_refused(tmp_path):
             seed=42, out_dir=tmp_path / "single",
             periods="2026-01:2026-01", long_tail_anomaly=True,
         ))
+
+
+# --- the two shapes, seen through the vendor ---------------------------------
+#
+# Cases 18, 19, 19a and 20 of task.md. This is what the whole ticket is for: the
+# insight layer's `breakdown_by_vendor` has to be able to reject "is it one
+# supplier?" for a long tail and confirm it for a concentrated rise. If both shapes
+# looked the same under that question, the third step's A/B comparison would have
+# nothing to show. See docs/adr/0022.
+
+from generator import dimensions as dim_module            # noqa: E402
+
+VENDOR_SPREAD_MIN = 20              # a long tail has to reach this many suppliers
+LONG_TAIL_TOP_VENDOR_SHARE = Decimal("0.15")
+CONCENTRATED_TOP_VENDOR_SHARE = Decimal("0.95")
+
+
+def increase_by_vendor(clean: Path, dirty: Path, account: str) -> dict[str, Decimal]:
+    """How much each vendor's total on `account` grew when the switch was turned on.
+
+    A difference rather than a snapshot, and that is the point. The long-tail account
+    carries its three hundred vouchers whether or not the switch is on
+    (docs/adr/0007), so grouping only the switched-on run by vendor looks spread out
+    even when the uplift never happened.
+    """
+    def totals(out: Path) -> dict[str, Decimal]:
+        found: dict[str, Decimal] = defaultdict(Decimal)
+        for row in rows(out, "gl_entry"):
+            if row["account_code"] == account and row["vendor_code"]:
+                found[row["vendor_code"]] += amount(row)
+        return found
+
+    before, after = totals(clean), totals(dirty)
+    return {
+        vendor: after[vendor] - before.get(vendor, Decimal(0))
+        for vendor in after
+        if after[vendor] - before.get(vendor, Decimal(0)) > 0
+    }
+
+
+def top_share(increase: dict[str, Decimal]) -> Decimal:
+    total = sum(increase.values())
+    assert total > 0, "the switch produced no increase at all"
+    return max(increase.values()) / total
+
+
+def test_the_long_tail_increase_is_spread_across_many_vendors(tmp_path):
+    """Case 18."""
+    clean = run(tmp_path)
+    dirty = run(tmp_path, long_tail_anomaly=True)
+
+    increase = increase_by_vendor(clean, dirty, LONG_TAIL_DEBIT_ACCOUNT)
+
+    assert len(increase) >= VENDOR_SPREAD_MIN, (
+        f"the long tail reached only {len(increase)} vendors"
+    )
+    assert top_share(increase) < LONG_TAIL_TOP_VENDOR_SHARE, (
+        f"the largest vendor took {top_share(increase):.1%} of the increase"
+    )
+
+
+def test_the_growth_increase_lands_on_one_vendor(tmp_path):
+    """Case 19. One vendor rather than two: the measure is the top vendor's share of
+    the increase, and a pair splitting it evenly would sit near a half, which is
+    neither concentrated nor spread."""
+    clean = run(tmp_path)
+    dirty = run(tmp_path, growing_account=True)
+
+    increase = increase_by_vendor(clean, dirty, GROWTH_DEBIT_ACCOUNT)
+
+    assert top_share(increase) > CONCENTRATED_TOP_VENDOR_SHARE, (
+        f"the largest vendor took only {top_share(increase):.1%} of the increase"
+    )
+
+
+def test_the_outlier_increase_lands_on_one_vendor(tmp_path):
+    """Case 19a. The other concentrated shape. Without it, amount_outliers could keep
+    spreading vendors at random and no test would say so."""
+    clean = run(tmp_path)
+    dirty = run(tmp_path, amount_outliers=True)
+
+    account = next(
+        row["account_code"] for row in rows(dirty, "gl_entry")
+        if row["entry_id"].startswith("X-OUTLIER") and Decimal(row["amount_dr"]) > 0
+    )
+    increase = increase_by_vendor(clean, dirty, account)
+
+    assert top_share(increase) > CONCENTRATED_TOP_VENDOR_SHARE, (
+        f"the largest vendor took only {top_share(increase):.1%} of the increase"
+    )
+
+
+def test_one_measure_separates_the_two_shapes(tmp_path):
+    """Case 20. The same question, asked of both: is the increase concentrated in one
+    supplier? The concentrated shapes say yes and the long tail says no, which is
+    exactly the step that lets an investigation reject its first hypothesis and go
+    looking for a second one."""
+    clean = run(tmp_path)
+
+    concentrated = top_share(increase_by_vendor(
+        clean, run(tmp_path, growing_account=True), GROWTH_DEBIT_ACCOUNT))
+    spread = top_share(increase_by_vendor(
+        clean, run(tmp_path, long_tail_anomaly=True), LONG_TAIL_DEBIT_ACCOUNT))
+
+    assert concentrated > CONCENTRATED_TOP_VENDOR_SHARE
+    assert spread < LONG_TAIL_TOP_VENDOR_SHARE
+    assert concentrated > spread * 5, (concentrated, spread)
+
+
+def test_the_clean_long_tail_amounts_stay_inside_their_band(tmp_path):
+    """The Top-20 arithmetic in docs/adr/0007 is computed from this band and from three
+    hundred vouchers a period. Nothing pinned the band itself, so widening it would
+    only have been caught if the sampled seed happened to break the predicate."""
+    out = run(tmp_path)
+    amounts = [
+        amount(row) for row in rows(out, "gl_entry")
+        if row["account_code"] == LONG_TAIL_DEBIT_ACCOUNT
+    ]
+    assert amounts
+    assert min(amounts) >= Decimal("250.00"), min(amounts)
+    assert max(amounts) <= Decimal("350.00"), max(amounts)

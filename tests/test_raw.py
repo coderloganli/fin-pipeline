@@ -46,6 +46,8 @@ def entry(entry_id: str, version: str, accounting_date: str, **overrides) -> dic
         "amount_dr": "100.00",
         "amount_cr": "0.00",
         "doc_id": f"DOC-{entry_id}",
+        "vendor_code": "V-0001",
+        "description": "Office supplies purchase",
     }
     row.update(overrides)
     return row

@@ -32,7 +32,7 @@ generator ──▶ raw (Parquet) ──▶ staging (Parquet, PySpark) ──▶
 
 | Directory | Responsibility |
 |---|---|
-| `generator/` | Synthetic ledger data, with a switch for every failure mode the tests need. Writes CSV to `data/source/`, reproducible from a seed |
+| `generator/` | Synthetic ledger data, with a switch for every failure mode the tests need. Writes CSV to `data/source/`, reproducible from a seed. The chart of accounts follows the accounting standard two levels deep, and expense-side vouchers carry a vendor |
 | `ingest/` | Contract validation, watermarked incremental merge, run records |
 | `transform/spark/` | SCD2 loading, the point-in-time join, monthly aggregation |
 | `transform/dbt/` | Relational models, tests, lineage |
@@ -72,13 +72,25 @@ test reports success, and a green CI run that verified nothing defeats the point
 having gates at all. The failure message names the command that starts the
 containers.
 
-**Test data is generated, never committed.** `generator/` writes the five source
+**Test data is generated, never committed.** `generator/` writes the six source
 tables to `data/source/`, which is ignored — `raw/` is the layer that exists after
 ingest, and the two names are not interchangeable. The same seed gives byte-identical
 files, so a scenario test can plant a failure and assert on it. Each failure mode
 draws from its own random stream, so switching one on leaves the data belonging to the
 others where it was. Anomalies are constructed, never found by scanning: rows are
 streamed and forgotten, so nothing that requires holding them is possible.
+
+**A vendor belongs to the voucher, and only where a vendor makes sense.** A voucher
+that debits an expense detail account and credits a payables one carries the same
+`vendor_code` and `description` on both of its lines; one that debits receivables and
+credits revenue leaves the vendor empty, because revenue is earned from customers rather
+than paid to suppliers. The supplier dimension is built from a stream of its own, so
+adding it moved no existing entry's amounts, dates or identifiers; the assignment itself
+draws nothing and chooses by position within the account's category. The vendor distribution is a design
+input: office supplies carries around thirty vendors so a long tail has somewhere to
+spread, marketing carries two so a growth anomaly concentrates, and without that
+asymmetry the two anomaly shapes would be indistinguishable under the insight layer's
+`breakdown_by_vendor`. See docs/adr/0021 and 0022.
 
 Two anomaly shapes exist and they are opposites. A concentrated one puts the increase
 into a few large entries; a long-tail one spreads it across hundreds of small ones, so
@@ -91,7 +103,7 @@ implementation. See docs/adr/0007-long-tail-anomaly-changes-amounts.md.
 `ingest/validate.py` applies a contract to a source file: an added column warns and
 the run continues, and a missing column, a reordering, a value that no longer fits its
 declared type or rule, a repeated primary key, or a broken row constraint fails it.
-That asymmetry is one rule for all five tables and it lives with the validator, not in
+That asymmetry is one rule for all six tables and it lives with the validator, not in
 the contracts. The library returns a report rather than raising, because a warning and
 a failure have to reach the caller through the same call; `python -m ingest.validate`
 is what turns an incompatible report into a non-zero exit. Rows stream and findings

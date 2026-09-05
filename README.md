@@ -25,7 +25,7 @@ costed across **12 cost centres** under a handful of departments, against a char
 around **40 accounts**. Sales, purchasing, expenses and payroll all end up posted to the
 general ledger of one ERP as **vouchers**.
 
-The platform does not connect to the ERP. **Every night the ERP exports five tables as
+The platform does not connect to the ERP. **Every night the ERP exports six tables as
 CSV into a landing directory**, and the platform picks them up from there.
 
 ```
@@ -48,9 +48,9 @@ type, and it will not tell you. The first thing that happens downstream is a con
 check. Swapping the file drop for CDC or an ERP API changes nothing below it, because
 what the pipeline depends on is the contract, not the transport.
 
-### The five tables
+### The six tables
 
-Three facts, two dimensions. The columns, types and constraints are declared in
+Three facts, three dimensions. The columns, types and constraints are declared in
 `ingest/contracts/*.yaml`.
 
 | Table | What it is | Primary key |
@@ -60,11 +60,12 @@ Three facts, two dimensions. The columns, types and constraints are declared in
 | `fx_rate` | **Exchange rates**, one row per currency per day, against the base currency | `(currency, rate_date)` |
 | `dim_account_src` | **Chart of accounts**, effective-dated | `(account_code, effective_date)` |
 | `dim_cost_center_src` | **Cost centres** and the department each belongs to, effective-dated | `(cc_code, effective_date)` |
+| `dim_vendor` | **Suppliers** and what they supply | `(vendor_code)` |
 
 `gl_entry` carries `entry_id`, `version`, `accounting_date`, `posted_at`, `account_code`,
-`cost_center_code`, `currency`, `amount_dr`, `amount_cr` and `doc_id`. `gl_adjustment`
-adds `adjusts_entry_id` — which original line it revises — and `adjustment_type`, either
-a `correction` or a `restatement`.
+`cost_center_code`, `currency`, `amount_dr`, `amount_cr`, `doc_id`, `vendor_code` and
+`description`. `gl_adjustment` adds `adjusts_entry_id` — which original line it revises —
+and `adjustment_type`, either a `correction` or a `restatement`.
 
 Three modelling points carry most of the difficulty:
 
@@ -76,10 +77,17 @@ Three modelling points carry most of the difficulty:
 - **A voucher is several rows and has to balance.** Rows sharing a `doc_id` are one
   unit, and each row is either a debit or a credit — never both, never neither. Debits
   that do not equal credits are bad data, and catching that is the quality gate's job.
-- **Both dimensions are keyed on their effective date.** A cost centre moving to another
-  department mid-year adds a row rather than changing one. Keyed on `cc_code` alone, that
-  perfectly legitimate reorganisation would be rejected as a duplicate key — and it is
-  the very scenario the point-in-time join exists for.
+- **The two effective-dated dimensions are keyed on their date.** A cost centre moving
+  to another department mid-year adds a row rather than changing one. Keyed on `cc_code`
+  alone, that perfectly legitimate reorganisation would be rejected as a duplicate key —
+  and it is the very scenario the point-in-time join exists for. `dim_vendor` is not
+  effective-dated: a supplier being renamed is not something the platform has to
+  reproduce point-in-time.
+- **A vendor belongs to the voucher, and only where a vendor makes sense.** A voucher
+  that debits an expense and credits a payable carries the same `vendor_code` and
+  `description` on both of its lines; one that debits receivables and credits revenue
+  leaves the vendor empty, because revenue is earned from customers rather than paid to
+  suppliers. That makes `vendor_code` a column that is null for a business reason.
 
 ### Synthetic, and honest about it
 
@@ -89,12 +97,17 @@ unbalanced vouchers, two shapes of anomaly, schema drift. Because the anomalies 
 planted deliberately, the golden set that evaluates the insight layer has known correct
 answers.
 
-As of the end of step one the generated data is **structurally real and semantically a
-placeholder**: accounts are named `account 6100`, cost centres `cost centre CC-001`, and
-`account_type` is assigned round-robin rather than meaning anything. There is also no
-vendor and no voucher description, which the insight layer's planned
-`breakdown_by_vendor` tool needs. Making the ledger read like a real one is generator
-work, and generator work gets more expensive the later it is done.
+The chart of accounts follows the accounting standard's numbering two levels deep, so a
+row reads as a transaction rather than as a fixture: `660101 Selling expenses - travel`
+debited, `220203 Accounts payable - travel agency` credited, a named supplier, and
+`Travel reimbursement` as the description.
+
+The supplier distribution is a design input rather than an accident. Office supplies
+carries thirty vendors so the long-tail anomaly has somewhere to spread; marketing
+carries two, and each concentrated anomaly lands on exactly one of them. Without that
+asymmetry the two anomaly shapes would be indistinguishable under the insight layer's
+`breakdown_by_vendor`, and the A/B comparison the third step is built on would have
+nothing to show.
 
 ## Architecture
 
