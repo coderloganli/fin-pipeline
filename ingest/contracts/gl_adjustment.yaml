@@ -74,6 +74,18 @@ columns:
     nullable: false
     allowed: [correction, restatement]
 
+  # Nullable for the same reason it is nullable on gl_entry, though an adjustment is a
+  # standalone row rather than a voucher: these correct expenses, so in practice every
+  # one of them names the supplier whose invoice is being put right.
+  - name: vendor_code
+    type: string
+    nullable: true
+
+  # Never empty. What the voucher was for, in the wording its account's category uses.
+  - name: description
+    type: string
+    nullable: false
+
 row_constraints:
   - type: not_after
     earlier: accounting_date

@@ -1,0 +1,25 @@
+# The suppliers an invoice can be owed to.
+#
+# Unlike the two effective-dated dimensions this one is keyed on the code alone. A
+# supplier being renamed or recategorised is not a business event the platform has to
+# reproduce point-in-time, so there is no history to keep and no second key column.
+
+table: dim_vendor
+primary_key: [vendor_code]
+
+columns:
+  - name: vendor_code
+    type: string
+    nullable: false
+
+  - name: name
+    type: string
+    nullable: false
+
+  # A closed set, because it decides which expense accounts a supplier can be invoiced
+  # against. A value outside it means the upstream added a kind of supplier nobody
+  # downstream knows how to attribute.
+  - name: category
+    type: string
+    nullable: false
+    allowed: [materials, services, travel, office, marketing]

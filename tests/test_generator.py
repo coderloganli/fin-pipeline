@@ -26,7 +26,8 @@ from generator import Config, generate
 from generator import dimensions, schema
 from generator.streams import stream_for
 
-TABLES = ("gl_entry", "gl_adjustment", "dim_account_src", "dim_cost_center_src", "fx_rate")
+TABLES = ("gl_entry", "gl_adjustment", "dim_account_src", "dim_cost_center_src",
+          "dim_vendor", "fx_rate")
 
 # Thresholds are constants, not judgements: a vague threshold can be tripped by clean
 # data or satisfied by a generator that plants nothing.
@@ -460,7 +461,7 @@ def test_a_switch_touches_only_the_table_it_owns(tmp_path, switch, owned):
     )
 
 
-def test_the_command_line_writes_the_five_tables(tmp_path):
+def test_the_command_line_writes_the_six_tables(tmp_path):
     """The CLI is how step four drives scale, so its wiring is user-facing."""
     from generator.__main__ import main
 
@@ -764,3 +765,393 @@ def test_the_rate_written_is_the_one_the_formatter_returned(monkeypatch):
 
     assert produced
     assert {row["rate_to_base"] for row in produced} == {"through-the-formatter"}
+
+
+# --- a chart of accounts, cost centres and vendors that read like a ledger ---
+#
+# Cases 1-8, 9-11, 12-17a, 20a and 23 of task.md. The generator's structure was
+# always right; what these pin is that its content means something. See
+# docs/adr/0021 (the chart follows the standard) and 0022 (a vendor belongs to the
+# voucher, and is drawn from its own stream).
+
+from generator import entries as entry_module            # noqa: E402
+from generator import streams as stream_module           # noqa: E402
+
+FIRST_LEVEL_DIGITS = 4
+DETAIL_DIGITS = 6
+
+
+def by_voucher(out: Path, prefix: str = "D-") -> dict[str, list[dict[str, str]]]:
+    """Ordinary vouchers, keyed by document. Planted rows carry their own prefixes."""
+    grouped: dict[str, list[dict[str, str]]] = defaultdict(list)
+    for row in rows(out, "gl_entry"):
+        if row["doc_id"].startswith(prefix):
+            grouped[row["doc_id"]].append(row)
+    return dict(grouped)
+
+
+def debit_of(voucher: list[dict[str, str]]) -> dict[str, str]:
+    return next(row for row in voucher if Decimal(row["amount_dr"]) > 0)
+
+
+def credit_of(voucher: list[dict[str, str]]) -> dict[str, str]:
+    return next(row for row in voucher if Decimal(row["amount_cr"]) > 0)
+
+
+# --- the chart --------------------------------------------------------------
+
+@pytest.mark.parametrize("code, expected_type", [
+    ("1001", "asset"),
+    ("2202", "liability"),
+    ("4001", "equity"),
+    ("6001", "revenue"),
+    ("6601", "expense"),
+])
+def test_an_accounts_code_name_and_type_agree(tmp_path, code, expected_type):
+    """Case 1. The old chart typed 6100 as an asset, which is not a chart anybody
+    could read: under the standard the 6xxx range is profit and loss."""
+    declared = {row["account_code"]: row for row in rows(run(tmp_path), "dim_account_src")}
+    assert code in declared, f"{code} is not in the chart"
+    assert declared[code]["account_type"] == expected_type
+    assert declared[code]["name"], f"{code} has no name"
+    assert not declared[code]["name"].startswith("account "), (
+        f"{code} is still named by its own code"
+    )
+
+
+def test_a_detail_account_hangs_off_a_first_level_one(tmp_path):
+    """Case 2. Exactly two levels: a row with a parent names a row without one."""
+    declared = {row["account_code"]: row for row in rows(run(tmp_path), "dim_account_src")}
+    details = [row for row in declared.values() if row["parent_code"]]
+    assert details, "no detail accounts at all"
+    for row in details:
+        parent = row["parent_code"]
+        assert parent in declared, f"{row['account_code']} names a parent that is absent"
+        assert not declared[parent]["parent_code"], (
+            f"{row['account_code']} hangs off {parent}, which itself has a parent"
+        )
+
+
+def test_a_first_level_account_has_no_parent(tmp_path):
+    """Case 3. The code says which level it is, and the two agree."""
+    for row in rows(run(tmp_path), "dim_account_src"):
+        if row["parent_code"]:
+            assert len(row["account_code"]) == DETAIL_DIGITS
+            assert row["account_code"].startswith(row["parent_code"])
+        else:
+            assert len(row["account_code"]) == FIRST_LEVEL_DIGITS
+
+
+def test_account_codes_are_unique(tmp_path):
+    """Case 4."""
+    codes = [row["account_code"] for row in rows(run(tmp_path), "dim_account_src")]
+    assert len(codes) == len(set(codes))
+
+
+def test_every_account_type_appears_more_than_once(tmp_path):
+    """Case 5. A chart with one equity account is a chart nobody modelled."""
+    seen = defaultdict(int)
+    for row in rows(run(tmp_path), "dim_account_src"):
+        seen[row["account_type"]] += 1
+    assert set(seen) == set(dimensions.ACCOUNT_TYPES)
+    assert all(count >= 2 for count in seen.values()), dict(seen)
+
+
+@pytest.mark.parametrize("switches", [
+    {},
+    {"long_tail_anomaly": True},
+    {"growing_account": True},
+])
+def test_the_reserved_anomaly_accounts_are_always_declared(tmp_path, switches):
+    """Case 6. The property docs/adr/0007 gave them, carried across the renumbering:
+    they are emitted whether or not their switch is on, so turning one on does not
+    change dim_account_src."""
+    declared = {row["account_code"] for row in rows(run(tmp_path, **switches), "dim_account_src")}
+    for account in dimensions.RESERVED_ACCOUNTS:
+        assert account in declared, f"{account} is missing with {switches}"
+
+
+# --- cost centres -----------------------------------------------------------
+
+def test_cost_centres_have_real_names_and_real_departments(tmp_path):
+    """Case 7."""
+    for row in rows(run(tmp_path), "dim_cost_center_src"):
+        assert row["name"] != f"cost centre {row['cc_code']}"
+        assert row["dept_code"] in dimensions.DEPARTMENTS, row["dept_code"]
+
+
+def test_the_cost_centre_move_rotates_within_the_departments(tmp_path):
+    """Case 8. The move used to be computed by reading the last character of the
+    department code as a number, which a code like DEPT-SALES has no answer for."""
+    seen: dict[str, list[dict[str, str]]] = defaultdict(list)
+    for row in rows(run(tmp_path, cost_centre_move=True), "dim_cost_center_src"):
+        seen[row["cc_code"]].append(row)
+
+    moved = [history for history in seen.values() if len(history) > 1]
+    assert len(moved) == 1, "expected exactly one cost centre to move"
+
+    before, after = sorted(moved[0], key=lambda row: row["effective_date"])
+    assert before["dept_code"] != after["dept_code"]
+    assert after["dept_code"] in dimensions.DEPARTMENTS
+
+
+# --- the vendor dimension ---------------------------------------------------
+
+def test_dim_vendor_has_one_row_per_vendor(tmp_path):
+    """Case 9."""
+    vendors = rows(run(tmp_path), "dim_vendor")
+    assert len(vendors) == dimensions.VENDOR_COUNT
+    codes = [row["vendor_code"] for row in vendors]
+    assert len(codes) == len(set(codes))
+    for row in vendors:
+        assert row["name"]
+        assert row["category"] in dimensions.VENDOR_CATEGORIES, row["category"]
+
+
+def test_the_vendor_categories_are_shaped_for_the_two_anomaly_forms(tmp_path):
+    """Case 10. The distribution is a design input, not an accident: a long tail needs
+    somewhere to spread and a concentrated anomaly needs somewhere to concentrate.
+    Without the asymmetry the two shapes look identical under breakdown_by_vendor,
+    which is the comparison the third step is built on. See docs/adr/0022."""
+    counts = defaultdict(int)
+    for row in rows(run(tmp_path), "dim_vendor"):
+        counts[row["category"]] += 1
+
+    assert counts[dimensions.OFFICE] >= 25, dict(counts)
+    assert counts[dimensions.MARKETING] <= 2, dict(counts)
+
+
+def test_dim_vendor_is_written_with_the_declared_header(tmp_path):
+    """Case 11."""
+    with (run(tmp_path) / "dim_vendor.csv").open(encoding="utf-8", newline="") as handle:
+        assert next(csv.reader(handle)) == list(schema.COLUMNS["dim_vendor"])
+
+
+# --- the vendor on an entry -------------------------------------------------
+
+def test_a_vendor_voucher_debits_an_expense_and_credits_a_payable(tmp_path):
+    """Case 12. Asserting only that both lines share a vendor would pass a generator
+    that credited anything at all; the shape is what makes the row an invoice."""
+    out = run(tmp_path)
+    checked = 0
+    for doc_id, voucher in by_voucher(out).items():
+        if not voucher[0]["vendor_code"]:
+            continue
+        assert len(voucher) == 2, doc_id
+        debit_account = debit_of(voucher)["account_code"]
+        assert debit_account in dimensions.EXPENSE_DETAIL
+        category = dimensions.CATEGORY_OF_ACCOUNT[debit_account]
+        # The payable the invoice is owed into, not merely some payable: a travel
+        # expense owed to a materials supplier would pass a membership check.
+        assert credit_of(voucher)["account_code"] == dimensions.PAYABLE_FOR_CATEGORY[category]
+        assert voucher[0]["vendor_code"] == voucher[1]["vendor_code"]
+        checked += 1
+    assert checked, "no voucher carried a vendor"
+
+
+def test_an_income_voucher_carries_no_vendor(tmp_path):
+    """Case 13. Revenue is earned from customers, not paid to suppliers."""
+    out = run(tmp_path)
+    checked = 0
+    for doc_id, voucher in by_voucher(out).items():
+        if voucher[0]["vendor_code"]:
+            continue
+        assert len(voucher) == 2, doc_id
+        assert debit_of(voucher)["account_code"] == dimensions.RECEIVABLE
+        assert credit_of(voucher)["account_code"] in dimensions.REVENUE_DETAIL
+        assert voucher[1]["vendor_code"] == ""
+        checked += 1
+    assert checked, "no voucher was free of a vendor"
+
+
+def test_both_voucher_shapes_are_generated(tmp_path):
+    """Case 13a. Without this, the two cases above can both pass against a generator
+    that only ever produces one shape."""
+    vouchers = by_voucher(run(tmp_path))
+    with_vendor = [v for v in vouchers.values() if v[0]["vendor_code"]]
+    without = [v for v in vouchers.values() if not v[0]["vendor_code"]]
+    assert with_vendor and without, (len(with_vendor), len(without))
+
+
+def test_every_vendor_on_an_entry_exists_in_the_dimension(tmp_path):
+    """Case 14. Referential integrity, asserted at the source rather than waited for
+    in a dbt test that does not exist yet."""
+    out = run(tmp_path, late_entries=True, restatements=True, long_tail_anomaly=True,
+              growing_account=True, amount_outliers=True)
+    declared = {row["vendor_code"] for row in rows(out, "dim_vendor")}
+    for table in ("gl_entry", "gl_adjustment"):
+        for row in rows(out, table):
+            if row["vendor_code"]:
+                assert row["vendor_code"] in declared, (
+                    f"{table}.{row['entry_id']} names vendor {row['vendor_code']}, "
+                    f"which is not in dim_vendor"
+                )
+
+
+def test_a_description_is_never_empty_and_the_voucher_shares_it(tmp_path):
+    """Case 15."""
+    for voucher in by_voucher(run(tmp_path)).values():
+        assert all(row["description"] for row in voucher)
+        assert len({row["description"] for row in voucher}) == 1
+
+
+def test_a_description_comes_from_its_accounts_category(tmp_path):
+    """Case 16. Phrase sets rather than free text, and the sets are disjoint - so a
+    generator that stamped any non-empty string on every row would fail here."""
+    out = run(tmp_path)
+    checked = 0
+    for voucher in by_voucher(out).values():
+        account = debit_of(voucher)["account_code"]
+        category = dimensions.CATEGORY_OF_ACCOUNT.get(account)
+        if category is None:
+            continue
+        assert voucher[0]["description"] in dimensions.PHRASES[category], (
+            f"{account} ({category}) got {voucher[0]['description']!r}"
+        )
+        checked += 1
+    assert checked, "no voucher debited an account with a category"
+
+
+def test_descriptions_and_vendors_are_deterministic(tmp_path):
+    """Case 17."""
+    first = {row["entry_id"]: (row["vendor_code"], row["description"])
+             for row in rows(run(tmp_path), "gl_entry")}
+    second = {row["entry_id"]: (row["vendor_code"], row["description"])
+              for row in rows(run(tmp_path), "gl_entry")}
+    assert first == second
+
+
+def test_an_adjustment_carries_a_vendor_when_its_account_does(tmp_path):
+    """Case 17a. An adjustment is a standalone row rather than a voucher, so the
+    per-voucher rule cannot apply to it; the rule is per row instead."""
+    out = run(tmp_path, restatements=True)
+    vendor_bearing = set(dimensions.EXPENSE_DETAIL) | set(dimensions.PAYABLE_DETAIL)
+    for row in rows(out, "gl_adjustment"):
+        assert row["description"], row["entry_id"]
+        if row["account_code"] in vendor_bearing:
+            assert row["vendor_code"], f"{row['entry_id']} posts to an expense with no vendor"
+        else:
+            assert row["vendor_code"] == "", f"{row['entry_id']} carries a vendor it should not"
+
+
+def test_ordinary_entries_never_post_to_a_reserved_account(tmp_path):
+    """Case 20a. docs/adr/0021 keeps the reserved accounts reserved so that a planted
+    increase never leaks into an ordinary account's monthly totals. Renaming them does
+    not change that argument, and the existing tests only check they exist."""
+    out = run(tmp_path, long_tail_anomaly=True, growing_account=True, amount_outliers=True)
+    for row in rows(out, "gl_entry"):
+        if row["entry_id"].startswith("E-"):
+            assert row["account_code"] not in dimensions.RESERVED_ACCOUNTS, (
+                f"ordinary entry {row['entry_id']} posts to reserved {row['account_code']}"
+            )
+
+
+def test_the_vendor_stream_does_not_move_the_entries(tmp_path, monkeypatch):
+    """Case 23. The whole reason docs/adr/0005 derives streams by name: a new concern
+    must not shift the numbers belonging to the old ones. Only the vendors stream is
+    replaced - changing Config.seed would move every stream and prove nothing."""
+    declared = list(schema.COLUMNS["gl_entry"])
+    business = [name for name in declared if name not in ("vendor_code", "description")]
+
+    before = [tuple(row[name] for name in business) for row in rows(run(tmp_path), "gl_entry")]
+
+    real = stream_module.stream_for
+
+    def a_different_vendor_stream(seed, name):
+        return real(seed + 1 if name == stream_module.VENDORS else seed, name)
+
+    monkeypatch.setattr(dimensions, "stream_for", a_different_vendor_stream)
+    monkeypatch.setattr(entry_module, "stream_for", a_different_vendor_stream)
+
+    after = [tuple(row[name] for name in business) for row in rows(run(tmp_path), "gl_entry")]
+
+    assert before == after
+
+
+# --- what the vendor has to agree with --------------------------------------
+#
+# Added at stage 8, after the code review found that a voucher could carry a supplier
+# of the wrong kind, or carry one inconsistently on a planted voucher, without any of
+# the cases above noticing.
+
+def all_vouchers(out: Path) -> dict[str, list[dict[str, str]]]:
+    """Every voucher in gl_entry, whatever planted it."""
+    grouped: dict[str, list[dict[str, str]]] = defaultdict(list)
+    for row in rows(out, "gl_entry"):
+        grouped[row["doc_id"]].append(row)
+    return dict(grouped)
+
+
+def test_a_vendor_supplies_what_its_account_buys(tmp_path):
+    """The supplier's own category has to be the account's category. Without this a
+    travel expense could be owed to an office-supplies vendor and still satisfy every
+    other test: the vendor exists, it is in dim_vendor, and the wording came from the
+    right phrase set."""
+    out = run(tmp_path, long_tail_anomaly=True, growing_account=True, amount_outliers=True)
+    category_of_vendor = {row["vendor_code"]: row["category"] for row in rows(out, "dim_vendor")}
+
+    checked = 0
+    for voucher in all_vouchers(out).values():
+        vendor = voucher[0]["vendor_code"]
+        if not vendor:
+            continue
+        account = debit_of(voucher)["account_code"]
+        assert category_of_vendor[vendor] == dimensions.CATEGORY_OF_ACCOUNT[account], (
+            f"{account} is invoiced by {vendor}, a "
+            f"{category_of_vendor[vendor]} supplier"
+        )
+        checked += 1
+    assert checked
+
+
+def test_every_voucher_carries_its_vendor_on_both_lines(tmp_path):
+    """Not just the ordinary ones. The planted vouchers - late, unbalanced, growth,
+    outlier - and the long tail all go through the same builder, and an aggregate taken
+    from the credit side has to reach the same supplier as one taken from the debit
+    side."""
+    out = run(tmp_path, late_entries=True, unbalanced_vouchers=True,
+              growing_account=True, amount_outliers=True, long_tail_anomaly=True)
+    prefixes = set()
+    for doc_id, voucher in all_vouchers(out).items():
+        assert len({row["vendor_code"] for row in voucher}) == 1, doc_id
+        assert len({row["description"] for row in voucher}) == 1, doc_id
+        assert all(row["description"] for row in voucher), doc_id
+        prefixes.add(doc_id.split("-")[0])
+
+    # The planted paths were reached at all, rather than the loop having nothing to do.
+    assert {"D", "X", "L"} <= prefixes, prefixes
+
+
+def test_an_adjustment_posts_to_an_expense_and_carries_its_vendor(tmp_path):
+    """Case 17a, narrowed to what the generator does. Adjustments correct expenses, so
+    every one of them has a supplier; asserting the empty branch as well would be
+    asserting against a path nothing produces."""
+    out = run(tmp_path, restatements=True)
+    category_of_vendor = {row["vendor_code"]: row["category"] for row in rows(out, "dim_vendor")}
+
+    rows_seen = rows(out, "gl_adjustment")
+    assert rows_seen
+    for row in rows_seen:
+        assert row["account_code"] in dimensions.EXPENSE_DETAIL, row["entry_id"]
+        assert row["vendor_code"], row["entry_id"]
+        assert row["description"], row["entry_id"]
+        assert (category_of_vendor[row["vendor_code"]]
+                == dimensions.CATEGORY_OF_ACCOUNT[row["account_code"]])
+
+
+def test_the_vendors_stream_is_what_names_the_suppliers(tmp_path, monkeypatch):
+    """The other half of the isolation test. That one shows the entries do not move
+    when the vendors stream changes; this one shows the stream is reaching the vendors
+    at all, so a generator that ignored it entirely could not pass both."""
+    before = {row["vendor_code"]: row["name"] for row in rows(run(tmp_path), "dim_vendor")}
+
+    real = stream_module.stream_for
+
+    def a_different_vendor_stream(seed, name):
+        return real(seed + 1 if name == stream_module.VENDORS else seed, name)
+
+    monkeypatch.setattr(dimensions, "stream_for", a_different_vendor_stream)
+    after = {row["vendor_code"]: row["name"] for row in rows(run(tmp_path), "dim_vendor")}
+
+    assert set(before) == set(after)
+    assert before != after

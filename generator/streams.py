@@ -23,6 +23,7 @@ UNBALANCED_VOUCHERS = "unbalanced_vouchers"
 GROWING_ACCOUNT = "growing_account"
 AMOUNT_OUTLIERS = "amount_outliers"
 LONG_TAIL = "long_tail"
+VENDORS = "vendors"
 
 
 def stream_for(seed: int, name: str) -> random.Random:

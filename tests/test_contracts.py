@@ -19,7 +19,7 @@ from pathlib import Path
 
 import pytest
 
-from generator import Config, generate, schema
+from generator import Config, dimensions, generate, schema
 from ingest import contracts
 from ingest.validate import check_value, check_row_constraint, validate_source
 
@@ -69,7 +69,7 @@ def generated(tmp_path: Path, **switches) -> Path:
 
 # --- Cases 1-3: the contract files themselves ------------------------------
 
-def test_there_are_exactly_five_contracts_named_after_their_tables():
+def test_there_is_a_contract_for_every_table_named_after_it():
     files = sorted(path.stem for path in CONTRACT_DIR.glob("*.yaml"))
     assert files == sorted(TABLES), (
         f"expected one contract per source table, got {files}"
@@ -462,7 +462,7 @@ def test_a_watermark_that_is_not_a_column_name_is_refused(key):
         validated(dated(**{key: 7}))
 
 
-FULL_RELOAD = ("dim_account_src", "dim_cost_center_src", "fx_rate")
+FULL_RELOAD = ("dim_account_src", "dim_cost_center_src", "dim_vendor", "fx_rate")
 
 
 @pytest.mark.parametrize("table", FULL_RELOAD)
@@ -484,3 +484,40 @@ def test_the_top_level_whitelist_did_not_widen():
     }
     with pytest.raises(contracts.ContractError, match="unknown top-level"):
         validated(dated(watermarkk="d"))
+
+
+# --- the vendor columns and the vendor dimension -----------------------------
+#
+# Cases 26, 27 and 29a of task.md. See docs/adr/0022.
+
+@pytest.mark.parametrize("table", ["gl_entry", "gl_adjustment"])
+def test_the_vendor_is_nullable_and_the_description_is_not(table):
+    """Case 26. A revenue voucher has no supplier, so the column is null for a
+    business reason rather than because a row happened to be short."""
+    contract = contracts.load(table)
+    assert column(contract, "vendor_code")["nullable"] is True
+    assert column(contract, "description")["nullable"] is False
+
+
+def test_dim_vendor_is_keyed_on_the_vendor_alone():
+    """Case 27. Unlike the two effective-dated dimensions, a vendor has no history to
+    keep here: renaming or recategorising one is not a business event this platform
+    has to reproduce."""
+    contract = contracts.load("dim_vendor")
+    assert contract["primary_key"] == ["vendor_code"]
+    assert "watermark" not in contract
+    assert "partition_by" not in contract
+    assert sorted(column(contract, "category")["allowed"]) == sorted(
+        dimensions.VENDOR_CATEGORIES
+    )
+
+
+def test_the_full_reload_list_covers_every_unwatermarked_table():
+    """Case 29a. FULL_RELOAD is written out by hand above, and a table added later
+    that declares no watermark would silently escape every test parametrised over it -
+    which is exactly what dim_vendor would have done."""
+    unwatermarked = {
+        table for table in contracts.tables()
+        if "watermark" not in contracts.load(table)
+    }
+    assert unwatermarked == set(FULL_RELOAD)

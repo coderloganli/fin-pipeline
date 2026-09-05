@@ -36,31 +36,31 @@ def _write(config: Config, table: str, rows) -> None:
 
 
 def generate(config: Config) -> None:
-    """Write the five source tables to `config.out_dir`."""
+    """Write the six source tables to `config.out_dir`."""
     months = entries.months_in(config.periods)
 
     account_rows = dimensions.accounts(config.seed)
     centre_rows = dimensions.cost_centres(config.seed, config.cost_centre_move)
+    vendor_rows = dimensions.vendors(config.seed)
 
-    # The two accounts the growth anomaly uses exist in the dimension whether or not
-    # the switch is on, so turning it on does not change dim_account_src.
-    ordinary_accounts = [
-        row["account_code"]
-        for row in account_rows
-        if row["account_code"] not in entries.RESERVED_ACCOUNTS
-    ]
+    # The pools an ordinary voucher is built from. The reserved anomaly accounts are
+    # in the chart but in none of the pools, so a planted increase never leaks into an
+    # ordinary account's monthly totals. See docs/adr/0007 and 0021.
+    books = entries.Books(config.seed)
+    assert not set(books.expense) & set(entries.RESERVED_ACCOUNTS)
     centre_codes = sorted({row["cc_code"] for row in centre_rows})
 
     _write(config, "dim_account_src", iter(account_rows))
     _write(config, "dim_cost_center_src", iter(centre_rows))
+    _write(config, "dim_vendor", iter(vendor_rows))
     _write(config, "fx_rate", iter(dimensions.fx_rates(config.seed, months)))
 
     def all_entries():
-        yield from entries.ordinary(config, months, ordinary_accounts, centre_codes)
+        yield from entries.ordinary(config, months, books, centre_codes)
         # Unconditional: the long-tail account has entries in every run, and the
         # switch changes their amounts rather than their number.
-        yield from entries.long_tail(config, months, centre_codes)
-        yield from entries.planted(config, months, ordinary_accounts, centre_codes)
+        yield from entries.long_tail(config, months, books, centre_codes)
+        yield from entries.planted(config, months, books, centre_codes)
 
     _write(config, "gl_entry", all_entries())
 
@@ -68,5 +68,5 @@ def generate(config: Config) -> None:
     _write(
         config,
         "gl_adjustment",
-        entries.adjustments(config, months, ordinary_accounts, centre_codes, entry_count),
+        entries.adjustments(config, months, books, centre_codes, entry_count),
     )

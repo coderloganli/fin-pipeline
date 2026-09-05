@@ -31,6 +31,14 @@ With no flags the output is the clean baseline: every voucher balances, nothing 
 late, no series is anomalous, and every cost centre has one row. That baseline is
 what the pipeline tests start from, so it is asserted directly rather than assumed.
 
+The ledger reads like one. The chart of accounts follows the accounting standard's
+numbering two levels deep — a four-digit first-level account, a six-digit detail account
+whose first four digits are its parent — and code, name and type agree with each other.
+An ordinary voucher is either an invoice (debit an expense detail, credit the payable
+matching its category, carry a supplier and a description) or a sale (debit receivables,
+credit revenue, carry no supplier, because revenue is earned from customers). See
+`docs/adr/0021` and `0022`.
+
 `schema.py` is the single truth for what the generator emits — column names, order,
 date format, decimal places. What ingest *expects* is declared separately under
 `ingest/contracts/`; a contract derived from its producer could not catch the
@@ -49,3 +57,12 @@ amount finds nothing, and the rise is only visible by asking a different questio
 
 The pair exists so the insight layer's two implementations can be compared. Both find
 a concentrated anomaly; only the long tail separates them.
+
+The suppliers are shaped for that comparison too. The long-tail account's three hundred
+vouchers rotate across thirty office-supply vendors, so its increase arrives spread
+thinly; the growth switch posts to a single marketing vendor and the outlier switch to a
+single vendor of its own account's category, so theirs arrives concentrated. An outlier
+has to sit on an ordinary account - being twenty times the median of the entries around
+it is what makes it one. Asked "is this one supplier?", the two shapes answer
+differently — which is the step that lets an investigation reject its first hypothesis
+and look for a second.
