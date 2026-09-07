@@ -155,11 +155,14 @@ docs/         architecture.md, and the decision records under adr/
 
 ## Running it locally
 
-Requires Docker and Python 3.13.
+Requires Docker, Python 3.13, and a JDK — Spark 4.2 runs on Java 17, 21 or 25, found
+either as `java` on your PATH or through `JAVA_HOME`. Spark runs inside the test
+process rather than in a container, so it is a toolchain dependency here in the same
+way the Python interpreter is; see `docs/adr/0028-spark-runs-in-process.md`.
 
 ```
 docker compose up -d          # Postgres, on 127.0.0.1:5432
-pip install -e ".[dev]"
+pip install -e ".[dev,spark]"
 pytest -q
 ```
 

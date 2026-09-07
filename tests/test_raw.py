@@ -64,7 +64,7 @@ THREE_PERIODS = [
 def test_a_batch_lands_one_file_per_accounting_period(tmp_path):
     """Case 9. The partition is what lets a late correction to March rewrite March
     and open nothing else."""
-    raw.write_table(GL_ENTRY, tmp_path, THREE_PERIODS, run_id=RUN_A)
+    raw.merge_table(GL_ENTRY, tmp_path, THREE_PERIODS, run_id=RUN_A)
 
     directories = sorted(path.name for path in (tmp_path / "gl_entry").iterdir())
     assert directories == [
@@ -86,7 +86,7 @@ def test_a_partition_carries_the_declared_columns_as_strings(tmp_path):
     import pyarrow as pa
     import pyarrow.parquet as pq
 
-    raw.write_table(GL_ENTRY, tmp_path, THREE_PERIODS, run_id=RUN_A)
+    raw.merge_table(GL_ENTRY, tmp_path, THREE_PERIODS, run_id=RUN_A)
     schema = pq.read_schema(tmp_path / "gl_entry" / "accounting_period=2026-01" / PART_FILE)
 
     declared = [spec["name"] for spec in GL_ENTRY["columns"]]
@@ -97,7 +97,7 @@ def test_a_partition_carries_the_declared_columns_as_strings(tmp_path):
 
 def test_rows_round_trip_unchanged(tmp_path):
     """Case 11."""
-    raw.write_table(GL_ENTRY, tmp_path, THREE_PERIODS, run_id=RUN_A)
+    raw.merge_table(GL_ENTRY, tmp_path, THREE_PERIODS, run_id=RUN_A)
     landed = sorted(raw.read_table(GL_ENTRY, tmp_path), key=lambda row: row["entry_id"])
 
     assert landed == sorted(THREE_PERIODS, key=lambda row: row["entry_id"])
@@ -114,7 +114,7 @@ def test_an_empty_field_stays_an_empty_string(tmp_path):
         {"account_code": "1000", "name": "Assets", "parent_code": "",
          "account_type": "asset", "effective_date": "2026-01-01"},
     ]
-    raw.write_table(DIM_ACCOUNT, tmp_path, rows, run_id=RUN_A)
+    raw.merge_table(DIM_ACCOUNT, tmp_path, rows, run_id=RUN_A)
 
     landed = list(raw.read_table(DIM_ACCOUNT, tmp_path))
     assert landed == rows
@@ -128,7 +128,7 @@ def test_a_table_with_no_partition_column_is_one_file(tmp_path):
         {"currency": "EUR", "rate_date": "2026-01-01", "rate_to_base": "7.654321"},
         {"currency": "USD", "rate_date": "2026-01-01", "rate_to_base": "7.123456"},
     ]
-    raw.write_table(FX_RATE, tmp_path, rows, run_id=RUN_A)
+    raw.merge_table(FX_RATE, tmp_path, rows, run_id=RUN_A)
 
     assert (tmp_path / "fx_rate" / PART_FILE).is_file()
     assert [path.name for path in (tmp_path / "fx_rate").iterdir()] == [PART_FILE]
@@ -144,8 +144,8 @@ def test_a_partition_is_sorted_by_primary_key_whatever_order_it_arrived_in(tmp_p
     ]
     backwards = list(reversed(forwards))
 
-    raw.write_table(GL_ENTRY, tmp_path / "a", forwards, run_id=RUN_A)
-    raw.write_table(GL_ENTRY, tmp_path / "b", backwards, run_id=RUN_A)
+    raw.merge_table(GL_ENTRY, tmp_path / "a", forwards, run_id=RUN_A)
+    raw.merge_table(GL_ENTRY, tmp_path / "b", backwards, run_id=RUN_A)
 
     partition = f"gl_entry/accounting_period=2026-01/{PART_FILE}"
     one = raw.read_partition(GL_ENTRY, tmp_path / "a" / partition)
@@ -158,7 +158,7 @@ def test_a_partition_is_sorted_by_primary_key_whatever_order_it_arrived_in(tmp_p
 
 def test_row_count_spans_every_partition(tmp_path):
     """Case 15."""
-    raw.write_table(GL_ENTRY, tmp_path, THREE_PERIODS, run_id=RUN_A)
+    raw.merge_table(GL_ENTRY, tmp_path, THREE_PERIODS, run_id=RUN_A)
     assert raw.row_count(GL_ENTRY, tmp_path) == len(THREE_PERIODS)
 
 
@@ -166,10 +166,10 @@ def test_the_checksum_does_not_depend_on_order_or_batching(tmp_path):
     """Case 16. The same rows, written in a different order and in a different number
     of calls, must produce the same digest - otherwise the acceptance criterion is
     measuring the load's shape rather than its result."""
-    raw.write_table(GL_ENTRY, tmp_path / "one_go", THREE_PERIODS, run_id=RUN_A)
+    raw.merge_table(GL_ENTRY, tmp_path / "one_go", THREE_PERIODS, run_id=RUN_A)
 
     second = tmp_path / "in_two"
-    raw.write_table(GL_ENTRY, second, list(reversed(THREE_PERIODS[:2])), run_id=RUN_A)
+    raw.merge_table(GL_ENTRY, second, list(reversed(THREE_PERIODS[:2])), run_id=RUN_A)
     for row in THREE_PERIODS[2:]:
         path = raw.partition_path(second, GL_ENTRY, raw.partition_of(row["accounting_date"]))
         existing = raw.read_partition(GL_ENTRY, path) if path.is_file() else []
@@ -180,11 +180,11 @@ def test_the_checksum_does_not_depend_on_order_or_batching(tmp_path):
 
 def test_the_checksum_notices_a_changed_field(tmp_path):
     """Case 17. An instrument that never moves is not an instrument."""
-    raw.write_table(GL_ENTRY, tmp_path / "before", THREE_PERIODS, run_id=RUN_A)
+    raw.merge_table(GL_ENTRY, tmp_path / "before", THREE_PERIODS, run_id=RUN_A)
 
     changed = [dict(row) for row in THREE_PERIODS]
     changed[0]["amount_dr"] = "100.01"
-    raw.write_table(GL_ENTRY, tmp_path / "after", changed, run_id=RUN_A)
+    raw.merge_table(GL_ENTRY, tmp_path / "after", changed, run_id=RUN_A)
 
     assert raw.checksum(GL_ENTRY, tmp_path / "before") != raw.checksum(
         GL_ENTRY, tmp_path / "after"
@@ -199,7 +199,7 @@ def test_the_checksum_ignores_a_column_the_contract_does_not_declare(tmp_path):
     import pyarrow as pa
     import pyarrow.parquet as pq
 
-    raw.write_table(GL_ENTRY, tmp_path, THREE_PERIODS, run_id=RUN_A)
+    raw.merge_table(GL_ENTRY, tmp_path, THREE_PERIODS, run_id=RUN_A)
     before = raw.checksum(GL_ENTRY, tmp_path)
 
     path = tmp_path / "gl_entry" / "accounting_period=2026-01" / PART_FILE
@@ -231,8 +231,8 @@ def test_the_checksum_separates_fields_it_cannot_be_fooled_across(tmp_path):
     right = [entry("A", "1", "2026-01-01",
                    account_code="6001", cost_center_code=f"X{separator}CC01")]
 
-    raw.write_table(GL_ENTRY, tmp_path / "left", left, run_id=RUN_A)
-    raw.write_table(GL_ENTRY, tmp_path / "right", right, run_id=RUN_A)
+    raw.merge_table(GL_ENTRY, tmp_path / "left", left, run_id=RUN_A)
+    raw.merge_table(GL_ENTRY, tmp_path / "right", right, run_id=RUN_A)
 
     assert raw.checksum(GL_ENTRY, tmp_path / "left") != raw.checksum(
         GL_ENTRY, tmp_path / "right"
@@ -269,7 +269,7 @@ def test_read_keys_on_an_absent_partition_is_empty(tmp_path):
 
 
 def test_read_keys_reads_the_keys_and_not_the_rest(tmp_path):
-    raw.write_table(GL_ENTRY, tmp_path, THREE_PERIODS, run_id=RUN_A)
+    raw.merge_table(GL_ENTRY, tmp_path, THREE_PERIODS, run_id=RUN_A)
     path = tmp_path / "gl_entry" / "accounting_period=2026-03" / PART_FILE
 
     assert raw.read_keys(GL_ENTRY, path) == {("E3", "1"), ("E4", "1")}
@@ -280,7 +280,7 @@ def test_a_parquet_write_that_fails_leaves_no_temporary_file(tmp_path, monkeypat
     Debris beside a partition would be picked up by nothing and explained by nobody."""
     import pyarrow.parquet as pq
 
-    raw.write_table(GL_ENTRY, tmp_path, THREE_PERIODS, run_id=RUN_A)
+    raw.merge_table(GL_ENTRY, tmp_path, THREE_PERIODS, run_id=RUN_A)
     path = tmp_path / "gl_entry" / "accounting_period=2026-01" / PART_FILE
     before = path.read_bytes()
 
@@ -297,17 +297,25 @@ def test_a_parquet_write_that_fails_leaves_no_temporary_file(tmp_path, monkeypat
     assert [p.name for p in path.parent.iterdir()] == [PART_FILE]
 
 
-def test_a_partitioned_table_reloaded_with_nothing_keeps_its_directory(tmp_path):
-    """The table still exists, it just holds no periods. Removing the directory as well
-    would make `partitions` and `checksum` unable to tell a table that was emptied from
-    one that was never loaded - and the acceptance check reads both."""
-    raw.write_table(GL_ENTRY, tmp_path, THREE_PERIODS, run_id=RUN_A)
-    raw.write_table(GL_ENTRY, tmp_path, [], run_id=RUN_A)
+def test_a_partitioned_table_merged_with_nothing_keeps_its_periods(tmp_path):
+    """Case 9, at the primitive. A batch carrying nothing touches nothing. This used to
+    assert that the periods were removed and the empty directory left behind; under
+    docs/adr/0023 an empty batch is a run that landed nothing, not an instruction to
+    delete the table."""
+    raw.merge_table(GL_ENTRY, tmp_path, THREE_PERIODS, run_id=RUN_A)
+    raw.merge_table(GL_ENTRY, tmp_path, [], run_id=RUN_A)
 
     assert (tmp_path / "gl_entry").is_dir()
-    assert list((tmp_path / "gl_entry").iterdir()) == []
-    assert raw.partitions(GL_ENTRY, tmp_path) == []
-    assert raw.row_count(GL_ENTRY, tmp_path) == 0
+    assert len(raw.partitions(GL_ENTRY, tmp_path)) == 3
+    assert raw.row_count(GL_ENTRY, tmp_path) == len(THREE_PERIODS)
+
+
+def test_the_rename_left_no_alias_behind(tmp_path):
+    """Case 13. The function merges now, so the name that said it replaced is gone
+    rather than kept pointing at something that does the opposite."""
+    assert "merge_table" in raw.__all__
+    assert "write_table" not in raw.__all__
+    assert not hasattr(raw, "write_table")
 
 
 # --- the two run identifiers -----------------------------------------------
@@ -354,7 +362,7 @@ def test_write_partition_will_not_run_without_a_run_identifier(tmp_path):
 def test_write_table_will_not_run_without_a_run_identifier(tmp_path):
     """Case 22. The whole-table replacement path, for the same reason."""
     with pytest.raises(TypeError):
-        raw.write_table(GL_ENTRY, tmp_path, THREE_PERIODS)
+        raw.merge_table(GL_ENTRY, tmp_path, THREE_PERIODS)
 
 
 def test_read_partition_hides_the_metadata_unless_it_is_asked_for(tmp_path):
@@ -391,8 +399,8 @@ def test_the_checksum_does_not_see_the_run_identifiers(tmp_path):
     raw layer as far as the acceptance criterion is concerned - which is what makes
     `record-every-pipeline-run` and the three-run stability property compatible at
     all. See docs/adr/0017."""
-    raw.write_table(GL_ENTRY, tmp_path / "left", THREE_PERIODS, run_id=RUN_A)
-    raw.write_table(GL_ENTRY, tmp_path / "right", THREE_PERIODS, run_id=RUN_B)
+    raw.merge_table(GL_ENTRY, tmp_path / "left", THREE_PERIODS, run_id=RUN_A)
+    raw.merge_table(GL_ENTRY, tmp_path / "right", THREE_PERIODS, run_id=RUN_B)
 
     assert raw.checksum(GL_ENTRY, tmp_path / "left") == raw.checksum(
         GL_ENTRY, tmp_path / "right"

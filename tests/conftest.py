@@ -104,3 +104,24 @@ def db():
         yield connection
     finally:
         connection.close()
+
+
+@pytest.fixture(scope="session")
+def spark():
+    """A local SparkSession, built once for the whole session.
+
+    Local mode, so this is a library with a toolchain requirement rather than a service
+    to stand up - see docs/adr/0028-spark-runs-in-process.md, which is where the
+    exception to ADR 0004 is argued.
+
+    It fails rather than skips when Spark cannot start, for the reason the database
+    fixture does: a skipped test reports success, and a CI run that verified nothing
+    comes back green.
+    """
+    from transform.spark import session as spark_session
+
+    built = spark_session.build("fin-pipeline-tests")
+    try:
+        yield built
+    finally:
+        built.stop()

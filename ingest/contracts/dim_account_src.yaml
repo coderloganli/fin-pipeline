@@ -7,6 +7,12 @@
 table: dim_account_src
 primary_key: [account_code, effective_date]
 
+# A version, once landed, never changes: a change to this dimension is supposed to
+# arrive as a new effective_date. The same key coming back with different values is the
+# source restating its own past, and it fails the run rather than overwriting what the
+# warehouse holds. See docs/adr/0023-raw-never-forgets-a-primary-key.md.
+rows_are_immutable: true
+
 columns:
   - name: account_code
     type: string

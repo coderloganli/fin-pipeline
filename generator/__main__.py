@@ -15,6 +15,7 @@ SWITCHES = (
     "late_entries",
     "restatements",
     "cost_centre_move",
+    "account_move",
     "unbalanced_vouchers",
     "growing_account",
     "amount_outliers",

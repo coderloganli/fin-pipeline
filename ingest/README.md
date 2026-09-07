@@ -26,13 +26,29 @@ Lands source extracts into the raw layer and keeps the load replayable.
   python -m ingest.load --source data/source --raw data/raw
   ```
 
-  Exit 0 on a clean load, 2 for a usage error. `--table` scopes the run to named
+  Exit 0 on a clean load, 1 when the extract restates a version the raw layer already
+  holds - the same code `ingest.validate` returns for a source it cannot accept - and
+  2 for a usage error. `--table` scopes the run to named
   tables, `--overlap-days` sets the window (default 7), and `--full` ignores the
   stored watermark and re-reads the whole source — the backfill path, which reaches
   the same raw layer because it goes through the same merge.
 
   This does not re-run contract validation. `python -m ingest.validate` is the gate;
   the DAG runs the two in order.
+- **The raw layer never forgets a primary key.** Both load paths agree that absence
+  from an extract is not a deletion. The watermarked one never deleted on absence
+  anyway - its batch is a window rather than the whole table - and the unwatermarked
+  one now merges by primary key instead of replacing. The upstream system is
+  authoritative about when a change took effect, not about how long it will keep
+  exporting it, and once an extract has landed this is the only place that can still
+  say what the source said. A contract may additionally declare `rows_are_immutable`,
+  which both source dimensions do: a key that comes back carrying different values is
+  the source restating its own past, and it raises `ImmutableRowChanged` before
+  anything is written rather than overwriting. See
+  `docs/adr/0023-raw-never-forgets-a-primary-key.md`.
+
+  A missing extract still raises. An extract that exists and holds no rows is a run
+  that landed nothing, and leaves what has accumulated where it is.
 - **Idempotent merge.** Entries are keyed on `(entry_id, version)` and merged rather
   than inserted, so a rerun produces identical output. The batch is grouped by
   accounting period and only the periods it touches are rewritten. A row whose
@@ -61,7 +77,7 @@ Lands source extracts into the raw layer and keeps the load replayable.
   first landed its primary key, and `_last_run_id`, the run that last wrote the file it
   is in. The first survives every rewrite - a merge that reopened the partition for
   some other row, an eviction, a move to another accounting period, the whole-table
-  replacement an unwatermarked table gets. Neither is a contract column, so neither
+  merge an unwatermarked table gets. Neither is a contract column, so neither
   reaches the checksum. The ingestion time and the source digest are not on the row;
   they are reached from either identifier through the run record. See
   `docs/adr/0018-raw-rows-carry-two-run-identifiers.md` and `docs/adr/0020-the-source-file-hash-belongs-to-the-run.md`.

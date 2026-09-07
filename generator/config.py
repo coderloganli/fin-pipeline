@@ -25,6 +25,7 @@ class Config:
     late_entries: bool = False
     restatements: bool = False
     cost_centre_move: bool = False
+    account_move: bool = False
     schema_drift: str = "none"
     schema_drift_table: str = "gl_entry"
     unbalanced_vouchers: bool = False

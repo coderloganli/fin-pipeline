@@ -8,7 +8,7 @@ from datetime import date, timedelta
 from decimal import Decimal
 
 from . import schema
-from .streams import COST_CENTRE_MOVE, DIMENSIONS, VENDORS, stream_for
+from .streams import ACCOUNT_MOVE, COST_CENTRE_MOVE, DIMENSIONS, VENDORS, stream_for
 
 BASE_CURRENCY = "CNY"
 CURRENCIES = ("CNY", "EUR", "USD", "GBP")
@@ -213,14 +213,25 @@ CATEGORY_OF_ACCOUNT[GROWTH_DEBIT_ACCOUNT] = MARKETING
 EPOCH = date(2020, 1, 1)
 
 
-def accounts(seed: int) -> list[dict[str, object]]:
-    """The chart of accounts, in code order.
+# When a reclassified account starts reporting under its new parent. April rather than
+# the cost centre's July on purpose: two change points on different dates are what lets
+# the point-in-time join's tests tell one from the other.
+ACCOUNT_MOVE_DATE = date(2026, 4, 1)
+
+
+def accounts(seed: int, move: bool = False) -> list[dict[str, object]]:
+    """The chart of accounts, in code order, unless `move` is on.
 
     Read from CHART rather than computed, because a chart is a statement about a
-    business and not a sequence. `seed` is kept in the signature so the call site does
-    not have to know that this one no longer draws.
+    business and not a sequence.
+
+    The move is a reclassification: a detail account starts reporting under a different
+    first-level account mid-year. It is the chart's counterpart to a cost centre
+    changing department - both change which parent a figure rolls up into, and both are
+    the reason a report has to be built against the structure in force for its period
+    rather than today's.
     """
-    return [
+    rows = [
         {
             "account_code": code,
             "name": name,
@@ -230,6 +241,32 @@ def accounts(seed: int) -> list[dict[str, object]]:
         }
         for code, name, parent, account_type in sorted(CHART)
     ]
+    if not move:
+        return rows
+
+    # A stream of its own, so turning this on leaves every other table byte-identical.
+    # See docs/adr/0005-deterministic-generation.md.
+    move_rng = stream_for(seed, ACCOUNT_MOVE)
+
+    # Only a detail account can be reclassified: a first-level account has no parent to
+    # change. The new parent has to be first-level and of the same account type - a
+    # detail account under a parent of another type would contradict its own
+    # `account_type`, which is malformed data rather than a business event.
+    detail = [row for row in rows if row["parent_code"]]
+    reclassified = detail[move_rng.randrange(len(detail))]
+    candidates = sorted(
+        row["account_code"] for row in rows
+        if not row["parent_code"]
+        and row["account_type"] == reclassified["account_type"]
+        and row["account_code"] != reclassified["parent_code"]
+    )
+
+    successor = dict(reclassified)
+    successor["parent_code"] = candidates[move_rng.randrange(len(candidates))]
+    successor["effective_date"] = schema.format_date(ACCOUNT_MOVE_DATE)
+    rows.append(successor)
+    rows.sort(key=lambda row: (row["account_code"], row["effective_date"]))
+    return rows
 
 
 def vendors(seed: int) -> list[dict[str, object]]:

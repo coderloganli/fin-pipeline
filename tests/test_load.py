@@ -646,9 +646,11 @@ def test_a_table_that_declares_no_watermark_is_loaded_in_full(tmp_path, raw_dir)
     assert [path.name for path in (raw_dir / "fx_rate").iterdir()] == [PART_FILE]
 
 
-def test_a_full_reload_table_drops_a_row_the_source_no_longer_has(tmp_path, raw_dir):
-    """Case 35. This is what separates a full reload from a merge: the merge has no
-    delete, and a table loaded in full does not need one."""
+def test_an_accumulating_table_keeps_a_row_the_source_no_longer_has(tmp_path, raw_dir):
+    """Case 1. This assertion used to be its opposite: absence in an extract deleted the
+    row. Both load paths now agree that absence is not a deletion - the watermarked one
+    never deleted on absence, because its batch is a window rather than the whole table,
+    and this one no longer does either. See docs/adr/0023."""
     source = tmp_path / "source"
     write_source(source, FX_RATE, FX_ROWS)
     load.load_source(source, raw_dir, tables=["fx_rate"])
@@ -657,7 +659,161 @@ def test_a_full_reload_table_drops_a_row_the_source_no_longer_has(tmp_path, raw_
     load.load_source(source, raw_dir, tables=["fx_rate"])
 
     landed_rows = list(raw.read_table(FX_RATE, raw_dir))
-    assert landed_rows == FX_ROWS[:1]
+    assert landed_rows == FX_ROWS, "a key that stopped being exported was dropped"
+
+
+# --- accumulation, and the tables that refuse to be restated ----------------
+#
+# Cases 1-8 of task.md. The raw layer never forgets a primary key, and a contract may
+# additionally declare that a row it already holds can never come back changed.
+# See docs/adr/0023.
+
+DIM_CC = contracts.load("dim_cost_center_src")
+
+CC_EARLY = {"cc_code": "CC-002", "name": "Sales - North", "dept_code": "DEPT-RND",
+            "effective_date": "2020-01-01"}
+CC_LATE = {"cc_code": "CC-002", "name": "Sales - North", "dept_code": "DEPT-OPS",
+           "effective_date": "2026-07-01"}
+
+
+def load_cc(source, raw_dir, rows):
+    write_source(source, DIM_CC, rows)
+    return load.load_source(source, raw_dir, tables=["dim_cost_center_src"])
+
+
+def cc_rows(raw_dir):
+    return sorted(
+        (row["cc_code"], row["effective_date"], row["dept_code"])
+        for row in raw.read_table(DIM_CC, raw_dir)
+    )
+
+
+def test_a_version_the_extract_stops_carrying_is_still_held(tmp_path, raw_dir):
+    """Case 1. The upstream system is authoritative about when a change took effect. It
+    is not authoritative about how long it will keep telling us, so once an extract has
+    landed the warehouse is the only party that can still say what the source said."""
+    source = tmp_path / "source"
+    load_cc(source, raw_dir, [CC_EARLY, CC_LATE])
+    load_cc(source, raw_dir, [CC_LATE])
+
+    assert cc_rows(raw_dir) == [
+        ("CC-002", "2020-01-01", "DEPT-RND"),
+        ("CC-002", "2026-07-01", "DEPT-OPS"),
+    ]
+
+
+def test_a_new_effective_date_lands_beside_the_versions_already_held(tmp_path, raw_dir):
+    """Case 2. The ordinary path: a cost centre moves department, the extract grows a
+    row, and the raw layer ends up holding both versions."""
+    source = tmp_path / "source"
+    load_cc(source, raw_dir, [CC_EARLY])
+    assert cc_rows(raw_dir) == [("CC-002", "2020-01-01", "DEPT-RND")]
+
+    load_cc(source, raw_dir, [CC_EARLY, CC_LATE])
+
+    assert cc_rows(raw_dir) == [
+        ("CC-002", "2020-01-01", "DEPT-RND"),
+        ("CC-002", "2026-07-01", "DEPT-OPS"),
+    ]
+
+
+def test_a_held_version_coming_back_changed_fails_the_run(tmp_path, raw_dir):
+    """Case 3. The same natural key and the same effective date, carrying a different
+    department, is the source restating its own past. Overwriting would reintroduce one
+    row at a time exactly the drift the dimension exists to prevent, so it stops the
+    run - `docs/product.md`, breaking is better than drifting."""
+    source = tmp_path / "source"
+    load_cc(source, raw_dir, [CC_EARLY])
+
+    restated = {**CC_EARLY, "dept_code": "DEPT-OPS"}
+    with pytest.raises(raw.ImmutableRowChanged) as failure:
+        load_cc(source, raw_dir, [restated])
+
+    message = str(failure.value)
+    assert "dim_cost_center_src" in message
+    assert "CC-002" in message and "2020-01-01" in message
+    assert "dept_code" in message
+    assert "DEPT-RND" in message and "DEPT-OPS" in message
+    assert cc_rows(raw_dir) == [("CC-002", "2020-01-01", "DEPT-RND")]
+
+
+def test_a_held_version_coming_back_unchanged_is_not_a_contradiction(tmp_path, raw_dir):
+    """Case 4. Every extract carries the whole history, so every run re-presents every
+    version it has already landed. Immutability has to mean "changed", not "seen
+    again", or the second run of the day would fail."""
+    source = tmp_path / "source"
+    load_cc(source, raw_dir, [CC_EARLY, CC_LATE])
+    load_cc(source, raw_dir, [CC_EARLY, CC_LATE])
+
+    assert len(cc_rows(raw_dir)) == 2
+
+
+def test_a_table_that_does_not_declare_immutability_still_updates_in_place(
+    tmp_path, raw_dir
+):
+    """Case 5. `dim_vendor` is keyed on the code alone, with no date in the key, so a
+    supplier changing its name genuinely is an update to the row that is there. The
+    accumulation applies to it; the refusal does not."""
+    source = tmp_path / "source"
+    vendor = contracts.load("dim_vendor")
+    assert not vendor.get("rows_are_immutable")
+
+    write_source(source, vendor, VENDOR_ROWS)
+    load.load_source(source, raw_dir, tables=["dim_vendor"])
+
+    renamed = [{**VENDOR_ROWS[0], "name": "Northwind Office Supplies Ltd"}]
+    write_source(source, vendor, renamed)
+    load.load_source(source, raw_dir, tables=["dim_vendor"])
+
+    assert list(raw.read_table(vendor, raw_dir)) == renamed
+
+
+def test_a_second_identical_extract_reports_nothing_inserted_or_updated(tmp_path, raw_dir):
+    """Found by the stage-8 review. The counts were being inferred from how much the
+    table grew, so a second run of an unchanged extract reported every version it
+    re-presented as an update - a number that cannot be true for a table that fails
+    when a held row comes back changed. They are now counted from what actually
+    differs."""
+    source = tmp_path / "source"
+    first = load_cc(source, raw_dir, [CC_EARLY, CC_LATE]).tables[0]
+    assert (first.rows_inserted, first.rows_updated) == (2, 0)
+
+    second = load_cc(source, raw_dir, [CC_EARLY, CC_LATE]).tables[0]
+    assert second.rows_scanned == 2
+    assert (second.rows_inserted, second.rows_updated) == (0, 0)
+
+
+def test_a_mutable_table_counts_only_the_rows_that_changed(tmp_path, raw_dir):
+    """The other half: `dim_vendor` can be updated in place, so an update has to be
+    reported as one - and a row that arrived unchanged still has to not be."""
+    source = tmp_path / "source"
+    vendor = contracts.load("dim_vendor")
+    second_vendor = {"vendor_code": "V-0002", "name": "Bluebird Materials",
+                     "category": "materials"}
+
+    write_source(source, vendor, VENDOR_ROWS + [second_vendor])
+    load.load_source(source, raw_dir, tables=["dim_vendor"])
+
+    renamed = [{**VENDOR_ROWS[0], "name": "Northwind Office Supplies Ltd"},
+               second_vendor]
+    write_source(source, vendor, renamed)
+    report = load.load_source(source, raw_dir, tables=["dim_vendor"]).tables[0]
+
+    assert (report.rows_inserted, report.rows_updated) == (0, 1)
+
+
+def test_an_accumulating_table_is_stable_across_three_runs(tmp_path, raw_dir):
+    """Case 6. Accumulating is not an excuse to stop being idempotent: re-presenting a
+    version already held has to reach the same file, not append to it."""
+    source = tmp_path / "source"
+    write_source(source, DIM_CC, [CC_EARLY, CC_LATE])
+
+    seen = []
+    for _ in range(3):
+        load.load_source(source, raw_dir, tables=["dim_cost_center_src"])
+        seen.append((raw.row_count(DIM_CC, raw_dir), raw.checksum(DIM_CC, raw_dir)))
+
+    assert seen[0] == seen[1] == seen[2], seen
 
 
 def test_a_full_reload_table_is_stable_across_runs(tmp_path, raw_dir):
@@ -849,10 +1005,11 @@ def test_a_truncated_source_file_is_refused(tmp_path, raw_dir):
     assert raw.row_count(FX_RATE, raw_dir) == len(FX_ROWS), "the raw table was emptied"
 
 
-def test_a_header_with_no_rows_is_a_genuinely_empty_extract(tmp_path, raw_dir):
-    """The other side of the line above. A source that really has nothing to say still
-    writes its header, and a full reload mirrors that - which is what full reload
-    means."""
+def test_a_header_with_no_rows_leaves_what_has_accumulated(tmp_path, raw_dir):
+    """Case 8. A source that really has nothing to say still writes its header, and it
+    is still read as zero rows - but zero rows no longer empties the table. The
+    distinction that survives is the one that matters: a missing extract raises, and an
+    empty one is a run that landed nothing. See docs/adr/0023."""
     source = tmp_path / "source"
     write_source(source, FX_RATE, FX_ROWS)
     load.load_source(source, raw_dir, tables=["fx_rate"])
@@ -861,7 +1018,7 @@ def test_a_header_with_no_rows_is_a_genuinely_empty_extract(tmp_path, raw_dir):
     report = load.load_source(source, raw_dir, tables=["fx_rate"])
 
     assert report.tables[0].rows_scanned == 0
-    assert raw.row_count(FX_RATE, raw_dir) == 0
+    assert raw.row_count(FX_RATE, raw_dir) == len(FX_ROWS)
 
 
 @pytest.mark.parametrize("shape", ["short", "long"])
@@ -951,34 +1108,41 @@ def test_the_command_turns_a_bad_source_shape_into_an_exit_code(source, raw_dir,
     assert "truncated" in capsys.readouterr().err
 
 
-def test_a_full_reload_of_a_partitioned_table_drops_the_periods_it_no_longer_has(
+def test_the_accumulating_primitive_keeps_the_periods_a_batch_does_not_carry(
     tmp_path, raw_dir
 ):
-    """`raw.write_table` is the full-reload primitive, and on a partitioned table it has
-    to remove the period directories the new batch does not carry - otherwise a shrunk
-    reload leaves rows nothing accounts for."""
-    raw.write_table(GL_ENTRY, raw_dir, SOURCE_ROWS, run_id=RUN_A)
+    """Case 9. `raw.merge_table` is the primitive the unwatermarked path uses, and a
+    partition the batch does not touch is neither read nor removed. Driven directly
+    rather than through `load_source`, because no contract is both partitioned and
+    unwatermarked: this pins the primitive's own behaviour.
+
+    Not to be confused with eviction. A key that moves accounting period is still
+    removed from the partition it left - that is the watermarked path, ADR 0016, and
+    `test_a_key_that_moved_period_is_removed_from_the_partition_it_left` is where it is
+    asserted. Absent from an extract and moved to another period are different things."""
+    raw.merge_table(GL_ENTRY, raw_dir, SOURCE_ROWS, run_id=RUN_A)
     assert len(list((raw_dir / "gl_entry").glob("accounting_period=*"))) == 3
 
-    raw.write_table(GL_ENTRY, raw_dir, SOURCE_ROWS[:1], run_id=RUN_A)
+    raw.merge_table(GL_ENTRY, raw_dir, SOURCE_ROWS[:1], run_id=RUN_A)
 
-    assert [path.name for path in (raw_dir / "gl_entry").glob("accounting_period=*")] == [
-        "accounting_period=2026-01"
-    ]
-    assert raw.row_count(GL_ENTRY, raw_dir) == 1
+    assert sorted(
+        path.name for path in (raw_dir / "gl_entry").glob("accounting_period=*")
+    ) == ["accounting_period=2026-01", "accounting_period=2026-02",
+          "accounting_period=2026-03"]
+    assert raw.row_count(GL_ENTRY, raw_dir) == len(SOURCE_ROWS)
 
 
 def test_a_batch_that_cannot_be_written_does_not_delete_what_is_there(raw_dir):
     """The new partitions go down before the stale ones come up. The other order would
     delete February and then raise while writing January, losing a period to a batch
     that never landed."""
-    raw.write_table(GL_ENTRY, raw_dir, SOURCE_ROWS, run_id=RUN_A)
+    raw.merge_table(GL_ENTRY, raw_dir, SOURCE_ROWS, run_id=RUN_A)
     before = raw.checksum(GL_ENTRY, raw_dir)
 
     incomplete = dict(entry("E9", "1", "2026-01-05", "2026-01-06"))
     del incomplete["doc_id"]
     with pytest.raises(KeyError):
-        raw.write_table(GL_ENTRY, raw_dir, [incomplete], run_id=RUN_A)
+        raw.merge_table(GL_ENTRY, raw_dir, [incomplete], run_id=RUN_A)
 
     assert raw.checksum(GL_ENTRY, raw_dir) == before
 
@@ -1031,15 +1195,17 @@ def test_a_corrupt_watermark_file_is_a_usage_error_at_the_command(source, raw_di
                       "--table", "gl_entry"]) == 2
 
 
-def test_a_full_reload_with_no_rows_leaves_no_periods_behind(raw_dir):
-    """The empty edge of the shrinking reload: every period goes, not all but one."""
-    raw.write_table(GL_ENTRY, raw_dir, SOURCE_ROWS, run_id=RUN_A)
+def test_an_empty_batch_leaves_every_period_where_it_was(raw_dir):
+    """The empty edge of case 9. A batch carrying nothing touches nothing, which is the
+    same sentence as "a partition the batch does not touch is not rewritten" - it used
+    to read as an instruction to delete the table."""
+    raw.merge_table(GL_ENTRY, raw_dir, SOURCE_ROWS, run_id=RUN_A)
     assert len(list((raw_dir / "gl_entry").glob("accounting_period=*"))) == 3
 
-    raw.write_table(GL_ENTRY, raw_dir, [], run_id=RUN_A)
+    raw.merge_table(GL_ENTRY, raw_dir, [], run_id=RUN_A)
 
-    assert list((raw_dir / "gl_entry").glob("accounting_period=*")) == []
-    assert raw.row_count(GL_ENTRY, raw_dir) == 0
+    assert len(list((raw_dir / "gl_entry").glob("accounting_period=*"))) == 3
+    assert raw.row_count(GL_ENTRY, raw_dir) == len(SOURCE_ROWS)
 
 
 def test_the_help_flag_is_not_an_error(capsys):
@@ -1197,20 +1363,23 @@ def test_a_whole_table_replacement_keeps_the_first_run(tmp_path, raw_dir, table)
     assert landed[newcomer] == (second, second)
 
 
-def test_a_whole_table_replacement_does_not_resurrect_a_removed_row(tmp_path, raw_dir):
-    """Case 21. Reading the old file for its identifiers must not turn the read into a
-    merge: a row the source dropped is gone, which is what `write_table` means."""
+def test_an_accumulating_table_keeps_a_dropped_row_with_its_first_run(tmp_path, raw_dir):
+    """Case 7, at the identifier level. A row the source stopped carrying stays, and it
+    keeps the run that first landed it rather than being restamped by the run that
+    happened to rewrite the file around it."""
     source = tmp_path / "source"
     existing, arriving = FULL_RELOAD_ROWS["fx_rate"]
 
     write_source(source, FX_RATE, existing + arriving)
-    load.load_source(source, raw_dir, tables=["fx_rate"])
+    first = load.load_source(source, raw_dir, tables=["fx_rate"]).run_id
     write_source(source, FX_RATE, arriving)
-    load.load_source(source, raw_dir, tables=["fx_rate"])
+    second = load.load_source(source, raw_dir, tables=["fx_rate"]).run_id
 
     landed = identifiers(raw_dir, FX_RATE)
-    assert tuple(existing[0][name] for name in FX_RATE["primary_key"]) not in landed
-    assert len(landed) == len(arriving)
+    dropped = tuple(existing[0][name] for name in FX_RATE["primary_key"])
+    assert dropped in landed, "a key that stopped being exported was dropped"
+    assert landed[dropped] == (first, second)
+    assert len(landed) == len(existing) + len(arriving)
 
 
 def test_merge_partition_will_not_run_without_a_run_identifier(raw_dir):
@@ -1334,13 +1503,13 @@ def test_a_source_column_named_like_a_run_identifier_is_ignored(tmp_path, raw_di
     assert set(identifiers(raw_dir).values()) == {(landed, landed)}
 
 
-def test_a_partitioned_whole_table_replacement_keeps_the_first_run(raw_dir):
-    """Case 20, on the branch of `write_table` a contract does not reach today.
-    `write_table` is the full-reload primitive and takes a partitioned table; nothing
+def test_a_partitioned_whole_table_merge_keeps_the_first_run(raw_dir):
+    """Case 20, on the branch of `merge_table` a contract does not reach today.
+    `merge_table` is the unwatermarked primitive and takes a partitioned table; nothing
     declares `partition_by` without a watermark, so the load never sends one down this
     branch - which is exactly why it needs a test of its own."""
-    raw.write_table(GL_ENTRY, raw_dir, SOURCE_ROWS, run_id=RUN_A)
-    raw.write_table(GL_ENTRY, raw_dir, SOURCE_ROWS, run_id=RUN_B)
+    raw.merge_table(GL_ENTRY, raw_dir, SOURCE_ROWS, run_id=RUN_A)
+    raw.merge_table(GL_ENTRY, raw_dir, SOURCE_ROWS, run_id=RUN_B)
 
     assert set(identifiers(raw_dir).values()) == {(RUN_A, RUN_B)}
 
@@ -1400,3 +1569,24 @@ def test_dim_vendor_lands_as_a_whole_table(tmp_path, raw_dir):
     contract = contracts.load("dim_vendor")
     assert [path.name for path in (raw_dir / "dim_vendor").iterdir()] == [PART_FILE]
     assert raw.row_count(contract, raw_dir) == dimensions.VENDOR_COUNT
+
+
+def test_a_restatement_is_an_exit_code_rather_than_a_traceback(tmp_path, raw_dir, capsys):
+    """Found while walking through the acceptance demo. `main` is the only place that
+    knows about exit codes, and every other expected failure reaches the operator as a
+    message plus a code - a restatement was the one escaping as a traceback.
+
+    1 rather than 2, matching `ingest.validate`: the source is incompatible with what is
+    held, which is not the same as the command having been typed wrong."""
+    source = tmp_path / "source"
+    load_cc(source, raw_dir, [CC_EARLY])
+
+    write_source(source, DIM_CC, [{**CC_EARLY, "dept_code": "DEPT-OPS"}])
+    code = load.main(["--source", str(source), "--raw", str(raw_dir),
+                      "--table", "dim_cost_center_src"])
+
+    assert code == 1
+    printed = capsys.readouterr()
+    assert "rows_are_immutable" in printed.err
+    assert "CC-002" in printed.err
+    assert printed.out == "", "a failed load should not also report success"
