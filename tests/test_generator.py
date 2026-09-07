@@ -895,6 +895,83 @@ def test_the_cost_centre_move_rotates_within_the_departments(tmp_path):
     assert after["dept_code"] in dimensions.DEPARTMENTS
 
 
+# --- the account dimension changes too --------------------------------------
+#
+# Cases 14-18 of task.md. The chart of accounts had no change scenario at all: every
+# row carried the epoch effective date, so the SCD2 chain only ever walked its trivial
+# branch on generated data. A reclassification is the chart's twin of a cost centre
+# moving department - it changes which first-level account a figure rolls up into.
+
+ACCOUNT_MOVE_DATE = "2026-04-01"
+
+
+def account_history(out: Path) -> dict[str, list[dict[str, str]]]:
+    seen: dict[str, list[dict[str, str]]] = defaultdict(list)
+    for row in rows(out, "dim_account_src"):
+        seen[row["account_code"]].append(row)
+    return seen
+
+
+def test_with_the_account_move_off_every_account_appears_once(tmp_path):
+    """Case 14. The clean baseline, unchanged: this is what the switch has to leave
+    alone."""
+    history = account_history(run(tmp_path))
+    repeated = {code: rows_ for code, rows_ in history.items() if len(rows_) > 1}
+    assert not repeated, f"accounts with more than one row: {sorted(repeated)}"
+
+
+def test_the_account_move_reclassifies_exactly_one_account(tmp_path):
+    """Case 15. One account, two rows, and a mid-year date - deliberately April rather
+    than the cost centre's July, so the two change points can be told apart in the
+    point-in-time join's tests."""
+    history = account_history(run(tmp_path, account_move=True))
+    moved = [rows_ for rows_ in history.values() if len(rows_) > 1]
+    assert len(moved) == 1, "expected exactly one account to be reclassified"
+
+    before, after = sorted(moved[0], key=lambda row: row["effective_date"])
+    assert before["effective_date"] == dimensions.EPOCH.isoformat()
+    assert after["effective_date"] == ACCOUNT_MOVE_DATE
+    assert before["parent_code"] != after["parent_code"]
+
+
+def test_the_account_move_stays_inside_its_account_type(tmp_path):
+    """Case 16. A detail account moving under a parent of another type would make the
+    row contradict itself - that is malformed data, not a business event, and the
+    contract's `account_type` would still say the old thing."""
+    out = run(tmp_path, account_move=True)
+    by_code = {row["account_code"]: row for row in rows(out, "dim_account_src")}
+
+    moved = [rows_ for rows_ in account_history(out).values() if len(rows_) > 1][0]
+    before, after = sorted(moved, key=lambda row: row["effective_date"])
+
+    assert before["account_type"] == after["account_type"]
+    for row in (before, after):
+        parent = by_code[row["parent_code"]]
+        assert parent["account_type"] == row["account_type"]
+        assert parent["parent_code"] == "", "the new parent is not a first-level account"
+        assert len(parent["account_code"]) == 4
+
+
+def test_the_account_move_disturbs_no_other_table(tmp_path):
+    """Case 17. Its own random stream, so turning it on leaves the data belonging to
+    everything else exactly where it was. See docs/adr/0005."""
+    off = run(tmp_path)
+    on = run(tmp_path, account_move=True)
+
+    for table in TABLES:
+        if table == "dim_account_src":
+            continue
+        assert raw_bytes(off, table) == raw_bytes(on, table), f"{table} moved"
+
+
+def test_the_account_move_is_deterministic(tmp_path):
+    """Case 18. The switch is as reproducible as everything else, or a test that plants
+    it cannot assert on what it planted."""
+    first = run(tmp_path, account_move=True)
+    second = run(tmp_path, account_move=True)
+    assert raw_bytes(first, "dim_account_src") == raw_bytes(second, "dim_account_src")
+
+
 # --- the vendor dimension ---------------------------------------------------
 
 def test_dim_vendor_has_one_row_per_vendor(tmp_path):

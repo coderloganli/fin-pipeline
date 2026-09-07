@@ -7,6 +7,7 @@ It must be able to emit, under explicit switches:
 - entries that arrive after their accounting period has closed
 - restatements as distinct from corrections
 - an organisational change that moves a cost centre mid-year
+- a reclassification that moves an account under a different parent mid-year
 - a source table that gains a column, and one that loses a column
 - unbalanced vouchers where debits do not equal credits
 - an account whose balance grows abnormally for three consecutive months
@@ -22,7 +23,8 @@ python -m generator --seed 42 --periods 2026-01:2026-12 \
 ```
 
 Each failure mode has a flag — `--enable-late-entries`, `--enable-restatements`,
-`--enable-cost-centre-move`, `--enable-unbalanced-vouchers`,
+`--enable-cost-centre-move`, `--enable-account-move`,
+`--enable-unbalanced-vouchers`,
 `--enable-growing-account`, `--enable-amount-outliers`,
 `--enable-long-tail-anomaly` — plus
 `--schema-drift {none,add_column,drop_column}` with `--schema-drift-table`.

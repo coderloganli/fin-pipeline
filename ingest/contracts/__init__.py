@@ -52,6 +52,7 @@ REQUIRED_CONSTRAINT_KEYS: dict[str, frozenset[str]] = {
 
 TOP_LEVEL = frozenset({
     "table", "primary_key", "columns", "row_constraints", "watermark", "partition_by",
+    "rows_are_immutable",
 })
 REQUIRED = frozenset({"table", "primary_key", "columns"})
 
@@ -193,6 +194,19 @@ def _validate(contract: dict, source: str) -> dict:
         for name in referenced:
             if name not in names:
                 fail(f"row constraint {kind} names {name!r}, which is not a column")
+
+    # A row of this table, once landed, is a historical fact: a change is supposed to
+    # arrive as a new primary key rather than as different values under the one that is
+    # there. Declaring it turns the second case from a silent update into a failed run.
+    # Checked as a real boolean because the whole meaning of the key is yes-or-no, and
+    # the string "false" - which is what a quoted YAML value gives - is truthy.
+    # See docs/adr/0023-raw-never-forgets-a-primary-key.md.
+    if "rows_are_immutable" in contract:
+        if not isinstance(contract["rows_are_immutable"], bool):
+            fail(
+                "rows_are_immutable must be true or false, got "
+                f"{contract['rows_are_immutable']!r}"
+            )
 
     return contract
 

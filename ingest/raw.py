@@ -26,6 +26,7 @@ module owns is the layout, and the two measurements a rerun is judged by.
 
 import hashlib
 import os
+from dataclasses import dataclass, field
 from pathlib import Path
 
 import pyarrow as pa
@@ -43,7 +44,9 @@ __all__ = [
     "read_keys",
     "read_partition",
     "write_partition",
-    "write_table",
+    "merge_table",
+    "MergeCounts",
+    "ImmutableRowChanged",
     "read_table",
     "row_count",
     "checksum",
@@ -231,44 +234,143 @@ def prior_first_run_ids(contract: dict, raw_dir) -> dict[tuple[str, ...], str]:
     return prior
 
 
-def write_table(contract: dict, raw_dir, rows, *, run_id: str) -> list[str]:
-    """Replace a table's contents with `rows`. Returns the periods written.
+@dataclass
+class MergeCounts:
+    """What one merge landed. `kept` is the rows the incoming batch did not mention and
+    that stayed - the number that would have been silently deleted before
+    docs/adr/0023, and therefore the one worth reporting."""
+    inserted: int = 0
+    updated: int = 0
+    kept: int = 0
+    periods: list[str] = field(default_factory=list)
 
-    This is what a table declaring no watermark is loaded with: no merge, no delete
-    semantics to invent, and a row the source no longer carries is simply gone. The old
-    file is read for its `_first_run_id` values and for nothing else - carrying those
-    across is not a merge, and a key the incoming rows do not carry stays gone.
+
+class ImmutableRowChanged(RuntimeError):
+    """A table declaring `rows_are_immutable` was handed a key it already holds,
+    carrying different values. The source is restating its own past.
+
+    Raised rather than reported, and raised before anything is written: this is the one
+    thing a merge cannot decide on its caller's behalf, because both answers - keep what
+    we hold, take what arrived - throw away something nobody can get back.
+    """
+
+
+def _refuse_restatement(contract: dict, held: dict, arriving: dict, key) -> None:
+    """Fail if an immutable row came back changed, naming what differs."""
+    declared = columns_of(contract)
+    differing = [name for name in declared if held[name] != arriving[name]]
+    if not differing:
+        return
+    table = contract["table"]
+    columns = ", ".join(
+        f"{name}: {held[name]!r} -> {arriving[name]!r}" for name in differing
+    )
+    raise ImmutableRowChanged(
+        f"{table} declares rows_are_immutable, and the extract restates a version it "
+        f"already holds. Key {list(key)}, changed {columns}. A change to this table is "
+        f"supposed to arrive under a new primary key; the same key carrying different "
+        f"values means the source has revised its own history. See "
+        f"docs/adr/0023-raw-never-forgets-a-primary-key.md."
+    )
+
+
+def merge_table(contract: dict, raw_dir, rows, *, run_id: str) -> "MergeCounts":
+    """Merge `rows` into a table by primary key. Returns what it landed.
+
+    This is what a table declaring no watermark is loaded with. A key the incoming rows
+    carry is replaced by the incoming row; a key they do not carry is kept. Absence
+    from an extract is not a deletion - the upstream system is authoritative about when
+    a change took effect, not about how long it will keep exporting it, and once an
+    extract has landed the warehouse is the only party that can still say what the
+    source said. See docs/adr/0023-raw-never-forgets-a-primary-key.md.
+
+    The watermarked path in `ingest.load` has never deleted on absence either, because
+    its batch is a window rather than the whole table. This is what makes the two paths
+    say the same thing.
+
+    A contract declaring `rows_are_immutable` raises rather than overwriting when a key
+    it already holds arrives with different values.
+
+    Not to be confused with eviction. A key that moves accounting period is still
+    removed from the partition it left; that is `ingest.load.evict_moved_keys` and
+    docs/adr/0016, and it is untouched here.
     """
     directory = table_dir(raw_dir, contract["table"])
     key_columns = contract["primary_key"]
-    prior = prior_first_run_ids(contract, raw_dir)
-    rows = [
-        {**row, FIRST_RUN_ID: prior.get(tuple(row[name] for name in key_columns)) or run_id}
-        for row in rows
-    ]
+    declared = columns_of(contract)
+    immutable = contract.get("rows_are_immutable", False)
+    counts = MergeCounts()
+
+    def key_of(row):
+        return tuple(row[name] for name in key_columns)
+
+    # Everything already held, by key. The whole table rather than the touched
+    # partitions: this path has no watermark, so there is no window to scope a read to,
+    # and a key that is absent from the batch still has to survive into the result.
+    #
+    # State the cost rather than hide it, as docs/adr/0011 and 0016 do. Peak memory here
+    # is the whole table plus the batch - not one partition plus the batch, which is
+    # what `merge_partition` on the watermarked path costs. Nothing bounds it but the
+    # table's own size. The four tables the load sends down this path are the small ones
+    # - a chart of accounts, twelve cost centres, the suppliers, the daily rates - but
+    # that is a property of the callers, not of this function, and a partitioned table
+    # merged this way would materialise whole.
+    held = {key_of(row): row for row in read_table_with_metadata(contract, raw_dir)}
+
+    incoming = {}
+    for row in rows:
+        key = key_of(row)
+        if key in held:
+            if immutable:
+                _refuse_restatement(contract, held[key], row, key)
+            # Counted by what actually differs, not by what arrived. Every extract
+            # carries the whole history, so a run re-presents every version it has
+            # already landed; calling those updates would report a table that changed
+            # every night when nothing had.
+            elif any(held[key][name] != row[name] for name in declared):
+                counts.updated += 1
+        else:
+            counts.inserted += 1
+        incoming[key] = row
+    counts.kept = len(held) - (len(incoming) - counts.inserted)
+
+    # Nothing is written until every incoming row has been checked, so a restatement in
+    # the middle of a batch leaves the layer exactly as it was.
+    merged = []
+    for key, row in {**held, **incoming}.items():
+        first = held[key].get(FIRST_RUN_ID) if key in held else None
+        merged.append({**{name: row[name] for name in declared},
+                       FIRST_RUN_ID: first or run_id})
 
     if "partition_by" not in contract:
-        write_partition(contract, partition_path(raw_dir, contract), rows, run_id=run_id)
-        return []
+        write_partition(contract, partition_path(raw_dir, contract), merged,
+                        run_id=run_id)
+        counts.periods = []
+        return counts
 
     grouped: dict[str, list[dict[str, str]]] = {}
-    for row in rows:
+    for row in merged:
         grouped.setdefault(partition_of(row[contract["partition_by"]]), []).append(row)
 
-    # The new partitions go down before the stale ones come up. The other order loses
-    # data on a batch that cannot be serialised: February would already be deleted by
-    # the time January raised, and nothing would have replaced it.
+    # Only the partitions the merged result actually lands in are written. Nothing is
+    # deleted: a partition that no longer appears here cannot exist, because `merged`
+    # carries every row the table held.
     for period, group in sorted(grouped.items()):
         write_partition(contract, partition_path(raw_dir, contract, period), group,
                         run_id=run_id)
 
-    for path in partitions(contract, raw_dir):
-        if path.parent.name.split("=", 1)[1] not in grouped:
-            path.unlink()
-            path.parent.rmdir()
-
     directory.mkdir(parents=True, exist_ok=True)
-    return sorted(grouped)
+    counts.periods = sorted(grouped)
+    return counts
+
+
+def read_table_with_metadata(contract: dict, raw_dir):
+    """Every row of a table, carrying the run identifiers as well as the declared
+    columns. `read_table` deliberately drops them; the merge needs `_first_run_id` to
+    carry it across, and reading it here is what `prior_first_run_ids` does for the
+    watermarked path."""
+    for path in partitions(contract, raw_dir):
+        yield from read_partition(contract, path, metadata=True)
 
 
 def read_table(contract: dict, raw_dir):

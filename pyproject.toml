@@ -13,9 +13,11 @@ dependencies = [
     "pyyaml",
 ]
 
-# Declared, but installed by nobody yet. The task that first needs one of these
-# is the task that makes it install, and that is where its version floor and any
-# toolchain requirement get settled. See docs/adr/0003-how-dependencies-are-declared.md.
+# Declared, and installed by the task that first needs one. That task is where the
+# version floor and any toolchain requirement get settled. See
+# docs/adr/0003-how-dependencies-are-declared.md. `spark` has been claimed:
+# transform/spark/ needs it, and it needs a JDK - Spark 4.2.0 runs on Java 17/21/25,
+# found through PATH or JAVA_HOME. See docs/adr/0028-spark-runs-in-process.md.
 [project.optional-dependencies]
 dev = [
     "pytest",
@@ -30,7 +32,7 @@ requires = ["setuptools>=68"]
 build-backend = "setuptools.build_meta"
 
 [tool.setuptools]
-packages = ["generator", "ingest", "ingest.contracts"]
+packages = ["generator", "ingest", "ingest.contracts", "transform", "transform.spark"]
 
 [tool.setuptools.package-data]
 # The contracts are data the package reads at runtime, so they have to ship with it.

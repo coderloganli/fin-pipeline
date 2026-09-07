@@ -39,7 +39,7 @@ def generate(config: Config) -> None:
     """Write the six source tables to `config.out_dir`."""
     months = entries.months_in(config.periods)
 
-    account_rows = dimensions.accounts(config.seed)
+    account_rows = dimensions.accounts(config.seed, config.account_move)
     centre_rows = dimensions.cost_centres(config.seed, config.cost_centre_move)
     vendor_rows = dimensions.vendors(config.seed)
 

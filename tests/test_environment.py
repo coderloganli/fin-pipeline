@@ -202,7 +202,7 @@ def test_core_and_dev_dependencies_are_declared():
 
 def test_ci_installs_the_same_way_the_readme_says_to():
     """Success criterion 3: CI uses the same install line as a developer does."""
-    command = 'pip install -e ".[dev]"'
+    command = 'pip install -e ".[dev,spark]"'
 
     steps = [
         step.get("run", "")
@@ -256,3 +256,57 @@ def test_pyarrow_is_a_core_dependency():
     assert "pyarrow" in core, f"core dependencies do not carry pyarrow: {sorted(core)}"
 
     import pyarrow  # noqa: F401  - declared is not installed until it imports
+
+
+# --- the Spark toolchain ----------------------------------------------------
+#
+# Cases 32-34 of task.md. See docs/adr/0028-spark-runs-in-process.md.
+
+# Spark 4.2.0 documents the versions it runs on as a list rather than a floor:
+# "Spark runs on Java 17/21/25". Encoding "17 or later" would pass a host running a
+# version Spark does not list, and the failure would then arrive from inside the JVM
+# rather than from a message written for someone who has just cloned the repository.
+SUPPORTED_JAVA = {"17", "21", "25"}
+
+
+def test_the_spark_session_fails_with_a_message_that_says_what_to_install(monkeypatch):
+    """Case 32. It does not skip, and it does not claim JAVA_HOME is required - Spark's
+    own documentation says `java` on PATH *or* JAVA_HOME, so demanding the variable
+    would reject an environment that works."""
+    from transform.spark import session as spark_session
+
+    def refuses(*args, **kwargs):
+        raise RuntimeError("Java gateway process exited before sending its port number")
+
+    monkeypatch.setattr(spark_session, "_build_session", refuses)
+
+    with pytest.raises(spark_session.SparkUnavailable) as failure:
+        spark_session.build("whatever")
+
+    message = str(failure.value)
+    assert all(version in message for version in sorted(SUPPORTED_JAVA)), message
+    assert "PATH" in message and "JAVA_HOME" in message, message
+    assert "JAVA_HOME must" not in message and "requires JAVA_HOME" not in message
+
+
+def test_the_transform_packages_are_declared_for_installation():
+    """Case 33. The same drift guard as the Python version: a package that is not
+    listed imports in the source tree and vanishes from an installed one."""
+    packages = read_pyproject()["tool"]["setuptools"]["packages"]
+    assert "transform" in packages
+    assert "transform.spark" in packages
+
+
+def test_ci_installs_a_java_version_spark_documents():
+    """Case 34. The workflow and the decision record have to agree on which Java, for
+    the reason the Python version is checked here rather than assumed."""
+    workflow = read_ci_workflow()
+    versions = set()
+    for job in workflow["jobs"].values():
+        for step in job.get("steps", []):
+            with_ = step.get("with", {})
+            if "java-version" in with_:
+                versions.add(str(with_["java-version"]))
+
+    assert versions, "no step in the CI workflow sets a java-version"
+    assert versions <= SUPPORTED_JAVA, f"CI installs Java {sorted(versions)}"

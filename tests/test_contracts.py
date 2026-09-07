@@ -476,14 +476,36 @@ def test_the_other_tables_declare_neither(table):
 
 
 def test_the_top_level_whitelist_did_not_widen():
-    """Case 8. Two keys were added to TOP_LEVEL; the guard against a third that
-    nobody declared has to still be there."""
+    """Case 12. `rows_are_immutable` is the third key added to TOP_LEVEL; the guard
+    against a fourth that nobody declared has to still be there."""
     assert contracts.TOP_LEVEL == {
         "table", "primary_key", "columns", "row_constraints",
-        "watermark", "partition_by",
+        "watermark", "partition_by", "rows_are_immutable",
     }
     with pytest.raises(contracts.ContractError, match="unknown top-level"):
         validated(dated(watermarkk="d"))
+
+
+def test_immutability_is_declared_as_a_boolean_or_not_at_all():
+    """Case 11. A key whose whole meaning is a yes/no, so a string "false" - which is
+    what YAML gives for a quoted value, and is truthy - has to be refused rather than
+    read as yes."""
+    assert validated(dated(rows_are_immutable=True))["rows_are_immutable"] is True
+    assert "rows_are_immutable" not in validated(dated())
+
+    with pytest.raises(contracts.ContractError, match="rows_are_immutable"):
+        validated(dated(rows_are_immutable="true"))
+
+
+def test_the_two_effective_dated_dimensions_declare_immutability():
+    """Case 11, on the contracts that ship. Their primary keys carry the date the
+    version took effect, so the same key arriving changed is the source restating its
+    own past rather than updating a row. See docs/adr/0023."""
+    for table in ("dim_account_src", "dim_cost_center_src"):
+        assert contracts.load(table).get("rows_are_immutable") is True, table
+
+    for table in ("gl_entry", "gl_adjustment", "fx_rate", "dim_vendor"):
+        assert "rows_are_immutable" not in contracts.load(table), table
 
 
 # --- the vendor columns and the vendor dimension -----------------------------

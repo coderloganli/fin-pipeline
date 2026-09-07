@@ -1,10 +1,12 @@
 # Product design
 
-**Status.** This describes the product as designed. Of it, `generator/` and
-`ingest/` have landed — synthetic entries, source-table contracts, the validator,
-the watermarked incremental load and the run record. The layered models, the
-quality gates beyond contract validation, the intraday path, the anomaly model,
-the explanation layer and the application are designed and not yet built.
+**Status.** This describes the product as designed. Of it, `generator/`,
+`ingest/` and the dimension half of `transform/` have landed — synthetic entries,
+source-table contracts, the validator, the watermarked incremental load, the run
+record, and the effective-dated account and cost-centre dimensions. The remaining
+models, the quality gates beyond contract validation, the intraday path, the
+anomaly model, the explanation layer and the application are designed and not yet
+built.
 `docs/architecture.md` states what is true today; this file states what is being
 built toward, and the two are not the same document.
 
@@ -99,6 +101,16 @@ bound.
 
 **It does not characterise.** It describes where a figure is high and what it
 came from. Calling something an error, or fraud, is a person's job.
+
+**It does not model a source correcting its own history.** Master data is
+effective-dated: a cost centre that moves department, or an account that is
+reclassified, arrives carrying the date the change took effect, and reports are
+built against the structure in force for the period they cover. What is not
+modelled is the source afterwards revising that date — saying a change took effect
+in January that it had previously reported as taking effect in July. A report would
+then have to distinguish what was published from what is now believed, which this
+platform does for entries and not for master data. An extract that contradicts a
+version already held stops the run rather than overwriting it.
 
 **No permissions, tenancy or approval flows**, and no front-end design work. They
 are orthogonal to what this is meant to demonstrate.

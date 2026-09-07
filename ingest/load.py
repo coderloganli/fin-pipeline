@@ -9,7 +9,8 @@ watermark only once every partition has been written. The order is the design:
    bound. Inside one batch a repeated primary key collapses to the last occurrence.
 3. Group what was kept by accounting period.
 4. Merge each touched period - and only those. A table declaring no watermark is
-   replaced whole instead.
+   merged whole instead: it has no window to scope a read to, but a key it does not
+   carry is still kept rather than deleted. See docs/adr/0023.
 5. Only now, store max(W, the highest watermark value in the batch).
 
 A crash in step 4 leaves the watermark where it was, so the next run re-reads the same
@@ -436,9 +437,10 @@ def load_table(
                 highest = value
 
     if watermark_column is None:
-        raw.write_table(contract, raw_dir, list(batch.values()), run_id=run_id)
-        result.rows_inserted = len(batch)
-        result.partitions_written = 1
+        counts = raw.merge_table(contract, raw_dir, list(batch.values()), run_id=run_id)
+        result.rows_inserted = counts.inserted
+        result.rows_updated = counts.updated
+        result.partitions_written = max(len(counts.periods), 1)
         return result
 
     if not batch:
@@ -546,7 +548,8 @@ def build_parser() -> argparse.ArgumentParser:
         prog="python -m ingest.load",
         description="Land source extracts into the raw layer. Entry tables are merged "
                     "on their primary key from a watermark with an overlap window; a "
-                    "table declaring no watermark is replaced whole.",
+                    "table declaring no watermark is merged whole instead. Absence "
+                    "from an extract never deletes a row.",
     )
     parser.add_argument("--source", default=str(DEFAULT_SOURCE),
                         help="directory holding the source CSVs (default: data/source)")
@@ -583,6 +586,13 @@ def main(argv: list[str] | None = None) -> int:
     except contracts.ContractError as failure:
         print(f"{failure}", file=sys.stderr)
         return 2
+    except raw.ImmutableRowChanged as failure:
+        # 1 rather than 2, matching `ingest.validate`: the source is incompatible with
+        # what the warehouse holds, which is a different thing from the operator having
+        # typed the command wrong. This is the second gate a source can fail, and it
+        # reports the same way the first one does.
+        print(f"{failure}", file=sys.stderr)
+        return 1
     except json.JSONDecodeError as failure:
         # The library raises rather than treating a corrupt state file as "no
         # watermark", which would silently re-scan everything and report success. The

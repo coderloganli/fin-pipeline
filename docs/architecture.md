@@ -17,10 +17,11 @@ replay — not volume.
 
 **Status: early.** `generator/` has landed. `ingest/` has its source-table
 contracts, the validator that applies them, the watermarked incremental load that lands
-entries in the raw layer, and the run record every load writes. The remaining
-directories exist and each carries a README stating what that layer is and is not
-responsible for, but no module has landed in them. Read the READMEs for intent; read
-this file for what is actually true today.
+entries in the raw layer, and the run record every load writes. `transform/spark/` has
+the SCD2 dimension loader, which is also what first installs PySpark. `transform/dbt/`,
+`ml/`, `insight/`, `app/` and `dags/` exist and each carries a README stating what that
+layer is and is not responsible for, but no module has landed in them. Read the READMEs
+for intent; read this file for what is actually true today.
 
 ## Shape
 
@@ -48,9 +49,16 @@ generator ──▶ raw (Parquet) ──▶ staging (Parquet, PySpark) ──▶
 container declared in `compose.yaml`, pinned to `postgres:18`. Connection parameters
 come from the environment; `.env.example` records the shape and `.env` is ignored.
 
-Every service this platform grows — Airflow, Spark — is added to the same
+Every service this platform grows — Airflow — is added to the same
 `compose.yaml` by the task that needs it. The host machine edits code and runs tests;
 it does not run services. See `docs/adr/0004-services-run-in-containers.md`.
+
+**Spark is the exception, and it is not a service.** It runs in local mode inside the
+process that imports it, so it is a library with a toolchain requirement rather than
+something to stand up. It needs a JDK: Spark 4.2 runs on Java 17, 21 or 25, found
+either as `java` on the PATH or through `JAVA_HOME` — either one, and the list is a
+list rather than a floor. CI installs Temurin 21. Tests that need it fail rather than skip, for the reason the database
+fixture does. See `docs/adr/0028-spark-runs-in-process.md`.
 
 **DeepSeek V4 Flash** is called by the insight layer once that layer exists. See
 `docs/adr/0001-llm-for-the-insight-layer.md`.
@@ -62,10 +70,12 @@ asserts the two agree, because they had already drifted apart once before anythi
 checked.
 
 **Dependencies live in `pyproject.toml` only**, installed with
-`pip install -e '.[dev]'` — the same command locally, in CI, and in any image. The
-core set is small — `psycopg`, `pyyaml`, and `pyarrow`, which ingest writes the raw
-layer with; `spark`, `dbt`, `ml` and `app` are declared but installed by nobody yet.
-The task that first needs one of them is the task that makes it install.
+`pip install -e '.[dev,spark]'` — the same command locally, in CI, and in any image.
+The core set is small — `psycopg`, `pyyaml`, and `pyarrow`, which ingest writes the raw
+layer with. `spark` has been claimed by `transform/spark/`, and it is in the install
+line rather than optional because tests that need Spark fail rather than skip, so the
+suite does not pass without it. `dbt`, `ml` and `app` are declared but installed by
+nobody yet; the task that first needs one of them is the task that makes it install.
 
 **Tests that need the database fail when it is absent — they never skip.** A skipped
 test reports success, and a green CI run that verified nothing defeats the point of
@@ -117,6 +127,38 @@ per period, every column written as a Parquet string and an empty field written 
 empty string. Retyping is `staging`'s line in the table above, and a raw layer that
 already reinterpreted cannot answer the question it exists for — whether the source
 really said that.
+
+**The raw layer never forgets a primary key, and absence is not deletion.** Both
+load paths agree on this. A key that stops appearing in an extract is kept, because
+once an extract has landed the warehouse is the only party that can still say what the
+source said in March — the upstream system is authoritative about when a change took
+effect, not about how long it will keep telling us. A contract may additionally declare
+`rows_are_immutable`, which the two source dimensions do: a key that reappears carrying
+different values is the source restating its own past, and it fails the run rather than
+overwriting. See docs/adr/0023.
+
+**The dimensions are effective-dated at the source, so their history is read rather
+than inferred.** `dim_account_src` and `dim_cost_center_src` key on
+`(code, effective_date)` and carry every version in every extract, so one run over one
+extract reconstructs the whole history. `transform/spark/` turns those versions into
+validity intervals: `valid_from` is the effective date, `valid_to` is the next
+version's effective date less a day, and the version in force ends at `9999-12-31`
+rather than at null — a null end makes `BETWEEN` evaluate to null and drops the current
+rows out of an inner join with nothing raised. The surrogate key is a hash of the
+natural key and `valid_from`, not a sequence, so it survives a rerun and a
+repartition. See docs/adr/0024 and 0025.
+
+**Staging is typed, and it is rebuilt.** Raw holds text and accumulates because it is
+the record; staging holds dates and booleans and is overwritten because it is derived
+from raw and can always be recomputed. See docs/adr/0026.
+
+**What is not modelled: the source correcting when a change took effect.** A version
+restating an effective date already given would need a second time axis — when it took
+effect, and when we learned of it — and reports would have to distinguish what was
+published from what is now believed. It is out of scope, an extract that contradicts a
+held version fails, and the gap it exposes is recorded: affected periods are derived
+from entries' accounting dates, and a dimension change produces no entry, so it
+currently triggers no recomputation. See docs/adr/0027.
 
 **The load is watermarked, and the merge is what makes a rerun free.** Each contract
 names the column its table advances on: `gl_entry` and `gl_adjustment` advance on
