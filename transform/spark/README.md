@@ -2,26 +2,60 @@
 
 PySpark jobs for the work that has to scale.
 
-**Landed:** `session.py`, which builds the local SparkSession, and `scd2.py`, which
-turns the two effective-dated source dimensions into validity intervals.
+**Landed:** `session.py`, which builds the local SparkSession; `scd2.py`, which turns
+the effective-dated sources into validity intervals; `facts.py`, which attributes each
+entry to the structure in force on its accounting date; and `balances.py`, which
+aggregates the result by month.
 
 ```
-python -m transform.spark.scd2 --raw data/raw --staging data/staging
+python -m transform.spark.scd2     --raw data/raw --staging data/staging
+python -m transform.spark.facts    --raw data/raw --staging data/staging
+python -m transform.spark.balances --staging data/staging --periods 2026-01:2026-12
 ```
 
-`--table` scopes the run to one dimension. Exit 0 on success, 2 for a usage error.
+`scd2 --table` scopes the run to one model. `balances --periods` sets the reporting
+range; without it the job uses the fact table's span and says so.
 
-**Not built yet:** the point-in-time join that attributes each entry to the hierarchy
-and exchange rate in effect on its accounting date, broadcasting the dimensions to
-avoid shuffling the fact table; monthly aggregation with period-over-period and rolling
-windows; small-file compaction after each write.
+**Not built yet:** small-file compaction after each write, and the tuning that step
+four measures.
+
+## The fact build
+
+Three joins, one shape, used three times:
+
+    <natural key> = <natural key>  AND  accounting_date BETWEEN valid_from AND valid_to
+
+Both halves, every time. With the range alone every entry matches every version valid
+on its date — which does not raise, it multiplies, and the result still adds up to a
+number somebody might publish. The dimensions are broadcast; they are tens of rows.
+
+An entry that matched no account, cost centre or rate stops the build. 27% of generated
+entries fall on a weekend, when no rate is published, so this is the failure the change
+itself creates rather than a hypothetical one.
+
+Amounts and rates are read as `DecimalType` and never as doubles, and the
+base-currency figure is rounded at the line so the monthly aggregate agrees with the
+entries added up. See docs/adr/0031.
+
+## The monthly balances
+
+Signed by the account's normal side, using the account type the period had — so a
+reclassification does not flip the sign of a period that already closed. Every active
+combination carries a row for every period in range, zero where nothing posted. Each
+comparison is two columns: a delta that is always defined, and a percentage that is
+null when the base is zero. See docs/adr/0032 and 0033.
 
 ## The SCD2 load
 
-The source declares its own history. `dim_account_src` and `dim_cost_center_src` key
-on `(code, effective_date)` and carry every version in every extract, so `valid_from`
-is the date a change took effect in the business rather than the date this pipeline
-noticed it, and one run over one extract reconstructs the whole chain.
+The source declares its own history. `dim_account_src`, `dim_cost_center_src` and
+`fx_rate` key on a code and a date and carry every version in every extract, so
+`valid_from` is the date a change took effect in the business rather than the date this
+pipeline noticed it, and one run over one extract reconstructs the whole chain.
+
+The exchange rate is loaded by this same code — a rate is a slowly changing attribute
+of a currency. Friday's rate runs until the day before the next published one, so the
+weekend falls inside it by construction rather than by a rule written for weekends.
+See docs/adr/0029.
 
 Per natural key the intervals abut exactly - the earlier one ends the day before the
 later one begins - so they neither overlap nor leave a gap by construction, and exactly

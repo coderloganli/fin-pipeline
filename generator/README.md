@@ -13,6 +13,10 @@ It must be able to emit, under explicit switches:
 - an account whose balance grows abnormally for three consecutive months
 - individual outlier amounts
 
+Exchange rates are a random walk pulled towards each currency's centre, published on
+business days only — a real feed does not publish at the weekend, and 27% of entries
+are dated on one, which is what makes the as-of join load-bearing. See docs/adr/0030.
+
 Because the anomalies are planted deliberately, the golden set used to evaluate the LLM layer has known correct answers.
 
 ## Using it
