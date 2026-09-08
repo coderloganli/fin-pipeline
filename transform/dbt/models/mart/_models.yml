@@ -1,0 +1,113 @@
+version: 2
+
+# Gates 1 and 2 of the six. A gate is defined by what it stops, so every one of these
+# has a scenario in tests/test_mart_gates.py that turns it red - a gate asserted only on
+# well-formed data is `assert True` wearing a costume.
+
+models:
+  - name: fct_gl_entry
+    description: One row per entry version, attributed and converted, widened with names.
+    data_tests:
+      - unique:
+          name: unique_fct_gl_entry_entry_id_version
+          arguments:
+            column_name: "entry_id || '|' || version"
+    columns:
+      - name: entry_id
+        data_tests: [not_null]
+      - name: version
+        data_tests: [not_null]
+      - name: account_key
+        data_tests:
+          - not_null
+          - relationships:
+              name: relationships_fct_gl_entry_account_key
+              arguments:
+                to: ref('dim_account')
+                field: surrogate_key
+      - name: cost_center_key
+        data_tests:
+          - not_null
+          - relationships:
+              name: relationships_fct_gl_entry_cost_center_key
+              arguments:
+                to: ref('dim_cost_center')
+                field: surrogate_key
+      - name: fx_key
+        data_tests:
+          - not_null
+          - relationships:
+              name: relationships_fct_gl_entry_fx_key
+              arguments:
+                to: ref('dim_fx_rate')
+                field: surrogate_key
+      - name: vendor_code
+        # Not not_null: a sale is earned from a customer, not paid to a supplier, and
+        # `relationships` ignores nulls for the same reason.
+        data_tests:
+          - relationships:
+              name: relationships_fct_gl_entry_vendor_code
+              arguments:
+                to: ref('dim_vendor')
+                field: vendor_code
+      - name: account_name
+        data_tests: [not_null]
+      - name: cost_center_name
+        data_tests: [not_null]
+
+  - name: agg_monthly_balance
+    description: A dense monthly grid, signed by the account's normal side.
+    data_tests:
+      - unique:
+          name: unique_agg_monthly_balance_key
+          arguments:
+            column_name: "account_code || '|' || cost_center_code || '|' || accounting_period"
+    columns:
+      - name: account_code
+        data_tests: [not_null]
+      - name: cost_center_code
+        data_tests: [not_null]
+      - name: accounting_period
+        data_tests: [not_null]
+      # The as-of join is a left join on a date range, so a dimension that leaves a gap
+      # over a period end produces a row with no name rather than no row. The fact has
+      # the same pair of tests for the same reason; without them here, a gap would reach
+      # a report as a blank label on a real figure.
+      - name: account_name
+        data_tests: [not_null]
+      - name: cost_center_name
+        data_tests: [not_null]
+
+  - name: dim_account
+    columns:
+      - name: surrogate_key
+        data_tests: [unique, not_null]
+      - name: account_code
+        data_tests: [not_null]
+
+  - name: dim_cost_center
+    columns:
+      - name: surrogate_key
+        data_tests: [unique, not_null]
+      - name: cc_code
+        data_tests: [not_null]
+
+  - name: dim_fx_rate
+    columns:
+      - name: surrogate_key
+        data_tests: [unique, not_null]
+      - name: currency
+        data_tests: [not_null]
+
+  - name: dim_vendor
+    columns:
+      - name: vendor_code
+        data_tests: [unique, not_null]
+
+  - name: model_row_count
+    description: One row per counted model per build. The drift gate's baseline.
+    columns:
+      - name: invocation_id
+        data_tests: [not_null]
+      - name: model
+        data_tests: [not_null]

@@ -7,6 +7,13 @@
 table: gl_entry
 primary_key: [entry_id, version]
 
+# What this table reaches downstream.
+# Every entry reaches the mart through the point-in-time fact that
+# transform/spark/facts.py builds. dbt cannot see that hop, so it is declared here.
+# See docs/adr/0035.
+feeds:
+  - landing.fct_gl_entry
+
 # The incremental load advances on posted_at - when the row actually landed.
 # There is no updated_at in this source; see
 # docs/adr/0014-the-contract-declares-the-watermark-column.md.

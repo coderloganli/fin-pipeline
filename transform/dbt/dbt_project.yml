@@ -1,0 +1,33 @@
+# The relational layer. dbt owns what benefits from being readable and verifiable in
+# SQL; PySpark owns what has to scale, and the two do not overlap.
+#
+# Connection settings and both schema names come from the environment, resolved the
+# same way transform/db.py resolves them. See docs/adr/0034.
+
+name: fin_pipeline
+version: 0.1.0
+config-version: 2
+profile: fin_pipeline
+
+model-paths: ["models"]
+test-paths: ["tests"]
+target-path: "target"
+clean-targets: ["target", "dbt_packages"]
+
+vars:
+  # The row-count drift gate. Five builds is the smallest window over which a median
+  # ignores a single outlier; ten percent is wide enough that a day of new entries does
+  # not fire it and narrow enough to catch a load that lost a partition. Moving either
+  # is a decision to record in docs/adr/0036, not a knob to turn quietly.
+  drift_window: 5
+  drift_tolerance: 0.10
+
+models:
+  fin_pipeline:
+    +materialized: table
+
+data_tests:
+  # A gate that can say only that something failed, and not what, is half a gate - and
+  # a failing singular test reports its node and a count, never the rows. Failures land
+  # in <schema>_dbt_test__audit.
+  +store_failures: true

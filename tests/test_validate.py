@@ -505,7 +505,8 @@ def test_a_broken_contract_is_a_usage_error(tmp_path, monkeypatch):
     monkeypatch.setattr(contracts, "CONTRACT_DIR", tmp_path / "contracts")
     (tmp_path / "contracts").mkdir()
     (tmp_path / "contracts" / "gl_entry.yaml").write_text(
-        "table: gl_entry\nprimary_key: [a]\ncolumns: []\n", encoding="utf-8"
+        "table: gl_entry\nprimary_key: [a]\ncolumns: []\nfeeds: []\n",
+        encoding="utf-8",
     )
     contracts.load.cache_clear()
 
@@ -610,15 +611,20 @@ def test_the_library_configures_no_logging(tmp_path):
 
 # --- Cases 28-29: downstream impact ----------------------------------------
 
-def test_a_failure_states_that_downstream_impact_is_unknown(tmp_path):
-    """Case 28. dbt has not landed, so there is no lineage graph and no models to
-    name. Saying so is what keeps the unfinished half of the requirement visible."""
+def test_a_failure_names_the_affected_downstream_models(tmp_path):
+    """Case 28. The graph exists now, so the section names models rather than saying
+    the impact is unknown.
+
+    This test asserted the word "unknown" until build-the-mart-layer. That string was
+    the placeholder docs/adr/0012 left behind, and replacing it is what closes the one
+    acceptance criterion the first phase did not meet. Same scenario, same place: what
+    changed is that there is an answer to give."""
     report = report_for(tmp_path, "gl_entry", [entry(currency="JPY")])
     described = report.describe()
 
     assert "Downstream impact:" in described
-    assert "unknown" in described
-    assert "dbt" in described
+    assert "unknown" not in described.lower()
+    assert "mart.fct_gl_entry" in described
 
 
 def test_a_passing_report_carries_no_downstream_section(tmp_path):

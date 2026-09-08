@@ -7,6 +7,12 @@
 table: dim_vendor
 primary_key: [vendor_code]
 
+# What this table reaches downstream.
+# Landed straight from raw: not effective-dated, so there is no staging form.
+# See docs/adr/0034.
+feeds:
+  - landing.dim_vendor
+
 columns:
   - name: vendor_code
     type: string

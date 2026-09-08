@@ -1,13 +1,13 @@
 # Product design
 
-**Status.** This describes the product as designed. Of it, `generator/`,
-`ingest/` and the Spark half of `transform/` have landed — synthetic entries,
-source-table contracts, the validator, the watermarked incremental load, the run
-record, the effective-dated account, cost-centre and exchange-rate dimensions, the
-point-in-time attribution of each entry, and the monthly balances built from it. The
-relational layer, the quality gates beyond contract validation, the intraday path, the
-anomaly model, the explanation layer and the application are designed and not yet
-built.
+**Status.** This describes the product as designed. Of it, `generator/`, `ingest/` and
+the whole of `transform/` have landed — synthetic entries, source-table contracts, the
+validator, the watermarked incremental load, the run record, the effective-dated
+account, cost-centre and exchange-rate dimensions, the point-in-time attribution of each
+entry, the monthly balances built from it, and the relational layer those become in
+Postgres: a star an analyst can query, six quality gates over it, and a lineage graph
+that names what a source change would break. The intraday path, the anomaly model, the
+explanation layer and the application are designed and not yet built.
 `docs/architecture.md` states what is true today; this file states what is being
 built toward, and the two are not the same document.
 

@@ -70,9 +70,13 @@ INCOMPATIBLE = "incompatible"
 # Only one kind is a warning. See docs/adr/0009.
 COMPATIBLE_KINDS = frozenset({"added_column"})
 
-DOWNSTREAM_IMPACT = (
-    "Downstream impact: unknown. No lineage graph exists yet - dbt has not landed, so "
-    "the models that would break cannot be named. See docs/adr/0012."
+# What the section says when the graph cannot be consulted. Not an empty string: an
+# empty impact section would let the unfinished half of the requirement pass for
+# finished, which is the reason docs/adr/0012 gave for stating the gap rather than
+# omitting it.
+NO_MANIFEST = (
+    "Downstream impact: not known yet. {reason}\n"
+    "Build it and run this again to see the models a change here would break."
 )
 
 
@@ -153,15 +157,54 @@ class Report:
 
 
 def downstream_impact(tables: list[str] | None = None) -> str:
-    """The models that would break, once there is a lineage graph to ask.
+    """The models a change to these source tables would break.
 
-    There is not one yet, so this states that rather than returning nothing: an empty
-    section would let the unfinished half of the requirement pass for finished. The
-    dbt ticket replaces the body of this function and nothing else - which is why it
-    already takes the tables that changed, the argument it will need and this
-    implementation has no use for.
+    dbt's graph starts at the Postgres landing tables; the hop from a CSV to one of
+    them happens inside `transform/spark/` and appears in no manifest. So each contract
+    declares the dbt sources it feeds, and this walks the manifest downward from
+    them. See docs/adr/0035.
+
+    The import of `transform.lineage` is lazy and deliberate. It is an edge from ingest
+    to transform, which is the wrong direction, and it is taken over the alternative -
+    a second manifest reader inside ingest, which would be a second thing to drift.
+    Lazy, because `ingest` has to import with no dbt project on disk: an ingest run is
+    not a dbt run.
     """
-    return DOWNSTREAM_IMPACT
+    try:
+        from transform import lineage
+    except ImportError as failure:  # pragma: no cover - transform is part of the package
+        return NO_MANIFEST.format(reason=f"The lineage reader is unavailable: {failure}.")
+
+    feeds: list[str] = []
+    for table in tables or contracts.tables():
+        try:
+            feeds.extend(contracts.load(table)["feeds"])
+        except contracts.ContractError:
+            continue
+
+    if not feeds:
+        named = ", ".join(sorted(tables or []))
+        return (
+            f"Downstream impact: none. No model consumes {named or 'these tables'} yet, "
+            f"so nothing downstream would break. See docs/adr/0035."
+        )
+
+    try:
+        manifest = lineage.load_manifest()
+    except lineage.ManifestMissing as failure:
+        return NO_MANIFEST.format(reason=str(failure))
+
+    missing = lineage.unresolved(feeds, manifest=manifest)
+    affected = lineage.downstream_of(feeds, manifest=manifest)
+
+    lines = ["Downstream impact: the following models read these tables."]
+    lines += [f"  - {name}" for name in affected] or ["  (none)"]
+    if missing:
+        lines.append(
+            f"  Declared sources the manifest does not have: {', '.join(missing)}. "
+            f"One of them has been renamed."
+        )
+    return "\n".join(lines)
 
 
 # --- the rule primitives ---------------------------------------------------
@@ -569,7 +612,13 @@ def main(argv: list[str] | None = None) -> int:
 
     if report.incompatible:
         print("", file=sys.stderr)
-        print(downstream_impact([t.table for t in report.tables]), file=sys.stderr)
+        # The tables that failed, not every table that was checked. `describe` has
+        # always narrowed it here and this did not; with the placeholder the argument
+        # went unread, so the two only disagreed once there was a graph to ask.
+        print(
+            downstream_impact([t.table for t in report.tables if t.incompatible]),
+            file=sys.stderr,
+        )
         return 1
     return 0
 

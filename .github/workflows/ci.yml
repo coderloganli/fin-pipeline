@@ -32,6 +32,10 @@ jobs:
       POSTGRES_DB: fin_pipeline
       POSTGRES_USER: fin_pipeline
       POSTGRES_PASSWORD: fin_pipeline
+      # The mart's two schemas. Named here rather than left to the default so the
+      # workflow says what it builds into. See docs/adr/0034.
+      POSTGRES_LANDING_SCHEMA: landing
+      POSTGRES_MART_SCHEMA: mart
 
     steps:
       - uses: actions/checkout@v4
@@ -47,5 +51,18 @@ jobs:
         with:
           distribution: temurin
           java-version: '21'
-      - run: pip install -e ".[dev,spark]"
+      - run: pip install -e ".[dev,spark,dbt]"
       - run: pytest -q
+      # The lineage graph is one of this project's answers to "what would a column
+      # change break", so CI produces it rather than leaving it to a developer's
+      # machine. `docs generate` is what refreshes catalog.json and proves the project
+      # documents; the artefact itself is rendered from the manifest, because
+      # `dbt docs generate --static` does not embed what it documents
+      # (dbt-labs/dbt-core#11986) and dbt Docs v2 has no single-file output.
+      # See docs/adr/0037.
+      - run: dbt docs generate --project-dir transform/dbt --profiles-dir transform/dbt
+      - run: python -m transform.lineage --out transform/dbt/target/lineage.html
+      - uses: actions/upload-artifact@v4
+        with:
+          name: lineage
+          path: transform/dbt/target/lineage.html

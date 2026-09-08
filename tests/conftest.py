@@ -1,12 +1,12 @@
-"""How the tests reach Postgres.
+"""How the tests reach Postgres, and how the mart is built for them.
 
-The connection is made inside a fixture a test asks for, never at import or
-collection time. Tests that do not ask for it keep working while the containers
-are stopped, which is what makes `pytest -m "not db"` useful.
+The connection is made inside a fixture a test asks for, never at import or collection
+time. Tests that do not ask for it keep working while the containers are stopped, which
+is what makes `pytest -m "not db"` useful.
 
-When the database is absent the failure names the command that starts it. It is
-not a skip: a skipped test reports success, and a CI run that verified nothing
-would come back green. See docs/adr/0004-services-run-in-containers.md.
+The settings themselves live in `transform/db.py`, and are re-exported here rather than
+restated: the loader resolves them too, and two copies would drift. See
+docs/adr/0004-services-run-in-containers.md.
 """
 
 import os
@@ -14,84 +14,29 @@ from pathlib import Path
 
 import pytest
 
+from transform.db import (  # noqa: F401  - re-exported for the tests that import them
+    DEFAULTS,
+    START_COMMAND,
+    DatabaseUnavailable,
+    connect,
+    parse_env_file,
+    settings,
+)
+
 REPO_ROOT = Path(__file__).resolve().parent.parent
-
-START_COMMAND = "docker compose up -d"
-
-DEFAULTS = {
-    "POSTGRES_HOST": "127.0.0.1",
-    "POSTGRES_PORT": "5432",
-    "POSTGRES_DB": "fin_pipeline",
-    "POSTGRES_USER": "fin_pipeline",
-    "POSTGRES_PASSWORD": "fin_pipeline",
-}
-
-
-class DatabaseUnavailable(RuntimeError):
-    """Raised instead of the driver's own error, so the message says what to do."""
-
-
-def parse_env_file(path: Path) -> dict[str, str]:
-    """Read KEY=VALUE lines, ignoring blanks and comments."""
-    if not path.is_file():
-        return {}
-    values = {}
-    for line in path.read_text(encoding="utf-8").splitlines():
-        line = line.strip()
-        if not line or line.startswith("#") or "=" not in line:
-            continue
-        key, _, value = line.partition("=")
-        values[key.strip()] = value.strip()
-    return values
-
-
-def settings() -> dict[str, str]:
-    """Connection settings, resolved the same way Compose resolves them: a real
-    environment variable wins, then `.env`, then the built-in default.
-
-    Reading `.env` matters because Compose reads it and pytest otherwise would
-    not: editing it would move the database the container publishes while the
-    tests kept connecting to the old one.
-    """
-    from_file = parse_env_file(REPO_ROOT / ".env")
-    return {
-        key: os.environ.get(key) or from_file.get(key) or default
-        for key, default in DEFAULTS.items()
-    }
-
-
-def connect(host: str, port: int | str, dbname: str, user: str, password: str):
-    """Open a connection, or fail with a message that names the start command."""
-    import psycopg
-
-    try:
-        port = int(port)
-    except (TypeError, ValueError) as failure:
-        raise DatabaseUnavailable(
-            f"POSTGRES_PORT must be a number, got {port!r}. "
-            f"Check .env against .env.example."
-        ) from failure
-
-    try:
-        return psycopg.connect(
-            host=host,
-            port=port,
-            dbname=dbname,
-            user=user,
-            password=password,
-            connect_timeout=5,
-        )
-    except psycopg.OperationalError as failure:
-        raise DatabaseUnavailable(
-            f"cannot reach Postgres at {host}:{port} as {user}. "
-            f"Start it with `{START_COMMAND}` from {REPO_ROOT}, "
-            f"or point POSTGRES_* at another database. Driver said: {failure}"
-        ) from failure
 
 
 @pytest.fixture(scope="session")
 def db():
-    """A connection to Postgres. Only tests that ask for it pay for it."""
+    """A connection to Postgres. Only tests that ask for it pay for it.
+
+    Autocommit, because this connection reads alongside processes that write DDL. A
+    plain SELECT opens an implicit transaction in psycopg, and a connection sitting
+    idle in one holds a lock on what it read - which is enough to block the loader's
+    `DROP TABLE` and the dbt build behind it, indefinitely and with nothing raised.
+    Nothing here needs a transaction: the tests read, and the writes they make are
+    single statements against schemas of their own.
+    """
     values = settings()
     connection = connect(
         host=values["POSTGRES_HOST"],
@@ -100,6 +45,7 @@ def db():
         user=values["POSTGRES_USER"],
         password=values["POSTGRES_PASSWORD"],
     )
+    connection.autocommit = True
     try:
         yield connection
     finally:
@@ -125,3 +71,222 @@ def spark():
         yield built
     finally:
         built.stop()
+
+
+# --- the mart: one pipeline run, many builds --------------------------------
+#
+# Building the Parquet is slow - the generator, ingest and three Spark jobs - and
+# loading it into Postgres is not. So the Parquet is built once per session per
+# generator configuration, and every scenario gets its own landing and mart schema
+# loaded from it. A scenario that has to plant a failure mutates its own schema and
+# nothing else's.
+#
+# The schemas the suite uses are named from POSTGRES_LANDING_SCHEMA and
+# POSTGRES_MART_SCHEMA, which the suite points somewhere of its own: running the tests
+# must not overwrite the schemas a developer has been looking at in the same database.
+# See docs/adr/0034.
+
+import hashlib
+import subprocess
+import sys
+from dataclasses import dataclass
+
+DBT_PROJECT = REPO_ROOT / "transform" / "dbt"
+
+TEST_LANDING_SCHEMA = "landing_test"
+TEST_MART_SCHEMA = "mart_test"
+
+# The whole year, thinly. The range is not a preference: the generator dates its
+# dimension moves in July, so a two-month window would contain no dimension with two
+# versions - and the point-in-time behaviour the mart has to preserve would go
+# unexercised while every test still passed. Forty entries a period keeps a scenario's
+# `dbt build` in seconds.
+TEST_PERIODS = "2026-01:2026-12"
+TEST_ENTRIES_PER_PERIOD = 40
+
+
+# Postgres truncates an identifier at 63 characters, and dbt appends
+# `_dbt_test__audit` - sixteen of them - to the mart schema when `store_failures` is on.
+# A name that fits on its own and not with the suffix is worse than one that is too
+# long: dbt computes the full name, Postgres stores the truncated one, the relation
+# cache misses, and the second build in a schema fails with "relation already exists"
+# on a test that is perfectly correct. So the budget is the suffix's, not Postgres's.
+AUDIT_SUFFIX = "_dbt_test__audit"
+MAX_SCHEMA = 63 - len(AUDIT_SUFFIX)
+
+
+def schema_for(node_id: str, prefix: str) -> str:
+    """A schema name unique to one test, short enough to survive dbt's audit suffix.
+
+    The readable part is kept and the rest is a digest, so a failure names something a
+    person can find in psql.
+    """
+    digest = hashlib.sha256(node_id.encode("utf-8")).hexdigest()[:8]
+    readable = "".join(c if c.isalnum() else "_" for c in node_id.rsplit("::", 1)[-1])
+    budget = MAX_SCHEMA - len(prefix) - len(digest) - 2
+    return f"{prefix}_{readable[:budget]}_{digest}".lower()
+
+
+@dataclass
+class Staging:
+    """One generator configuration, built through to Parquet."""
+
+    root: Path
+    source: Path
+    raw: Path
+    staging: Path
+
+
+def build_staging(spark, root: Path, **config) -> Staging:
+    """Generator, ingest, then the three Spark jobs. Everything under one directory."""
+    from generator import generate
+    from generator.config import Config
+    from ingest import load as ingest_load
+    from transform.spark import balances, facts, scd2
+
+    source, raw_dir, staging_dir = root / "source", root / "raw", root / "staging"
+    settings_ = {
+        "seed": 42,
+        "out_dir": source,
+        "periods": TEST_PERIODS,
+        "entries_per_period": TEST_ENTRIES_PER_PERIOD,
+    }
+    settings_.update(config)
+    generate(Config(**settings_))
+
+    ingest_load.load_source(source, raw_dir)
+    for table in sorted(scd2.MODELS):
+        scd2.build(spark, contracts_load(table), raw_dir, staging_dir)
+    facts.build(spark, raw_dir, staging_dir)
+    balances.build(spark, staging_dir, periods=TEST_PERIODS)
+    return Staging(root=root, source=source, raw=raw_dir, staging=staging_dir)
+
+
+def contracts_load(table: str) -> dict:
+    from ingest import contracts
+
+    return contracts.load(table)
+
+
+@pytest.fixture(scope="session")
+def clean_staging(spark, tmp_path_factory) -> Staging:
+    """A correct ledger. The baseline every gate passes on.
+
+    The two dimension moves are on, and they are not failure modes: docs/architecture.md
+    says so in as many words - a cost centre that moved department is a legitimate
+    business event, not malformed input. They are what gives the mart a dimension with
+    two versions to attribute against, which cases 25 and 26 are about.
+    """
+    return build_staging(
+        spark, tmp_path_factory.mktemp("clean"),
+        cost_centre_move=True, account_move=True,
+    )
+
+
+@pytest.fixture(scope="session")
+def unbalanced_staging(spark, tmp_path_factory) -> Staging:
+    """A ledger whose vouchers do not balance. Gate 3's red scenario."""
+    return build_staging(
+        spark, tmp_path_factory.mktemp("unbalanced"),
+        unbalanced_vouchers=True, cost_centre_move=True, account_move=True,
+    )
+
+
+@dataclass
+class Build:
+    """One mart, in schemas of its own, and what `dbt build` said about it."""
+
+    landing: str
+    mart: str
+    staging: Staging
+    result: subprocess.CompletedProcess
+
+    @property
+    def ok(self) -> bool:
+        return self.result.returncode == 0
+
+    @property
+    def output(self) -> str:
+        return self.result.stdout + self.result.stderr
+
+    def statuses(self) -> dict[str, str]:
+        """Every node dbt ran, and what it said. A gate that did not run at all is a
+        different failure from a gate that ran and passed, and only this tells them
+        apart."""
+        import json
+
+        path = DBT_PROJECT / "target" / "run_results.json"
+        results = json.loads(path.read_text(encoding="utf-8"))["results"]
+        return {r["unique_id"]: r["status"] for r in results}
+
+    def failed_tests(self) -> set[str]:
+        """The test nodes dbt reported as failing, by their full unique id.
+
+        Read from run_results.json rather than scraped out of the log: a gate is
+        asserted by name, and a substring match against console output would pass on a
+        message that merely mentioned the name.
+
+        The whole id, not its last segment. A generic test's id is
+        `test.<project>.<name>.<hash>`, so the last segment is the hash - matching
+        against it finds nothing, silently, for every gate declared in YAML.
+        """
+        import json
+
+        path = DBT_PROJECT / "target" / "run_results.json"
+        results = json.loads(path.read_text(encoding="utf-8"))["results"]
+        return {
+            r["unique_id"] for r in results if r["status"] in ("fail", "error")
+        }
+
+
+def dbt_env(landing: str, mart: str) -> dict:
+    values = dict(os.environ)
+    values.update(settings())
+    values["POSTGRES_LANDING_SCHEMA"] = landing
+    values["POSTGRES_MART_SCHEMA"] = mart
+    return values
+
+
+def run_dbt(args: list[str], landing: str, mart: str) -> subprocess.CompletedProcess:
+    """Invoke dbt as a subprocess against this build's own schemas.
+
+    A subprocess rather than dbt's Python entry point, because what CI runs is the
+    command, and a gate that only fires through an in-process API is a gate whose
+    behaviour in CI is untested.
+    """
+    return subprocess.run(
+        [sys.executable, "-m", "dbt.cli.main", *args,
+         "--project-dir", str(DBT_PROJECT), "--profiles-dir", str(DBT_PROJECT)],
+        env=dbt_env(landing, mart),
+        capture_output=True,
+        text=True,
+    )
+
+
+@pytest.fixture
+def mart(request, db):
+    """Load a staging directory into schemas of this test's own, and build.
+
+    `mutate` runs after the load and before the build - that is where a scenario
+    plants the failure its gate is supposed to stop.
+    """
+    from transform import load as mart_load
+
+    landing = schema_for(request.node.nodeid, TEST_LANDING_SCHEMA)
+    mart_schema = schema_for(request.node.nodeid, TEST_MART_SCHEMA)
+
+    def build(staging: Staging, mutate=None, dbt_args=None, command="build") -> Build:
+        mart_load.load_all(
+            staging_dir=staging.staging, raw_dir=staging.raw, schema=landing
+        )
+        if mutate is not None:
+            mutate(db, landing)
+        result = run_dbt([command, *(dbt_args or [])], landing, mart_schema)
+        return Build(landing=landing, mart=mart_schema, staging=staging, result=result)
+
+    yield build
+
+    with db.cursor() as cursor:
+        for schema in (landing, mart_schema, mart_schema + AUDIT_SUFFIX):
+            cursor.execute(f'DROP SCHEMA IF EXISTS "{schema}" CASCADE')
+    db.commit()

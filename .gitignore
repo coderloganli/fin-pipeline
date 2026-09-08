@@ -12,4 +12,6 @@ data/
 target/
 dbt_packages/
 logs/
+# dbt writes this beside the project: an anonymous id for its own telemetry.
+.user.yml
 .DS_Store
