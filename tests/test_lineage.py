@@ -40,14 +40,9 @@ def manifest_path() -> Path:
 
 
 @pytest.fixture(scope="module")
-def manifest():
-    path = manifest_path()
-    if not path.is_file():
-        raise AssertionError(
-            f"no manifest at {path}. It is written by any dbt command that parses the "
-            f"project; run `dbt parse` or `dbt build`."
-        )
-    return json.loads(path.read_text(encoding="utf-8"))
+def manifest(dbt_manifest):
+    """The parsed manifest. `dbt_manifest` builds it if the working tree has none."""
+    return json.loads(Path(dbt_manifest).read_text(encoding="utf-8"))
 
 
 def contract_yaml(table: str) -> dict:
@@ -126,7 +121,7 @@ def test_the_walk_is_transitive(manifest):
 
 # --- cases 65-68: what validation says now ---------------------------------
 
-def test_a_dropped_column_names_the_downstream_models(tmp_path):
+def test_a_dropped_column_names_the_downstream_models(tmp_path, dbt_manifest):
     """65. The acceptance criterion from the first phase that went unmet. docs/adr/0012
     said the downstream impact was unknown because there was no graph to ask."""
     from generator import generate

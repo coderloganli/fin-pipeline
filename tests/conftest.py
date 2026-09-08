@@ -263,6 +263,35 @@ def run_dbt(args: list[str], landing: str, mart: str) -> subprocess.CompletedPro
     )
 
 
+@pytest.fixture(scope="session")
+def dbt_manifest() -> Path:
+    """The manifest, built if it is not on disk.
+
+    `target/` is ignored, so a fresh clone has no manifest and neither does CI - which
+    runs the suite before it generates the docs, and has to, because a graph of a
+    project whose tests have not run is a graph of something nobody has checked. The
+    tests that read the manifest therefore build it rather than assuming it: `dbt parse`
+    writes one and does not touch the database.
+    """
+    target = DBT_PROJECT / "target" / "manifest.json"
+    if target.is_file():
+        return target
+
+    result = subprocess.run(
+        [sys.executable, "-m", "dbt.cli.main", "parse",
+         "--project-dir", str(DBT_PROJECT), "--profiles-dir", str(DBT_PROJECT)],
+        env=dbt_env(TEST_LANDING_SCHEMA, TEST_MART_SCHEMA),
+        capture_output=True,
+        text=True,
+    )
+    if not target.is_file():
+        raise AssertionError(
+            f"`dbt parse` wrote no manifest at {target}:\n"
+            f"{result.stdout}\n{result.stderr}"
+        )
+    return target
+
+
 @pytest.fixture
 def mart(request, db):
     """Load a staging directory into schemas of this test's own, and build.

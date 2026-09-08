@@ -266,17 +266,25 @@ def test_a_staging_model_lands_whole(mart, clean_staging, db):
 
 # --- cases 9-11: the settings both the loader and this suite resolve --------
 
-def test_settings_resolve_environment_then_env_file_then_default(tmp_path, monkeypatch):
+def test_settings_resolve_environment_then_env_file_then_default(tmp_path):
     """9. Every setting, the two schema names included. Compose reads `.env` and pytest
-    otherwise would not: editing it has to move the database and the tests together."""
+    otherwise would not: editing it has to move the database and the tests together.
+
+    The environment is passed in rather than patched. `settings` takes it as an argument
+    for the same reason it takes the repository root — and it matters here rather than
+    only being tidy: CI sets `POSTGRES_MART_SCHEMA` for the job, so a test reading the
+    real environment would find the ambient value winning over the file it just wrote and
+    fail on a machine where the setting works exactly as designed.
+    """
     from transform import db as transform_db
 
     (tmp_path / ".env").write_text(
         "POSTGRES_DB=from_file\nPOSTGRES_MART_SCHEMA=mart_from_file\n", encoding="utf-8"
     )
-    monkeypatch.setenv("POSTGRES_DB", "from_environment")
 
-    values = transform_db.settings(repo_root=tmp_path)
+    values = transform_db.settings(
+        repo_root=tmp_path, env={"POSTGRES_DB": "from_environment"}
+    )
 
     assert values["POSTGRES_DB"] == "from_environment"
     assert values["POSTGRES_MART_SCHEMA"] == "mart_from_file"
@@ -289,25 +297,26 @@ def test_settings_resolve_environment_then_env_file_then_default(tmp_path, monke
     assert set(values) == set(transform_db.DEFAULTS)
     for key in transform_db.DEFAULTS:
         (tmp_path / ".env").write_text(f"{key}=from_file\n", encoding="utf-8")
-        monkeypatch.delenv(key, raising=False)
-        assert transform_db.settings(repo_root=tmp_path)[key] == "from_file", key
-        monkeypatch.setenv(key, "from_environment")
-        assert transform_db.settings(repo_root=tmp_path)[key] == "from_environment", key
-        monkeypatch.delenv(key)
+        from_file = transform_db.settings(repo_root=tmp_path, env={})
+        assert from_file[key] == "from_file", key
+        from_env = transform_db.settings(
+            repo_root=tmp_path, env={key: "from_environment"}
+        )
+        assert from_env[key] == "from_environment", key
 
 
 def test_settings_takes_its_root_as_an_argument(tmp_path):
-    """10. Not as a module global. `tests/test_environment.py` monkeypatches the root
-    to test `.env` precedence, and a resolver reading its own globals would quietly
+    """10. Not as a module global. `tests/test_environment.py` used to monkeypatch the
+    root to test `.env` precedence, and a resolver reading its own globals would quietly
     stop being affected by that."""
     from transform import db as transform_db
 
     (tmp_path / ".env").write_text("POSTGRES_USER=someone_else\n", encoding="utf-8")
+    here = transform_db.settings(repo_root=tmp_path, env={})
+    elsewhere = transform_db.settings(repo_root=tmp_path / "elsewhere", env={})
 
-    assert transform_db.settings(repo_root=tmp_path)["POSTGRES_USER"] == "someone_else"
-    assert transform_db.settings(repo_root=tmp_path / "elsewhere")["POSTGRES_USER"] != (
-        "someone_else"
-    )
+    assert here["POSTGRES_USER"] == "someone_else"
+    assert elsewhere["POSTGRES_USER"] == transform_db.DEFAULTS["POSTGRES_USER"]
 
 
 def test_conftest_re_exports_rather_than_copies():
