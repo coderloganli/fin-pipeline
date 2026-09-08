@@ -21,7 +21,8 @@ load that lands entries in the raw layer, and the run record every load writes.
 `transform/spark/` has the SCD2 loader — which builds the two dimensions and the
 exchange rate alike — the point-in-time fact build, and the monthly aggregation; it is
 also what first installs PySpark. `transform/load.py` copies the staging layer into
-Postgres and `transform/dbt/` models it as a star with six quality gates over it;
+Postgres and `transform/dbt/` models it as a star with six quality gates over it; late
+entries, adjustments and dimension changes recompute only the periods they affect;
 `transform/lineage.py` renders the graph and answers what a column change would break.
 `ml/`, `insight/`, `app/` and `dags/` exist and each carries a README stating what that
 layer is and is not responsible for, but no module has landed in them. Read the READMEs
@@ -185,8 +186,8 @@ whose grain has no vendor.
 feeds.** dbt's graph starts at the landing tables; the hop from `gl_entry.csv` to one of
 them happens inside `transform/spark/` and appears in no manifest, so every contract
 declares a `feeds` list of dbt source names and `transform/lineage.py` walks `child_map`
-downward from them. `gl_adjustment` declares `feeds: []` because nothing consumes it
-yet, and validation says so rather than reporting an unknown. The HTML artefact is
+downward from them. Every contract now names something: `gl_adjustment` reaches
+`mart.fct_gl_adjustment`, and the empty `feeds` it used to declare is gone. The HTML artefact is
 rendered here rather than by `dbt docs generate --static`, which does not embed the
 artefacts it documents (dbt-labs/dbt-core#11986, open) and which dbt Docs v2 replaced
 with a multi-file site. See docs/adr/0035 and 0037.
@@ -243,17 +244,64 @@ period, zero where nothing posted — because a period-over-period comparison ov
 sparse table silently becomes a comparison with the last month that had activity. Zero
 and null are different facts and stay different. See docs/adr/0032 and 0033.
 
-**Staging is typed, and it is rebuilt.** Raw holds text and accumulates because it is
-the record; staging holds dates and booleans and is overwritten because it is derived
-from raw and can always be recomputed. See docs/adr/0026.
+**Staging is typed; the dimensions are rebuilt and the facts are partitioned.** Raw
+holds text and accumulates because it is the record; staging holds dates and booleans
+and is derived from raw, so it can always be recomputed. The three dimensions are tens
+of rows and are overwritten whole. `fct_gl_entry`, `fct_gl_adjustment` and
+`agg_monthly_balance` are partitioned by `accounting_period`, matching the raw layout,
+and a run rewrites only the partitions it has reason to — a run with no dirty set
+rewrites all of them, which is the overwrite this used to be. See docs/adr/0026.
 
 **What is not modelled: the source correcting when a change took effect.** A version
 restating an effective date already given would need a second time axis — when it took
 effect, and when we learned of it — and reports would have to distinguish what was
 published from what is now believed. It is out of scope, an extract that contradicts a
-held version fails, and the gap it exposes is recorded: affected periods are derived
-from entries' accounting dates, and a dimension change produces no entry, so it
-currently triggers no recomputation. See docs/adr/0027.
+held version fails. The gap it once exposed — a dimension change producing no entry and
+therefore triggering no recomputation — is closed; see the affected-period entry above.
+See docs/adr/0027.
+
+**A run records which periods it dirtied.** Both merge paths already knew — one groups
+its batch by period, the other counts an update only when a declared column actually
+differs — and both used to throw it away. `ingest/affected.py` keeps it in
+`data/raw/_state/affected_periods.json`, unioned across runs and cleared by the
+orchestrator rather than by whatever read it, so an interrupted transform leaves the work
+still owed. Two triggers, not one: an entry landing in a period, and a dimension version
+taking effect over one. All three effective-dated tables declare `rows_are_immutable`, so
+a dimension change can only be the insert of a new `(natural key, effective_date)`
+version, which makes that trigger exact. Ingest records those inserts as observations;
+`transform/spark/affected.py` turns each into the periods its validity interval covers,
+intersected with the periods carrying entries on that key. `fx_rate` counts, like the two
+org dimensions. See docs/adr/0039.
+
+**A dirty period drags its windows with it, and recomputation bounds writes rather
+than reads.** `balances.py` computes month-on-month with `lag(1)`, year-on-year with
+`lag(12)` and the rolling mean over three periods, so a dirty period M also dirties M+1,
+M+2 and M+12 — a closure computed from those constants rather than written down beside
+them, because widening a window would otherwise leave the backfill quietly skipping
+periods it had changed. Only the closure is written. Reading is wider: the dense grid's
+membership and the type carried into an empty period are properties of the whole fact
+table, so every partition is still read for two or five string columns, which is what
+columnar storage costs and the same trade docs/adr/0016 made for the key sweep. The
+criterion is about modification times, and a read does not change one. See
+docs/adr/0040 and 0041.
+
+**An adjustment is a fact of its own.** `gl_adjustment` was ingested and consumed by
+nothing; it is now `fct_gl_adjustment`, attributed by the same three point-in-time joins
+as an entry. It is not folded into `fct_gl_entry` because gate 3 requires the rows
+sharing a `doc_id` to balance, and an adjustment is a single-sided delta against a
+voucher that already balanced — folding it in would turn a gate red on correct data. It
+carries the gates that apply to it and not that one. See docs/adr/0042.
+
+**A report gives two bases, and one column bridges them.** `agg_monthly_balance` carries
+`balance_as_reported` — entries and corrections — `restatement_delta`, and
+`balance_as_restated`, their sum. A correction amends the period's figure; a restatement
+keeps the original basis and presents a new one alongside it, which is the distinction
+docs/product.md puts at the centre of what this platform is for. One row, one grain, so
+the dense grid and the drift gate keep their current arguments. The delta is the seam: if
+master-data restatement is ever brought into scope it contributes to a delta beside this
+one rather than needing a mechanism of its own. The windowed columns derive from the
+restated basis, because that is the answer a report shows. `balance` is gone. See
+docs/adr/0043.
 
 **The load is watermarked, and the merge is what makes a rerun free.** Each contract
 names the column its table advances on: `gl_entry` and `gl_adjustment` advance on

@@ -113,7 +113,12 @@ def test_the_widest_spark_decimal_survives(mart, clean_staging, db):
 
     assert types["debit_total"] == "numeric(38,2)"
     assert types["credit_total"] == "numeric(38,2)"
-    assert types["balance"] == "numeric(38,2)"
+    # All three balance columns, because the widening applies to each: the delta is a
+    # sum of the same amounts and the restated figure is a sum of two of these. See
+    # docs/adr/0043.
+    assert types["balance_as_reported"] == "numeric(38,2)"
+    assert types["restatement_delta"] == "numeric(38,2)"
+    assert types["balance_as_restated"] == "numeric(38,2)"
 
 
 def test_a_decimal_survives_the_round_trip_exactly(mart, clean_staging, db, spark):
@@ -399,3 +404,97 @@ def test_the_loader_writes_into_the_configured_schema(mart, clean_staging, db):
     assert build.landing != "landing"
     assert row_count(db, build.landing, "fct_gl_entry") > 0
     assert landing_writes() == before
+
+
+# --- a partitioned staging model across the boundary (ADR 0026, 0041) -------
+#
+# Case 38 of task.md. `fct_gl_entry` and `agg_monthly_balance` are partitioned by
+# accounting period, so the column exists only in the directory names and pyarrow has
+# to be told what type to give it back. `postgres_schema` matches types exactly and
+# refuses what it has not seen - a dictionary-typed partition column would stop the
+# load - and `copy_types` and the DDL both read the same Arrow schema, so the order
+# they see has to be the order `copy_rows` writes.
+
+
+def test_a_partitioned_model_crosses_the_boundary_whole(db, clean_staging):
+    """Case 38. The whole boundary, not just the type: exactly one occurrence, values
+    taken from the directory names, every partition on disk represented, one order for
+    the DDL and the binary copy, and the row count unchanged."""
+    import pyarrow as pa
+
+    from transform import load as mart_load
+
+    schema_name = "landing_case38"
+    with db.cursor() as cursor:
+        cursor.execute(f'DROP SCHEMA IF EXISTS "{schema_name}" CASCADE')
+    db.commit()
+
+    directory = mart_load.parquet_dir(clean_staging.staging, clean_staging.raw,
+                                      "agg_monthly_balance")
+    on_disk = {path.name.split("=", 1)[1]
+               for path in directory.glob("accounting_period=*")}
+    assert on_disk, "the model is not partitioned on disk"
+
+    table = mart_load.read_table(directory, mart_load.columns_for("agg_monthly_balance"),
+                                 partitioned=True)
+    names = table.column_names
+
+    assert names.count("accounting_period") == 1
+    assert table.schema.field("accounting_period").type == pa.string()
+    assert set(table.column("accounting_period").to_pylist()) == on_disk
+
+    declared = [name for name, _ in mart_load.postgres_schema(table.schema)]
+    assert declared == names
+    assert len(mart_load.copy_types(table.schema)) == len(names)
+
+    try:
+        landed = mart_load.load_all(
+            staging_dir=clean_staging.staging, raw_dir=clean_staging.raw,
+            schema=schema_name, models=["agg_monthly_balance"],
+        )
+        assert landed["agg_monthly_balance"] == table.num_rows
+        assert column_types(db, schema_name, "agg_monthly_balance")[
+            "accounting_period"] == "text"
+    finally:
+        with db.cursor() as cursor:
+            cursor.execute(f'DROP SCHEMA IF EXISTS "{schema_name}" CASCADE')
+        db.commit()
+
+
+def test_the_adjustment_fact_is_landed(db, clean_staging):
+    """Case 39, first half. `gl_adjustment` was ingested and consumed by nothing; the
+    loader is where it stops being."""
+    from transform import load as mart_load
+
+    assert "fct_gl_adjustment" in mart_load.MODELS
+
+    schema_name = "landing_case39"
+    try:
+        landed = mart_load.load_all(
+            staging_dir=clean_staging.staging, raw_dir=clean_staging.raw,
+            schema=schema_name, models=["fct_gl_adjustment"],
+        )
+        assert landed["fct_gl_adjustment"] > 0
+        types = column_types(db, schema_name, "fct_gl_adjustment")
+        assert "adjusts_entry_id" in types
+        assert "adjustment_type" in types
+    finally:
+        with db.cursor() as cursor:
+            cursor.execute(f'DROP SCHEMA IF EXISTS "{schema_name}" CASCADE')
+        db.commit()
+
+
+def test_a_partitioned_model_with_no_partitions_says_so(tmp_path):
+    """A partitioned model holding nothing has no schema to land, so the loader stops
+    and says which directory - rather than falling through to Parquet schema inference
+    and failing with a message about Arrow. Breaking is better than drifting."""
+    from transform import load as mart_load
+
+    empty = tmp_path / "fct_gl_entry"
+    empty.mkdir()
+
+    with pytest.raises(mart_load.EmptyStagingModel) as failure:
+        mart_load.read_table(empty, None, partitioned=True)
+
+    assert "fct_gl_entry" in str(failure.value)
+    assert "staging build" in str(failure.value)

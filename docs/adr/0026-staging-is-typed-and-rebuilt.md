@@ -17,11 +17,21 @@ Staging is Parquet with real types. `valid_from` and `valid_to` are dates,
 `is_current` is a boolean, and the natural key and attribute columns stay strings
 because that is what they are.
 
-Staging is written with `mode("overwrite")`. It is rebuilt from the raw layer on every
-run, and holds nothing that cannot be recomputed from it.
+Staging holds nothing that cannot be recomputed from the raw layer.
 
-Models land at `data/staging/<model>/`, unpartitioned, and the file names inside are
-Spark's.
+**The dimensions are rebuilt whole.** `dim_account`, `dim_cost_center`, `dim_fx_rate`
+are written with `mode("overwrite")` at `data/staging/<model>/`, unpartitioned, and the
+file names inside are Spark's.
+
+**The fact tables and the aggregate are partitioned by accounting period, and a run
+rewrites only the partitions it has reason to.** `fct_gl_entry`, `fct_gl_adjustment` and
+`agg_monthly_balance` land at
+`data/staging/<model>/accounting_period=YYYY-MM/`, matching the raw layer's layout. A
+run with no dirty set rewrites every partition and is the same thing as the overwrite
+this record originally specified. A partition is written by overwriting its own
+directory rather than by writing the table with `partitionBy`, because Spark's default
+`partitionOverwriteMode` of `STATIC` replaces the whole table directory. See
+`docs/adr/0041`.
 
 ## Reasoning
 
@@ -50,5 +60,22 @@ carries its writer's version, so byte comparison was never going to be the check
 single output file per model comes from coalescing before the write; at these row
 counts that costs nothing and keeps the layer readable by hand.
 
-Unpartitioned, because these dimensions are tens of rows. `fct_gl_entry` is a
-different question and belongs to the ticket that builds it.
+Unpartitioned, because these dimensions are tens of rows.
+
+**The fact and the aggregate were the different question this record deferred, and the
+answer is not the same one.** Overwrite is still the right default for a derived layer,
+and it stays the behaviour of a run that has no dirty set to work from. What changed is
+that a late entry is a normal event rather than an exceptional one, so "rebuilt" and
+"rewritten whole every time" stopped being the same statement. A correction to March
+recomputes March and the periods whose windows read through it, and the other partitions
+are not opened - which is the property `docs/adr/0016` already gives the raw layer, at
+the layer where the acceptance criterion is checked.
+
+Overwrite's original argument survives intact underneath this: everything in staging is
+still a function of raw, nothing here is a record, and a full rebuild is always
+available and always produces the same answer. Selective rewriting is an optimisation
+that is required to be indistinguishable from the rebuild, and
+`docs/adr/0041` is what keeps it so - the dirty set scopes writes, not reads, precisely
+so that a partially recomputed table cannot disagree with a fully recomputed one.
+
+See `docs/adr/0039`, `0040` and `0041`.

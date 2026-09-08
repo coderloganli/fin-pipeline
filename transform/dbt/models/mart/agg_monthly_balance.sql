@@ -31,7 +31,16 @@ select
 
     balances.debit_total,
     balances.credit_total,
-    balances.balance,
+
+    -- Two bases and the column that bridges them. `balance_as_reported` is entries and
+    -- corrections - a correction amends the period's figure, so after it lands there is
+    -- one number and it is the amended one. `restatement_delta` is the restatements
+    -- alone, signed the same way, and it is the figure an analyst asking "what changed"
+    -- actually wants. `balance_as_restated` is their sum, stored rather than left to the
+    -- reader. See docs/adr/0043.
+    balances.balance_as_reported,
+    balances.restatement_delta,
+    balances.balance_as_restated,
 
     balances.balance_delta_mom,
     balances.balance_pct_mom,

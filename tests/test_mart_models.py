@@ -33,7 +33,11 @@ RUN_ID = re.compile(r"\d{8}T\d{6}Z-[0-9a-f]{6}")
 # The aggregate's measures, and the columns whose null means something. A comparison
 # that skipped the null-bearing ones would pass a mart that lost every percentage.
 AGGREGATE_COLUMNS = (
-    "debit_total", "credit_total", "balance", "account_type",
+    "debit_total", "credit_total", "account_type",
+    # All three bases, not just the restated one: a comparison that checked only the
+    # number the report shows would pass a mart that had lost the as-reported view,
+    # which is half of what this ticket built. See docs/adr/0043.
+    "balance_as_reported", "restatement_delta", "balance_as_restated",
     "balance_delta_mom", "balance_pct_mom",
     "balance_delta_yoy", "balance_pct_yoy",
     "balance_rolling_3m",
@@ -418,3 +422,58 @@ def test_the_fact_keeps_the_run_that_landed_the_source(mart, clean_staging, db, 
     }
 
     assert landed == staged
+
+
+# --- the adjustment fact and the two bases (ADR 0042, 0043) -----------------
+#
+# Cases 39-41 of task.md.
+
+
+def test_the_adjustment_fact_is_widened_with_its_names(mart, clean_staging, db):
+    """Case 39. The same widening as the entry fact: the application reads this layer
+    and computes nothing, so the names are here rather than in a join every query
+    repeats."""
+    build = mart(clean_staging)
+
+    assert row_count(db, build.mart, "fct_gl_adjustment") > 0
+    missing = query(
+        db,
+        f"""SELECT count(*) FROM "{build.mart}".fct_gl_adjustment
+            WHERE account_name IS NULL OR cost_center_name IS NULL""",
+    )[0][0]
+    assert missing == 0
+
+    wrong = query(
+        db,
+        f"""SELECT count(*) FROM "{build.mart}".fct_gl_adjustment f
+            JOIN "{build.mart}".dim_vendor v ON v.vendor_code = f.vendor_code
+            WHERE f.vendor_name IS DISTINCT FROM v.name""",
+    )[0][0]
+    assert wrong == 0
+
+
+def test_the_aggregate_exposes_both_bases_and_not_the_old_column(mart, clean_staging,
+                                                                 db):
+    """Case 40. Three columns in place of one, and the reader can add the delta to the
+    reported figure and get the restated one."""
+    build = mart(clean_staging)
+    columns = {
+        row[0]
+        for row in query(
+            db,
+            """SELECT column_name FROM information_schema.columns
+               WHERE table_schema = %s AND table_name = 'agg_monthly_balance'""",
+            (build.mart,),
+        )
+    }
+
+    assert {"balance_as_reported", "restatement_delta", "balance_as_restated"} <= columns
+    assert "balance" not in columns
+
+    disagreeing = query(
+        db,
+        f"""SELECT count(*) FROM "{build.mart}".agg_monthly_balance
+            WHERE balance_as_restated
+                IS DISTINCT FROM balance_as_reported + restatement_delta""",
+    )[0][0]
+    assert disagreeing == 0

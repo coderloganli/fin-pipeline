@@ -20,6 +20,7 @@
 
 {% set counted = [
     'fct_gl_entry',
+    'fct_gl_adjustment',
     'agg_monthly_balance',
     'dim_account',
     'dim_cost_center',

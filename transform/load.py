@@ -25,7 +25,8 @@ from pathlib import Path
 
 from transform import db
 
-__all__ = ["MODELS", "UnmappedType", "postgres_schema", "copy_rows", "load_model",
+__all__ = ["MODELS", "UnmappedType", "EmptyStagingModel", "postgres_schema",
+           "copy_rows", "load_model",
            "load_all", "main"]
 
 
@@ -46,6 +47,7 @@ class UnmappedType(TypeError):
 # ingestion metadata is reached through the run record. See docs/adr/0020 and 0034.
 STAGING_MODELS = (
     "fct_gl_entry",
+    "fct_gl_adjustment",
     "agg_monthly_balance",
     "dim_account",
     "dim_cost_center",
@@ -53,6 +55,14 @@ STAGING_MODELS = (
 )
 RAW_MODELS = {"dim_vendor": "dim_vendor"}
 MODELS = STAGING_MODELS + tuple(RAW_MODELS)
+
+# The staging models partitioned by accounting period. The column lives in the
+# directory name rather than in the Parquet files, so pyarrow has to be told what type
+# to give it back: left to infer, it produces a dictionary type, which `postgres_schema`
+# refuses rather than guessing at - correctly, but the load would stop on a correct
+# layer. See docs/adr/0026 and 0041.
+PARTITIONED_MODELS = ("fct_gl_entry", "fct_gl_adjustment", "agg_monthly_balance")
+PARTITION_COLUMN = "accounting_period"
 
 # How many rows to hand the copy at a time. Large enough that the round trips do not
 # dominate, small enough that a fact table does not have to be resident to be written.
@@ -131,10 +141,51 @@ def columns_for(model: str) -> list[str] | None:
     return raw_layer.columns_of(contracts.load(RAW_MODELS[model]))
 
 
-def read_table(directory: Path, columns: list[str] | None):
+class EmptyStagingModel(FileNotFoundError):
+    """A partitioned staging model holds no partitions at all.
+
+    Not an empty table: with no Parquet file anywhere under it there is no schema to
+    read, so there is nothing to create the landing table from. It means the staging
+    build has not run, or ran over a raw layer with no rows in it. Saying so is better
+    than a message about Parquet schema inference, and stopping is better than
+    inventing a shape - see docs/product.md, breaking is better than drifting.
+    """
+
+
+def read_table(directory: Path, columns: list[str] | None, *, partitioned: bool = False):
+    """One model's Parquet, as one Arrow table.
+
+    A partitioned model is read as a dataset with the partition field declared as a
+    plain string. Hive discovery would otherwise hand back a dictionary-encoded column,
+    and `postgres_schema` matches types exactly and stops on anything it has not seen -
+    so a correct staging layer would fail to load, with a message about a type rather
+    than about partitioning.
+
+    Whether to read it that way comes from the model, not from what happens to be on
+    disk: a partitioned model that currently holds no partitions is a different thing
+    from an unpartitioned one, and guessing from the directory would send it down the
+    unpartitioned path to fail on schema inference.
+
+    The DDL, `copy_types` and `copy_rows` all read this one Arrow schema, so whatever
+    order the partition column arrives in is the order all three use.
+    """
+    import pyarrow as pa
+    import pyarrow.dataset as ds
     import pyarrow.parquet as pq
 
-    table = pq.read_table(directory)
+    if partitioned:
+        if not any(directory.rglob("*.parquet")):
+            raise EmptyStagingModel(
+                f"{directory} holds no partitions, so there is no schema to land. "
+                f"Run the staging build first."
+            )
+        partitioning = ds.HivePartitioning(
+            pa.schema([(PARTITION_COLUMN, pa.string())])
+        )
+        table = ds.dataset(directory, format="parquet",
+                           partitioning=partitioning).to_table()
+    else:
+        table = pq.read_table(directory)
     return table.select(columns) if columns is not None else table
 
 
@@ -157,7 +208,8 @@ def copy_rows(cursor, schema: str, model: str, table) -> None:
 def load_model(connection, staging_dir, raw_dir, schema: str, model: str) -> int:
     """Drop, create and copy one model, in one transaction."""
     directory = parquet_dir(staging_dir, raw_dir, model)
-    table = read_table(directory, columns_for(model))
+    table = read_table(directory, columns_for(model),
+                       partitioned=model in PARTITIONED_MODELS)
     definition = ", ".join(
         f'"{name}" {kind}' for name, kind in postgres_schema(table.schema)
     )

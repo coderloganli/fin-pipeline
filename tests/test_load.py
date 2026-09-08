@@ -614,7 +614,7 @@ def test_the_watermark_temporary_file_is_cleaned_up_when_the_write_fails(
 
     assert state.read_text(encoding="utf-8") == before
     assert sorted(path.name for path in (raw_dir / "_state").iterdir()) == [
-        "runs.jsonl", "watermarks.json"
+        "affected_periods.json", "runs.jsonl", "watermarks.json"
     ]
 
 
@@ -1163,7 +1163,7 @@ def test_the_watermark_file_is_replaced_rather_than_rewritten_in_place(source, r
 
     assert (raw_dir / "_state" / "watermarks.json").read_text(encoding="utf-8") == before
     assert sorted(p.name for p in (raw_dir / "_state").iterdir()) == [
-        "runs.jsonl", "watermarks.json"
+        "affected_periods.json", "runs.jsonl", "watermarks.json"
     ]
 
 
@@ -1418,10 +1418,10 @@ def test_evict_moved_keys_keeps_the_first_run_on_the_rows_it_leaves(raw_dir):
     ], run_id=RUN_A)
 
     evicted, rewritten = load.evict_moved_keys(
-        GL_ENTRY, raw_dir, {("E2", "1"): "2026-02"}, run_id=RUN_B
+        GL_ENTRY, raw_dir, {("E2", "1"): "2026-02"}, run_id=RUN_B, record=False
     )
 
-    assert (evicted, rewritten) == (1, 1)
+    assert (evicted, rewritten) == (1, ["2026-01"])
     kept = raw.read_partition(GL_ENTRY, january, metadata=True)
     assert [row["entry_id"] for row in kept] == ["E1"]
     assert (kept[0]["_first_run_id"], kept[0]["_last_run_id"]) == (RUN_A, RUN_B)

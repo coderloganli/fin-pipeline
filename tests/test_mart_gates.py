@@ -573,3 +573,64 @@ def test_the_tolerance_is_load_bearing(mart, clean_staging, db):
         "no line disagrees at all, so this gate would pass with a tolerance of zero "
         "and proves nothing about the tolerance it declares"
     )
+
+
+# --- gates over the adjustment fact (ADR 0042) ------------------------------
+#
+# Cases 42-45 of task.md. It carries the gates that apply to it - key uniqueness,
+# referential integrity, and the amount agreement - and not gate 3, because it is not a
+# voucher and never was.
+
+
+def test_a_duplicated_adjustment_key_turns_its_gate_red(mart, clean_staging):
+    """Case 42. The same property gate 1 asserts for entries: one row per version."""
+    build = mart(clean_staging, mutate=duplicate_a_row("fct_gl_adjustment"))
+
+    assert_failed(build, "unique_fct_gl_adjustment_entry_id_version")
+
+
+def test_an_orphan_adjustment_key_turns_referential_integrity_red(mart, clean_staging):
+    """Case 43. An adjustment attributed to a dimension row that is not there. Gate 2
+    for the new fact."""
+    build = mart(
+        clean_staging,
+        mutate=sql(
+            'UPDATE "{schema}".fct_gl_adjustment SET account_key = \'nope\' '
+            "WHERE entry_id = (SELECT min(entry_id) FROM \"{schema}\".fct_gl_adjustment)"
+        ),
+    )
+
+    assert_failed(build, "relationships_fct_gl_adjustment_account_key")
+
+
+def test_a_mangled_adjustment_amount_turns_the_rate_gate_red(mart, clean_staging):
+    """Case 44. Gate 6 is a gate on the load path and the numeric types, and the
+    adjustment fact crosses the same load path."""
+    build = mart(
+        clean_staging,
+        mutate=sql(
+            'UPDATE "{schema}".fct_gl_adjustment SET amount_dr_base = amount_dr_base + 5 '
+            "WHERE entry_id = (SELECT min(entry_id) FROM \"{schema}\".fct_gl_adjustment)"
+        ),
+    )
+
+    assert_failed(build, "amounts_agree_with_the_rate")
+
+
+def test_the_voucher_gate_stays_green_with_adjustments_in_the_mart(mart, clean_staging,
+                                                                   db):
+    """Case 45. The case that decided the shape. An adjustment is a single-sided delta
+    against a voucher that already balanced, so folding it into `fct_gl_entry` would
+    turn gate 3 red on a correct ledger - see docs/adr/0042."""
+    build = mart(clean_staging)
+
+    # The precondition is the whole test. Gate 3 is trivially green on a mart holding no
+    # adjustments, so without this the case passes before the feature exists and asserts
+    # nothing whatever.
+    with db.cursor() as cursor:
+        cursor.execute(f'SELECT count(*) FROM "{build.mart}".fct_gl_adjustment')
+        adjustments = cursor.fetchone()[0]
+    assert adjustments > 0, "no adjustments reached the mart; the case would be vacuous"
+
+    assert build.ok, build.output
+    assert not [name for name in build.failed_tests() if "vouchers_are_balanced" in name]
