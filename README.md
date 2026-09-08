@@ -2,12 +2,14 @@
 
 A finance data platform where the hard problems are data engineering ones: point-in-time correctness, slowly changing dimensions, late-arriving corrections, idempotent replay, schema contracts, and partitioned scale. An LLM layer sits on top as a consumer of the warehouse, not as its centrepiece.
 
-**Status: the ingest layer is built; everything downstream of it is not.** The
+**Status: the batch path is built, from the generator to a queryable mart.** The
 generator, the source-table contracts and their validator, the watermarked idempotent
-load, and the run record have landed. `transform/`, `ml/`, `insight/`, `app/` and
-`dags/` carry a README stating what each is for and no module yet. `docs/architecture.md`
-is the file that says what is actually true today; the rest of this one describes what
-the platform is for. No measured numbers are published yet.
+load, the run record, the SCD2 dimensions, the point-in-time fact, the monthly balances,
+and the mart those become in Postgres — a star with six quality gates over it and a
+lineage graph that names what a source change would break. `ml/`, `insight/`, `app/` and
+`dags/` carry a README stating what each is for and no module yet.
+`docs/architecture.md` is the file that says what is actually true today; the rest of
+this one describes what the platform is for. No measured numbers are published yet.
 
 ## Why this exists
 
@@ -162,7 +164,7 @@ way the Python interpreter is; see `docs/adr/0028-spark-runs-in-process.md`.
 
 ```
 docker compose up -d          # Postgres, on 127.0.0.1:5432
-pip install -e ".[dev,spark]"
+pip install -e ".[dev,spark,dbt]"
 pytest -q
 ```
 
@@ -191,24 +193,30 @@ it work.
 
 ## Quality gates
 
-Three gates are planned. **One of them exists today**, and this section says which,
+Three gates are planned. **Two of them exist today**, and this section says which,
 because a list of gates is exactly the kind of claim worth being able to check:
 
 - **contract validation at ingest — built.** `python -m ingest.validate` applies each
   source table's contract; an added column warns and the run continues, and a missing
   column, a reordering, a value that no longer fits its declared type or rule, a
-  repeated primary key, or a broken row constraint fails it. It runs inside the pytest
-  suite rather than as its own CI step, and it cannot yet name the downstream models a
-  failure would break — that needs a lineage graph, and dbt has not landed. See
-  `docs/adr/0012`.
-- **dbt tests after transformation — not built.** Uniqueness, referential integrity,
-  debit/credit reconciliation, SCD2 interval consistency, row-count drift.
-- **pytest — built, over what exists.** The generator's failure modes, the contracts
-  and the validator, the raw layer, and the watermarked merge's idempotency. The
-  point-in-time join, SCD2 loading and backfill scoping are not covered because they
-  are not written.
+  repeated primary key, or a broken row constraint fails it. A failure now names the
+  downstream models it would break, read off dbt's manifest. See `docs/adr/0012` and
+  `0035`.
+- **dbt tests after transformation — built.** Six of them: primary key uniqueness,
+  referential integrity, debit and credit balancing per voucher, SCD2 validity intervals
+  that neither overlap nor gap, row-count drift against the median of recent builds, and
+  agreement between base-currency and original amounts within a rounding tolerance. Each
+  one has a constructed scenario that turns it red — a gate is worth what it can stop,
+  not that it is listed here. Failing rows are kept, so a red gate says what it caught.
+- **stream-batch reconciliation — not built.** The intraday view against the same
+  period's mart figures, account by account.
+- **pytest — built, over what exists.** The generator's failure modes, the contracts and
+  the validator, the raw layer, the watermarked merge's idempotency, the SCD2 loading and
+  point-in-time join, the monthly balances, the mart and its gates, and the lineage
+  graph. Backfill scoping is not covered because it is not written.
 
-`pytest -q` is what CI runs, and it is the whole of CI today.
+`pytest -q` is the whole of the test suite. CI runs it, then generates the dbt docs and
+renders `transform/dbt/target/lineage.html` as a build artefact.
 
 The LLM layer is evaluated against a fixed golden set whose answers are known because the generator produced the anomalies deliberately. A drop in that score fails the build in the same way a broken test does.
 

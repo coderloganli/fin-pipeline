@@ -16,6 +16,9 @@ python -m transform.spark.balances --staging data/staging --periods 2026-01:2026
 `scd2 --table` scopes the run to one model. `balances --periods` sets the reporting
 range; without it the job uses the fact table's span and says so.
 
+What these four write to `data/staging/` is what `transform/load.py` copies into
+Postgres for `transform/dbt/` to model. Nothing downstream recomputes any of it.
+
 **Not built yet:** small-file compaction after each write, and the tuning that step
 four measures.
 

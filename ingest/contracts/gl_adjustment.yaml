@@ -7,6 +7,11 @@
 table: gl_adjustment
 primary_key: [entry_id, version]
 
+# What this table reaches downstream.
+# Nothing consumes this table yet. An empty list is a statement, and validation
+# says so out loud rather than reporting the impact as unknown. See docs/adr/0035.
+feeds: []
+
 # The incremental load advances on posted_at - when the row actually landed.
 # There is no updated_at in this source; see
 # docs/adr/0014-the-contract-declares-the-watermark-column.md.

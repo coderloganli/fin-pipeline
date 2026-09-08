@@ -202,7 +202,7 @@ def test_core_and_dev_dependencies_are_declared():
 
 def test_ci_installs_the_same_way_the_readme_says_to():
     """Success criterion 3: CI uses the same install line as a developer does."""
-    command = 'pip install -e ".[dev,spark]"'
+    command = 'pip install -e ".[dev,spark,dbt]"'
 
     steps = [
         step.get("run", "")
@@ -233,17 +233,19 @@ def test_settings_fall_back_to_the_dotenv_file(monkeypatch, tmp_path):
     database the container publishes while the tests keep connecting to the old
     one. Written against a temporary directory so a developer's real .env is
     neither read nor overwritten."""
-    import conftest
+    from conftest import settings
 
     (tmp_path / ".env").write_text("POSTGRES_DB=from_dotenv\n", encoding="utf-8")
-    monkeypatch.setattr(conftest, "REPO_ROOT", tmp_path)
     monkeypatch.delenv("POSTGRES_DB", raising=False)
 
-    assert conftest.settings()["POSTGRES_DB"] == "from_dotenv"
+    # The root is an argument rather than a module global. `settings` is
+    # `transform.db.settings` - the loader resolves through the same function - so
+    # patching a name in this file would reach nothing. See docs/adr/0034.
+    assert settings(repo_root=tmp_path)["POSTGRES_DB"] == "from_dotenv"
 
     # A real environment variable still wins, the way Compose resolves it.
     monkeypatch.setenv("POSTGRES_DB", "from_environment")
-    assert conftest.settings()["POSTGRES_DB"] == "from_environment"
+    assert settings(repo_root=tmp_path)["POSTGRES_DB"] == "from_environment"
 
 
 # --- Added at stage 6 of merge-entries-idempotently -------------------------

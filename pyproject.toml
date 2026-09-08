@@ -17,7 +17,10 @@ dependencies = [
 # version floor and any toolchain requirement get settled. See
 # docs/adr/0003-how-dependencies-are-declared.md. `spark` has been claimed:
 # transform/spark/ needs it, and it needs a JDK - Spark 4.2.0 runs on Java 17/21/25,
-# found through PATH or JAVA_HOME. See docs/adr/0028-spark-runs-in-process.md.
+# found through PATH or JAVA_HOME. See docs/adr/0028-spark-runs-in-process.md. `dbt` has
+# been claimed too: transform/dbt/ is the mart, and the floor is the release confirmed
+# to support Python 3.13 on the Postgres adapter. It needs no toolchain of its own - it
+# talks to the Postgres that compose.yaml already declares.
 [project.optional-dependencies]
 dev = [
     "pytest",
@@ -33,6 +36,9 @@ build-backend = "setuptools.build_meta"
 
 [tool.setuptools]
 packages = ["generator", "ingest", "ingest.contracts", "transform", "transform.spark"]
+# transform/dbt/ is a dbt project, not a Python package: it holds SQL and YAML that dbt
+# reads, and nothing imports it. transform/load.py, transform/db.py and
+# transform/lineage.py sit beside it in transform/ and are ordinary modules.
 
 [tool.setuptools.package-data]
 # The contracts are data the package reads at runtime, so they have to ship with it.

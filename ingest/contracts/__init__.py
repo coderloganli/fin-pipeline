@@ -53,14 +53,23 @@ REQUIRED_CONSTRAINT_KEYS: dict[str, frozenset[str]] = {
 TOP_LEVEL = frozenset({
     "table", "primary_key", "columns", "row_constraints", "watermark", "partition_by",
     "rows_are_immutable",
+    "feeds",
 })
-REQUIRED = frozenset({"table", "primary_key", "columns"})
+REQUIRED = frozenset({"table", "primary_key", "columns", "feeds"})
 
 # Both name a column the load reads as a date and must be able to compare: `watermark`
 # is what the incremental load advances on, `partition_by` is what the raw layer
 # partitions by. Absence is meaningful - a table that declares no watermark is loaded
 # in full. See docs/adr/0014-the-contract-declares-the-watermark-column.md.
 DATE_KEYS = ("watermark", "partition_by")
+
+# What a `feeds` entry looks like: the dbt source this table reaches, qualified with the
+# source it is declared under. dbt's graph starts at the Postgres landing tables and the
+# hop from a CSV to one of them happens inside transform/spark/, so it appears in no
+# manifest and has to be declared. Required rather than optional: an optional key would
+# let a new contract silently feed nothing, and `feeds: []` already says that out loud
+# for the one table it is true of. See docs/adr/0035.
+FEED_PATTERN = re.compile(r"[a-z_]+\.[a-z_]+")
 
 
 class ContractError(ValueError):
@@ -93,6 +102,17 @@ def _validate(contract: dict, source: str) -> dict:
 
     if not isinstance(contract["columns"], list) or not contract["columns"]:
         fail("columns must be a non-empty list")
+
+    if not isinstance(contract["feeds"], list):
+        fail(f"feeds must be a list of dbt source names, got {contract['feeds']!r}")
+    for name in contract["feeds"]:
+        if not isinstance(name, str) or not FEED_PATTERN.fullmatch(name):
+            fail(
+                f"feeds entry {name!r} is not a qualified dbt source name. It has to "
+                f"read <source>.<table>, as the dbt project declares it - a bare table "
+                f"name resolves against nothing and empties the impact list without "
+                f"anything noticing. See docs/adr/0035."
+            )
 
     names = []
     for spec in contract["columns"]:

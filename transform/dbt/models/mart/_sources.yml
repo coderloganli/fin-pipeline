@@ -1,0 +1,21 @@
+version: 2
+
+sources:
+  # The tables transform/load.py lands. The source is named `landing` whatever schema
+  # it actually resolves to, because ingest/contracts/*.yaml declares `feeds` against
+  # this name and the impact list has to stay stable across a test's own schemas.
+  # See docs/adr/0034 and 0035.
+  - name: landing
+    schema: "{{ env_var('POSTGRES_LANDING_SCHEMA', 'landing') }}"
+    description: >
+      The staging layer, copied into Postgres. It computes nothing and holds no answer
+      that data/staging/ does not already hold.
+    # No freshness. This is a rebuild, not a feed, and a freshness rule here would
+    # assert something no run makes true.
+    tables:
+      - name: fct_gl_entry
+      - name: agg_monthly_balance
+      - name: dim_account
+      - name: dim_cost_center
+      - name: dim_fx_rate
+      - name: dim_vendor

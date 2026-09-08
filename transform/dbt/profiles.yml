@@ -1,0 +1,15 @@
+# In the project directory rather than ~/.dbt, so the same command works on a
+# developer's machine, in CI, and in any image, with nothing to place first.
+
+fin_pipeline:
+  target: default
+  outputs:
+    default:
+      type: postgres
+      host: "{{ env_var('POSTGRES_HOST', '127.0.0.1') }}"
+      port: "{{ env_var('POSTGRES_PORT', '5432') | int }}"
+      dbname: "{{ env_var('POSTGRES_DB', 'fin_pipeline') }}"
+      user: "{{ env_var('POSTGRES_USER', 'fin_pipeline') }}"
+      password: "{{ env_var('POSTGRES_PASSWORD', 'fin_pipeline') }}"
+      schema: "{{ env_var('POSTGRES_MART_SCHEMA', 'mart') }}"
+      threads: 4

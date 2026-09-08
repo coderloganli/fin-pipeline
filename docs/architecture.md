@@ -15,14 +15,16 @@ entries it relied on. The hard problems here are time semantics — point-in-tim
 correctness, slowly changing dimensions, late-arriving corrections, idempotent
 replay — not volume.
 
-**Status: early.** `generator/` has landed. `ingest/` has its source-table
-contracts, the validator that applies them, the watermarked incremental load that lands
-entries in the raw layer, and the run record every load writes. `transform/spark/` has
-the SCD2 loader — which builds the two dimensions and the exchange rate alike — the
-point-in-time fact build, and the monthly aggregation; it is also what first installs
-PySpark. `transform/dbt/`, `ml/`, `insight/`, `app/` and `dags/` exist and each carries
-a README stating what that layer is and is not responsible for, but no module has landed
-in them. Read the READMEs
+**Status: the batch path is complete.** `generator/` has landed. `ingest/` has its
+source-table contracts, the validator that applies them, the watermarked incremental
+load that lands entries in the raw layer, and the run record every load writes.
+`transform/spark/` has the SCD2 loader — which builds the two dimensions and the
+exchange rate alike — the point-in-time fact build, and the monthly aggregation; it is
+also what first installs PySpark. `transform/load.py` copies the staging layer into
+Postgres and `transform/dbt/` models it as a star with six quality gates over it;
+`transform/lineage.py` renders the graph and answers what a column change would break.
+`ml/`, `insight/`, `app/` and `dags/` exist and each carries a README stating what that
+layer is and is not responsible for, but no module has landed in them. Read the READMEs
 for intent; read this file for what is actually true today.
 
 ## Shape
@@ -38,7 +40,9 @@ generator ──▶ raw (Parquet) ──▶ staging (Parquet, PySpark) ──▶
 | `generator/` | Synthetic ledger data, with a switch for every failure mode the tests need. Writes CSV to `data/source/`, reproducible from a seed. The chart of accounts follows the accounting standard two levels deep, and expense-side vouchers carry a vendor |
 | `ingest/` | Contract validation, watermarked incremental merge, run records |
 | `transform/spark/` | SCD2 loading, the point-in-time join, monthly aggregation |
-| `transform/dbt/` | Relational models, tests, lineage |
+| `transform/dbt/` | The mart: a star in Postgres, and the six gates over it |
+| `transform/load.py` | Copies the staging Parquet into Postgres so dbt has sources |
+| `transform/lineage.py` | Reads dbt's manifest: the impact list, and the HTML graph |
 | `ml/` | Anomaly detection over monthly balances |
 | `insight/` | The LLM investigation loop and its golden-set evaluation |
 | `app/` | Streamlit application; queries the mart, computes nothing |
@@ -49,7 +53,20 @@ generator ──▶ raw (Parquet) ──▶ staging (Parquet, PySpark) ──▶
 
 **Postgres** is the only external service the repository talks to today. It runs in a
 container declared in `compose.yaml`, pinned to `postgres:18`. Connection parameters
-come from the environment; `.env.example` records the shape and `.env` is ignored.
+come from the environment, resolved by `transform/db.py` — environment, then `.env`,
+then a default — and `tests/conftest.py` re-exports that resolver rather than restating
+it. `.env.example` records the shape and `.env` is ignored.
+
+**The mart lives in two schemas, and the first is not called staging.**
+`POSTGRES_LANDING_SCHEMA` holds what `transform/load.py` copies across and
+`POSTGRES_MART_SCHEMA` holds what dbt builds. The landing schema is `landing` rather
+than `staging` because `docs/adr/0026` already owns that name for the Parquet layer, and
+one name for two things is what this repository argues against everywhere else. Both are
+settings so the test suite can point at schemas of its own. See `docs/adr/0034`.
+
+**dbt runs against that Postgres and needs no toolchain of its own.** `transform/dbt/`
+carries its own `profiles.yml` rather than expecting one in `~/.dbt`, so the same
+command works on a machine, in CI and in an image with nothing to place first.
 
 Every service this platform grows — Airflow — is added to the same
 `compose.yaml` by the task that needs it. The host machine edits code and runs tests;
@@ -72,12 +89,13 @@ asserts the two agree, because they had already drifted apart once before anythi
 checked.
 
 **Dependencies live in `pyproject.toml` only**, installed with
-`pip install -e '.[dev,spark]'` — the same command locally, in CI, and in any image.
+`pip install -e '.[dev,spark,dbt]'` — the same command locally, in CI, and in any image.
 The core set is small — `psycopg`, `pyyaml`, and `pyarrow`, which ingest writes the raw
-layer with. `spark` has been claimed by `transform/spark/`, and it is in the install
-line rather than optional because tests that need Spark fail rather than skip, so the
-suite does not pass without it. `dbt`, `ml` and `app` are declared but installed by
-nobody yet; the task that first needs one of them is the task that makes it install.
+layer with. `spark` has been claimed by `transform/spark/` and `dbt` by `transform/dbt/`, and both
+are in the install line rather than optional because the tests that need them fail
+rather than skip, so the suite does not pass without them. `ml` and `app` are declared
+but installed by nobody yet; the task that first needs one of them is the task that
+makes it install.
 
 **Tests that need the database fail when it is absent — they never skip.** A skipped
 test reports success, and a green CI run that verified nothing defeats the point of
@@ -111,7 +129,8 @@ rise. The long-tail switch therefore raises amounts on a dedicated account rathe
 appending rows — a steady count is the shape's diagnostic feature, not an accident of
 implementation. See docs/adr/0007-long-tail-anomaly-changes-amounts.md.
 
-**The first quality gate is contract validation, and it is the only one that exists.**
+**Contract validation is the first of three quality gates, and the second has
+landed.**
 `ingest/validate.py` applies a contract to a source file: an added column warns and
 the run continues, and a missing column, a reordering, a value that no longer fits its
 declared type or rule, a repeated primary key, or a broken row constraint fails it.
@@ -119,9 +138,58 @@ That asymmetry is one rule for all six tables and it lives with the validator, n
 the contracts. The library returns a report rather than raising, because a warning and
 a failure have to reach the caller through the same call; `python -m ingest.validate`
 is what turns an incompatible report into a non-zero exit. Rows stream and findings
-are capped per table, so the gate can guard a table it could not hold. Until dbt
-lands there is no lineage graph, so a failure says the downstream impact is unknown
-rather than omitting it. See docs/adr/0009, 0010, 0011 and 0012.
+are capped per table, so the gate can guard a table it could not hold. A failure now
+names the models it would break, read off dbt's manifest — see the lineage entry below.
+See docs/adr/0009, 0010, 0011 and 0012.
+
+**The second gate is six dbt tests over the mart, and each one has a scenario that
+turns it red.** Primary key uniqueness, referential integrity, debit and credit
+balancing per voucher, SCD2 intervals that neither overlap nor gap, row-count drift, and
+agreement between the base-currency and original amounts. The acceptance standard is
+what a gate can stop, not that it exists: `tests/test_mart_gates.py` builds a failure for
+every one of them and asserts the named test node fails. `store_failures` is on
+project-wide, so a failing gate leaves its offending rows in
+`<mart schema>_dbt_test__audit` — a gate that can say only that something failed, and
+not what, is half a gate.
+
+Drift is the one gate that needs a memory. `mart.model_row_count` gains one row per
+counted model per build, and the gate compares the current count against the median of
+the previous five, excluding the build being tested, failing outside ten percent. It
+does not count itself, which is what keeps the graph acyclic. See docs/adr/0036.
+
+**A failed build leaves what failed in the mart.** dbt builds the models and then runs
+the tests over them, so a gate that goes red does so after the table it guards has been
+written. `dbt build` stops there and exits non-zero, and nothing reads the mart yet — but
+what is missing is an atomic swap, not a check. Adding one means building into a schema
+of the run's own and renaming it into place, which is a decision about what a run is;
+`orchestrate-the-daily-run` owns that. See docs/adr/0034.
+
+**The mart is a function of its inputs, so nothing in it names the build that wrote
+it.** Rebuilding from an unchanged staging snapshot is identical in every column. A full
+pipeline rerun is identical in every reported column and moves `source_last_run_id`,
+because docs/adr/0018 has that set by whichever run wrote the partition — so the mart
+checksum excludes the two provenance columns, exactly as docs/adr/0017 excludes
+ingestion metadata from the raw one. Which build wrote a table is reached through
+`mart.model_row_count`, not through a column on a row. See docs/adr/0038.
+
+**The aggregate's dimension names are resolved as of the period's close, and the fact's
+by surrogate key.** The staging fact carries `account_key`, `cost_center_key` and
+`fx_key`, so the fact's widening is an equality join. The monthly aggregate carries
+neither, and joining an SCD2 dimension on the natural key alone would match every
+version valid in any period — which does not raise, it multiplies. Its as-of date is the
+period's last day, the same date `balances.py` already reports `account_type` as of. The
+vendor joins on `vendor_code` in the fact and does not appear in the aggregate at all,
+whose grain has no vendor.
+
+**The lineage graph is rendered from dbt's manifest, and a contract says what it
+feeds.** dbt's graph starts at the landing tables; the hop from `gl_entry.csv` to one of
+them happens inside `transform/spark/` and appears in no manifest, so every contract
+declares a `feeds` list of dbt source names and `transform/lineage.py` walks `child_map`
+downward from them. `gl_adjustment` declares `feeds: []` because nothing consumes it
+yet, and validation says so rather than reporting an unknown. The HTML artefact is
+rendered here rather than by `dbt docs generate --static`, which does not embed the
+artefacts it documents (dbt-labs/dbt-core#11986, open) and which dbt Docs v2 replaced
+with a multi-file site. See docs/adr/0035 and 0037.
 
 **The raw layer holds text: the columns the contract declares, and two run
 identifiers.** Entries land under `data/raw/<table>/accounting_period=YYYY-MM/part-0000.parquet`, one file

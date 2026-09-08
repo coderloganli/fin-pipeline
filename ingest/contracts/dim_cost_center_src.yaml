@@ -8,6 +8,11 @@
 table: dim_cost_center_src
 primary_key: [cc_code, effective_date]
 
+# What this table reaches downstream.
+# The effective-dated versions become the SCD2 dimension. See docs/adr/0035.
+feeds:
+  - landing.dim_cost_center
+
 # A version, once landed, never changes: a change to this dimension is supposed to
 # arrive as a new effective_date. The same key coming back with different values is the
 # source restating its own past, and it fails the run rather than overwriting what the

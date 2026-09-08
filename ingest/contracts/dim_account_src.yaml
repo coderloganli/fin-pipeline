@@ -7,6 +7,11 @@
 table: dim_account_src
 primary_key: [account_code, effective_date]
 
+# What this table reaches downstream.
+# The effective-dated versions become the SCD2 dimension. See docs/adr/0035.
+feeds:
+  - landing.dim_account
+
 # A version, once landed, never changes: a change to this dimension is supposed to
 # arrive as a new effective_date. The same key coming back with different values is the
 # source restating its own past, and it fails the run rather than overwriting what the

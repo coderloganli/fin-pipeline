@@ -273,6 +273,10 @@ MINIMAL = {
     "table": "t",
     "primary_key": ["a"],
     "columns": [{"name": "a", "type": "string", "nullable": False}],
+    # Required since build-the-mart-layer: a contract has to say what it reaches
+    # downstream, because dbt's graph cannot see the Spark hop. An empty list is a
+    # statement. See docs/adr/0035.
+    "feeds": [],
 }
 
 
@@ -357,7 +361,7 @@ def test_a_contract_whose_table_disagrees_with_its_filename_is_refused(tmp_path,
     monkeypatch.setattr(contracts, "CONTRACT_DIR", tmp_path)
     contracts.load.cache_clear()
     (tmp_path / "gl_entry.yaml").write_text(
-        "table: something_else\nprimary_key: [a]\n"
+        "table: something_else\nprimary_key: [a]\nfeeds: []\n"
         "columns:\n  - name: a\n    type: string\n    nullable: false\n",
         encoding="utf-8",
     )
@@ -412,6 +416,8 @@ DATED = {
         {"name": "d", "type": "date", "nullable": False},
         {"name": "maybe", "type": "date", "nullable": True},
     ],
+    # See MINIMAL above: required since build-the-mart-layer, docs/adr/0035.
+    "feeds": [],
 }
 
 
@@ -480,7 +486,7 @@ def test_the_top_level_whitelist_did_not_widen():
     against a fourth that nobody declared has to still be there."""
     assert contracts.TOP_LEVEL == {
         "table", "primary_key", "columns", "row_constraints",
-        "watermark", "partition_by", "rows_are_immutable",
+        "watermark", "partition_by", "rows_are_immutable", "feeds",
     }
     with pytest.raises(contracts.ContractError, match="unknown top-level"):
         validated(dated(watermarkk="d"))
