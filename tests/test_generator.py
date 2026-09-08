@@ -16,7 +16,7 @@ import subprocess
 import sys
 import tracemalloc
 from collections import defaultdict
-from datetime import date
+from datetime import date, timedelta
 from decimal import Decimal
 from pathlib import Path
 
@@ -574,6 +574,129 @@ def test_every_rate_lands_in_the_reachable_band(tmp_path):
             )
 
 
+# --- the walk, and the weekend ----------------------------------------------
+#
+# Cases 1-6 of task.md. The series was independent jitter around a fixed centre, so
+# consecutive days could differ by four per cent; it is a random walk now, and the feed
+# does not publish at the weekend. See docs/adr/0030.
+
+WEEKEND = (5, 6)
+
+
+def published(out: Path, currency: str) -> list[tuple[date, Decimal]]:
+    """One currency's series, in date order."""
+    return sorted(
+        (date.fromisoformat(row["rate_date"]), Decimal(row["rate_to_base"]))
+        for row in rows(out, "fx_rate")
+        if row["currency"] == currency
+    )
+
+
+ONE_DAY = Decimal(dimensions.MAX_DAILY_MOVE_PPM) / Decimal(1_000_000)
+
+# What the sawtooth did, for scale: EUR moved 2.34% between 1 and 2 January.
+SAWTOOTH = Decimal("0.02")
+
+
+def moves(series, span_days: int, weekday=None) -> list[Decimal]:
+    """Relative moves between pairs `span_days` apart, optionally starting on one
+    weekday."""
+    found = []
+    for (earlier, before), (later, after) in zip(series, series[1:]):
+        if (later - earlier).days != span_days:
+            continue
+        if weekday is not None and earlier.weekday() != weekday:
+            continue
+        found.append(abs(after - before) / before)
+    return found
+
+
+@pytest.mark.parametrize("currency", NON_BASE_CURRENCIES)
+def test_two_days_inside_one_week_move_by_at_most_one_step(tmp_path, currency):
+    """Case 1. Monday to Tuesday is one perturbation, so the move stays inside one
+    step's band. This is what the sawtooth failed: EUR moved 2.34% in a day."""
+    within_week = moves(published(run(tmp_path), currency), span_days=1)
+
+    assert within_week, "no consecutive-day pair in the series"
+    assert max(within_week) <= ONE_DAY, (
+        f"{currency} moved {max(within_week):.4%} in a day, more than the model claims "
+        f"({ONE_DAY:.4%})"
+    )
+    assert max(within_week) < SAWTOOTH, (
+        f"{currency} still moves like the independent jitter this replaced"
+    )
+
+
+@pytest.mark.parametrize("currency", NON_BASE_CURRENCIES)
+def test_friday_to_monday_moves_by_up_to_three_steps(tmp_path, currency):
+    """Case 2, and the only observable evidence that the walk advances through the
+    weekend. The draw happens on every calendar day and only the value is withheld, so
+    Monday is three perturbations from Friday - see docs/adr/0030.
+
+    An implementation that skipped the weekend draws would shift the stream cursor for
+    every later currency, and every rate would still be a well-formed six-place number
+    inside the band. Byte-identical reruns and switch isolation both pass under it.
+    What does not pass is this: without the weekend steps, Friday to Monday would sit
+    inside one step's band."""
+    series = published(run(tmp_path), currency)
+    over_weekend = moves(series, span_days=3, weekday=4)
+
+    assert over_weekend, "no Friday-to-Monday pair in the series"
+    assert max(over_weekend) <= ONE_DAY * 3, (
+        f"{currency} moved {max(over_weekend):.4%} over a weekend, more than three days"
+    )
+
+
+def test_the_feed_does_not_publish_at_the_weekend(tmp_path):
+    """Case 2a. And every business day is there: a feed that skipped days at random
+    would satisfy the first half alone."""
+    out = run(tmp_path)
+    for currency in dimensions.CURRENCIES:
+        days = [day for day, _ in published(out, currency)]
+        assert not [d for d in days if d.weekday() in WEEKEND], (
+            f"{currency} published at the weekend"
+        )
+        expected = [
+            d for d in (days[0] + timedelta(n) for n in range((days[-1] - days[0]).days + 1))
+            if d.weekday() not in WEEKEND
+        ]
+        assert days == expected, f"{currency} is missing business days"
+
+
+@pytest.mark.parametrize("currency", NON_BASE_CURRENCIES)
+def test_the_walk_stays_inside_the_band(tmp_path, currency):
+    """Case 3. A pure random walk is unbounded; the pull towards the centre is what
+    keeps it in a plausible range by construction rather than by luck."""
+    for _, rate in published(run(tmp_path), currency):
+        assert rate > 0, f"{currency} produced a non-positive rate"
+        assert RATE_FLOOR <= rate <= RATE_CEILING, (
+            f"{currency} wandered to {rate}, outside [{RATE_FLOOR}, {RATE_CEILING}]"
+        )
+
+
+def test_the_base_currency_is_exactly_one_every_day(tmp_path):
+    """Case 4. CNY does not walk."""
+    assert {rate for _, rate in published(run(tmp_path), "CNY")} == {Decimal("1.000000")}
+
+
+def test_the_walk_is_reproducible(tmp_path):
+    """Case 5. Same seed, same file, byte for byte."""
+    first, second = run(tmp_path), run(tmp_path)
+    assert raw_bytes(first, "fx_rate") == raw_bytes(second, "fx_rate")
+
+
+@pytest.mark.parametrize("switch", [
+    "late_entries", "restatements", "cost_centre_move", "account_move",
+    "unbalanced_vouchers", "growing_account", "amount_outliers", "long_tail_anomaly",
+])
+def test_no_other_switch_disturbs_the_rates(tmp_path, switch):
+    """Case 6. The rates draw from the dimensions stream; every switch has its own.
+    See docs/adr/0005."""
+    assert raw_bytes(run(tmp_path), "fx_rate") == raw_bytes(
+        run(tmp_path, **{switch: True}), "fx_rate"
+    )
+
+
 @pytest.mark.parametrize("currency", NON_BASE_CURRENCIES)
 def test_a_rate_moves_from_day_to_day(tmp_path, currency):
     """Case 5. Guards a refactor that gets the centre right and drops the daily term."""
@@ -704,12 +827,12 @@ def drive(monkeypatch, values=None) -> tuple[ScriptedStream, list[dict]]:
 
 
 @pytest.mark.parametrize("centre,drift,expected", [
-    # The top of the range: RATE_MAX_MICROS is exclusive and the division floors, so
-    # the highest reachable rate is 8_999_999 * 1_020_000 // 1_000_000 = 9_179_998.
-    # An off-by-one that made the centre bound inclusive would produce 9.180000 here.
-    (dimensions.RATE_MAX_MICROS - 1, dimensions.DRIFT_PPM, "9.179998"),
-    # The bottom, which is exact.
-    (dimensions.RATE_MIN_MICROS, -dimensions.DRIFT_PPM, "4.900000"),
+    # The top of the range. RATE_MAX_MICROS is exclusive and the divisions floor, so
+    # the first day is one step up from 8_999_999 and then pulled back towards it. An
+    # off-by-one that made the centre bound inclusive would move this.
+    (dimensions.RATE_MAX_MICROS - 1, dimensions.DRIFT_PPM, "9.026458"),
+    # The bottom, one step down and pulled back up.
+    (dimensions.RATE_MIN_MICROS, -dimensions.DRIFT_PPM, "4.985300"),
 ])
 def test_the_edges_of_the_draw_range_land_where_the_band_says(
     monkeypatch, centre, drift, expected
@@ -717,6 +840,11 @@ def test_the_edges_of_the_draw_range_land_where_the_band_says(
     """Case 9. Case 4 asserts the band over a seed-42 sample, which cannot reach its
     own edges: an inclusive upper bound would pass there unless the sample happened to
     draw it. This dictates the boundary draw instead of waiting for it.
+
+    The expected values moved with docs/adr/0030: the first day is no longer the centre
+    scaled by one drift, it is one step of the walk followed by the pull back towards
+    the centre. The property being pinned - that the boundary draws land where the band
+    says and not one unit outside it - is unchanged.
 
     The script feeds CNY's discarded drift for every day of the month - the base
     currency takes one per day, not one per month - and then EUR's centre and its
@@ -730,25 +858,34 @@ def test_the_edges_of_the_draw_range_land_where_the_band_says(
 def test_the_draws_taken_per_currency_are_exactly_the_documented_ones(monkeypatch):
     """Case 10. The stream cursor is a contract, and it is invisible in the output.
 
-    CNY takes no centre draw and a discarded drift draw every day. Dropping either
-    would shift EUR, USD and GBP - silently, because every rate would still be a
+    CNY takes no centre draw and a discarded drift draw every calendar day. Dropping
+    either - or skipping the weekend's draw now that the weekend is not published -
+    would shift EUR, USD and GBP silently, because every rate would still be a
     well-formed six-place number inside the band. See
-    docs/adr/0013-a-rate-is-not-an-amount.md.
+    docs/adr/0013-a-rate-is-not-an-amount.md and docs/adr/0030.
     """
     stream, produced = drive(monkeypatch)
 
     centre_bounds = (dimensions.RATE_MIN_MICROS, dimensions.RATE_MAX_MICROS)
     drift_bounds = (-dimensions.DRIFT_PPM, dimensions.DRIFT_PPM + 1)
 
-    days = len({row["rate_date"] for row in produced})
+    # Calendar days, not the rows that came out. Since docs/adr/0030 the weekend is
+    # drawn and not written, so counting the output would count business days and this
+    # assertion would enforce the opposite of the discipline it exists for.
+    days = monthrange(DRIVEN_MONTH.year, DRIVEN_MONTH.month)[1]
+    published_days = len({row["rate_date"] for row in produced})
+    assert published_days < days, (
+        "the driven month has no weekend, so this test cannot tell the two counts apart"
+    )
     non_base = [c for c in dimensions.CURRENCIES if c != dimensions.BASE_CURRENCY]
 
     assert stream.calls.count(centre_bounds) == len(non_base), (
         f"expected one centre draw per non-base currency, got {stream.calls}"
     )
     assert stream.calls.count(drift_bounds) == len(dimensions.CURRENCIES) * days, (
-        "expected a drift draw for every currency on every day, including the base "
-        f"currency whose value is discarded; got {stream.calls}"
+        "expected a drift draw for every currency on every calendar day - including "
+        "the weekend, whose value is not written, and the base currency, whose value "
+        f"is discarded; got {stream.calls}"
     )
     assert len(stream.calls) == len(non_base) + len(dimensions.CURRENCIES) * days
 
@@ -1232,3 +1369,74 @@ def test_the_vendors_stream_is_what_names_the_suppliers(tmp_path, monkeypatch):
 
     assert set(before) == set(after)
     assert before != after
+
+
+def test_the_month_to_month_drift_exceeds_the_day_to_day_noise(tmp_path):
+    """Not in task.md's list. Added after measuring what docs/adr/0030 argues.
+
+    The record's case is that a sawtooth makes "the March rate, as it stood in March" a
+    weak demonstration: against noise around a constant, any date's rate is as good as
+    any other's. That is a claim about signal against noise, and nothing asserted it —
+    every other case here pins a bound or a shape, all of which a retuned sawtooth
+    would still satisfy.
+
+    Measured over three currencies, every pair of months:
+
+        independent jitter   drift 0.248%   noise 1.305%   0.19:1
+        random walk          drift 0.734%   noise 0.150%   4.88:1
+
+    Noise drowning signal five to one, become signal over noise five to one. The
+    threshold below is deliberately far under the measured 4.88, so ordinary variation
+    does not make this flap; what it catches is a retune that puts the day-to-day jitter
+    back on top, which is the failure mode and not a near miss.
+    """
+    import statistics
+
+    out = run(tmp_path)
+    drift, noise = [], []
+    for currency in NON_BASE_CURRENCIES:
+        series = published(out, currency)
+        monthly = {}
+        for day, rate in series:
+            monthly.setdefault(day.strftime("%Y-%m"), []).append(rate)
+        means = [sum(v) / len(v) for _, v in sorted(monthly.items())]
+        drift += [abs(b / a - 1) for i, a in enumerate(means) for b in means[i + 1:]]
+        noise += moves(series, span_days=1)
+
+    ratio = statistics.mean(drift) / statistics.mean(noise)
+    assert ratio > 2, (
+        f"month-to-month drift is {statistics.mean(drift):.4%} against day-to-day noise "
+        f"of {statistics.mean(noise):.4%} ({ratio:.2f}:1). Below 1 the series is noise "
+        f"around a constant, which is what the independent jitter was."
+    )
+
+
+def test_the_weekend_steps_are_taken_even_though_they_are_not_written(monkeypatch):
+    """Case 2, driven rather than sampled. Comparing the largest weekend move against
+    the largest within-week move was too weak: under an implementation that skipped the
+    weekend draws both sets are one-step moves, and their maxima differ anyway.
+
+    Here every drift is dictated as the maximum upward step, so the arithmetic is
+    exact. 2026-01-02 is a Friday and 2026-01-05 the Monday after it. Three steps
+    separate them if the weekend is drawn and one if it is not, and those are different
+    numbers rather than different samples. See docs/adr/0030.
+    """
+    step = dimensions.DRIFT_PPM
+    centre = 7_000_000
+    _, produced = drive(monkeypatch, [0] * DRIVEN_DAYS + [centre] + [step] * DRIVEN_DAYS)
+
+    eur = {row["rate_date"]: row["rate_to_base"]
+           for row in produced if row["currency"] == "EUR"}
+
+    def walk(micros, steps):
+        for _ in range(steps):
+            micros = micros * (1_000_000 + step) // 1_000_000
+            micros += (centre - micros) * dimensions.PULL_PPM // 1_000_000
+        return dimensions.schema.format_rate(dimensions._rate(micros))
+
+    assert eur["2026-01-02"] == walk(centre, 2), "Friday is two steps from the start"
+    assert eur["2026-01-05"] == walk(centre, 5), (
+        "Monday should be five steps from the start - three more than Friday, because "
+        "Saturday and Sunday are drawn and only withheld. Two more would mean the "
+        "weekend draws are being skipped, which shifts every later currency."
+    )

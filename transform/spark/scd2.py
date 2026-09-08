@@ -36,6 +36,22 @@ __all__ = ["MODELS", "FAR_FUTURE", "build", "read", "frame", "checksum", "main"]
 MODELS = {
     "dim_account_src": ("dim_account", ["account_code"], "effective_date"),
     "dim_cost_center_src": ("dim_cost_center", ["cc_code"], "effective_date"),
+    # A rate is a slowly changing attribute of a currency, so it is loaded by this same
+    # code: a rate runs from the day it was published until the day before the next
+    # one, which is what puts the weekend inside Friday's interval without a rule
+    # written for weekends. See docs/adr/0029.
+    "fx_rate": ("dim_fx_rate", ["currency"], "rate_date"),
+}
+
+# What a contract's declared type becomes in staging. Raw holds text because it has to
+# answer whether the source really said that (docs/adr/0015); staging is where the
+# retyping happens (docs/adr/0026). Only the rate is not a string today, and leaving it
+# text would have made 0026 true of the interval columns and of nothing else.
+COLUMN_TYPES = {
+    "string": "string",
+    "date": "date",
+    "integer": "bigint",
+    "decimal": "decimal(18,6)",
 }
 
 # The open end of an interval. See docs/adr/0024.
@@ -69,6 +85,7 @@ def _rendered(columns):
 
     parts = []
     for column in columns:
+        column = F.col(column) if isinstance(column, str) else column
         parts.append(F.concat(F.length(column).cast("string"), F.lit(":"), column))
     return F.concat_ws(raw.UNIT_SEPARATOR, *parts)
 
@@ -85,13 +102,29 @@ def build(spark, contract: dict, raw_dir, staging_dir) -> Path:
     source = Path(raw.partition_path(raw_dir, contract))
     rows = spark.read.parquet(str(source)).select(*declared)
 
+    # Cast every column to the type its contract declares. A no-op for the two source
+    # dimensions, whose attributes are all strings; it is the rate that made the gap
+    # visible. The effective column is handled below, where it becomes valid_from.
+    for spec in contract["columns"]:
+        if spec["name"] == effective:
+            continue
+        rows = rows.withColumn(
+            spec["name"], F.col(spec["name"]).cast(COLUMN_TYPES[spec["type"]])
+        )
+
     # Collapse a version that restates the previous one without changing anything. A
     # new effective date carrying identical attributes is not a change, and counting it
     # as one would make "how many versions does this key have" a function of how many
     # times the source re-exported it. The attribute hash is what the ticket's
     # "compare a hash of the attributes" becomes once the source declares its own dates.
     ordered = Window.partitionBy(*natural_key).orderBy(effective)
-    fingerprint = F.sha2(_rendered(attributes), 256) if attributes else F.lit("")
+    # Rendered from the string form of each attribute: `_rendered` prefixes a length,
+    # and a length is only meaningful over text. Casting first would make the
+    # fingerprint depend on how Spark formats a decimal.
+    fingerprint = (
+        F.sha2(_rendered([F.col(name).cast("string") for name in attributes]), 256)
+        if attributes else F.lit("")
+    )
     distinct = (
         rows
         .withColumn("_fingerprint", fingerprint)

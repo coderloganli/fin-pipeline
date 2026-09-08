@@ -18,9 +18,11 @@ replay — not volume.
 **Status: early.** `generator/` has landed. `ingest/` has its source-table
 contracts, the validator that applies them, the watermarked incremental load that lands
 entries in the raw layer, and the run record every load writes. `transform/spark/` has
-the SCD2 dimension loader, which is also what first installs PySpark. `transform/dbt/`,
-`ml/`, `insight/`, `app/` and `dags/` exist and each carries a README stating what that
-layer is and is not responsible for, but no module has landed in them. Read the READMEs
+the SCD2 loader — which builds the two dimensions and the exchange rate alike — the
+point-in-time fact build, and the monthly aggregation; it is also what first installs
+PySpark. `transform/dbt/`, `ml/`, `insight/`, `app/` and `dags/` exist and each carries
+a README stating what that layer is and is not responsible for, but no module has landed
+in them. Read the READMEs
 for intent; read this file for what is actually true today.
 
 ## Shape
@@ -147,6 +149,31 @@ rather than at null — a null end makes `BETWEEN` evaluate to null and drops th
 rows out of an inner join with nothing raised. The surrogate key is a hash of the
 natural key and `valid_from`, not a sequence, so it survives a rerun and a
 repartition. See docs/adr/0024 and 0025.
+
+**An exchange rate is a dimension, so the fact build has one join shape.** `fx_rate`
+is loaded by the same SCD2 code as the two source dimensions: a currency's rate runs
+from the day it was published until the day before the next one. Attributing an entry
+is then `accounting_date BETWEEN valid_from AND valid_to`, three times — account, cost
+centre, rate — rather than a range join for two of them and an equality for the third.
+The rate feed does not publish at the weekend and 27% of entries are dated on one, so
+this is load-bearing: an equality join would leave a quarter of the ledger with no
+base-currency amount. See docs/adr/0029 and 0030.
+
+**Conversion rounds at the line, and never through a float.** A line's base-currency
+amount is rounded to two places in `fct_gl_entry`, and the monthly aggregate sums those
+already-rounded figures — so an analyst who totals the detail gets the number the report
+shows. Amounts and rates are cast from the raw layer's text to `DecimalType`; reading
+them back as doubles would undo the whole of docs/adr/0013. See docs/adr/0031.
+
+**A monthly balance is signed by the account's normal side, as it stood in the
+period.** Expenses and assets are debit-normal, revenue, liabilities and equity
+credit-normal, so every account's ordinary activity reads as a positive number that
+grows and no consumer restates the rule. The account type comes from the point-in-time
+attribution, so a reclassification does not flip the sign of periods that already
+closed. The grid is dense — every active account and cost centre carries a row for every
+period, zero where nothing posted — because a period-over-period comparison over a
+sparse table silently becomes a comparison with the last month that had activity. Zero
+and null are different facts and stay different. See docs/adr/0032 and 0033.
 
 **Staging is typed, and it is rebuilt.** Raw holds text and accumulates because it is
 the record; staging holds dates and booleans and is overwritten because it is derived

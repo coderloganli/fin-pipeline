@@ -314,9 +314,13 @@ def test_a_version_no_longer_exported_still_takes_part_in_the_chain(spark, lande
 # point somebody actually types uncovered.
 
 def test_the_command_builds_every_dimension_it_is_given(spark, landed, tmp_path, capsys):
-    """Both models in one invocation, and the printed line names where each landed."""
+    """Case 10c. All three models in one invocation, and the printed line names where
+    each landed. This asserted two lines until `fx_rate` became a model of its own -
+    see docs/adr/0029."""
     raw_dir, staging = landed()
     raw.merge_table(DIM_ACCOUNT, raw_dir, ACCOUNT_ROWS, run_id=RUN_A)
+
+    raw.merge_table(DIM_FX, raw_dir, FX_ROWS, run_id=RUN_A)
 
     code = scd2.main(["--raw", str(raw_dir), "--staging", str(staging)])
 
@@ -324,6 +328,7 @@ def test_the_command_builds_every_dimension_it_is_given(spark, landed, tmp_path,
     assert capsys.readouterr().out.splitlines() == [
         f"dim_account_src: dim_account -> {staging / 'dim_account'}",
         f"dim_cost_center_src: dim_cost_center -> {staging / 'dim_cost_center'}",
+        f"fx_rate: dim_fx_rate -> {staging / 'dim_fx_rate'}",
     ]
     assert len(scd2.read(spark, DIM_CC, staging)) == 3
 
@@ -356,3 +361,115 @@ def test_the_session_is_configured_the_way_the_decision_record_argues(spark):
     assert spark.conf.get("spark.master").startswith("local")
     assert spark.conf.get("spark.sql.shuffle.partitions") == "4"
     assert spark.conf.get("spark.sql.session.timeZone") == "UTC"
+
+
+# --- the exchange rate is a dimension too -----------------------------------
+#
+# Cases 7-10c of task.md. `fx_rate` is loaded by this same code: a currency's rate runs
+# from the day it was published until the day before the next one, so the weekend falls
+# inside Friday's interval by construction rather than by a rule written for it.
+# See docs/adr/0029.
+
+DIM_FX = contracts.load("fx_rate")
+
+# Thursday, Friday, Monday - three distinct values on purpose. A Friday equal to
+# Thursday would be folded into Thursday's interval by the fingerprint collapse, and
+# "Friday's interval" would then not be a thing to assert on. A non-base currency for
+# the same reason: CNY is 1.000000 throughout and collapses to a single interval.
+FX_ROWS = [
+    {"currency": "EUR", "rate_date": "2026-01-01", "rate_to_base": "7.100000"},
+    {"currency": "EUR", "rate_date": "2026-01-02", "rate_to_base": "7.200000"},
+    {"currency": "EUR", "rate_date": "2026-01-05", "rate_to_base": "7.300000"},
+    {"currency": "CNY", "rate_date": "2026-01-01", "rate_to_base": "1.000000"},
+]
+
+
+def test_every_currency_has_intervals_that_neither_overlap_nor_gap(spark, landed):
+    """Case 7. The same three properties the dimensions are held to, for every currency
+    in the output rather than a sampled one."""
+    from datetime import timedelta
+
+    raw_dir, staging = landed(FX_ROWS, DIM_FX)
+    scd2.build(spark, DIM_FX, raw_dir, staging)
+
+    for key, group in versions(scd2.read(spark, DIM_FX, staging), ["currency"]).items():
+        for earlier, later in zip(group, group[1:]):
+            assert earlier["valid_to"] < later["valid_from"], key
+            assert earlier["valid_to"] + timedelta(days=1) == later["valid_from"], key
+        assert sum(1 for row in group if row["is_current"]) == 1, key
+
+
+def test_fridays_interval_covers_the_weekend(spark, landed):
+    """Case 8. 2026-01-02 is a Friday and the next published day is Monday the 5th, so
+    Friday's interval ends on Sunday the 4th. Nothing here is a weekend rule - it is
+    the same "until the day before the next version" the dimensions use, and the
+    weekend is simply what falls in the gap. See docs/adr/0029."""
+    raw_dir, staging = landed(FX_ROWS, DIM_FX)
+    scd2.build(spark, DIM_FX, raw_dir, staging)
+
+    eur = versions(scd2.read(spark, DIM_FX, staging), ["currency"])[("EUR",)]
+    friday = [row for row in eur if row["valid_from"].isoformat() == "2026-01-02"]
+    assert len(friday) == 1
+    assert friday[0]["valid_to"].isoformat() == "2026-01-04"
+
+
+def test_a_rate_that_did_not_move_becomes_one_interval(spark, landed):
+    """Case 9. Ordinary here, where it never happened on the dimensions: a currency
+    that holds its rate for two days should not carry two versions saying the same
+    thing."""
+    steady = [
+        {"currency": "EUR", "rate_date": "2026-01-01", "rate_to_base": "7.100000"},
+        {"currency": "EUR", "rate_date": "2026-01-02", "rate_to_base": "7.100000"},
+        {"currency": "EUR", "rate_date": "2026-01-05", "rate_to_base": "7.300000"},
+    ]
+    raw_dir, staging = landed(steady, DIM_FX)
+    scd2.build(spark, DIM_FX, raw_dir, staging)
+
+    eur = versions(scd2.read(spark, DIM_FX, staging), ["currency"])[("EUR",)]
+    assert len(eur) == 2
+    assert eur[0]["valid_from"].isoformat() == "2026-01-01"
+    assert eur[0]["valid_to"].isoformat() == "2026-01-04"
+
+
+def test_the_rate_contract_refuses_a_restated_day(tmp_path):
+    """Case 10. A given day's rate does not change. build-scd2-dimensions left this one
+    line to the ticket that first joins on it - see docs/adr/0023.
+
+    The flag alone was what this asserted, which is a statement about a YAML file and
+    not about the load. The refusal is the behaviour worth holding."""
+    assert contracts.load("fx_rate").get("rows_are_immutable") is True
+
+    raw_dir = tmp_path / "raw"
+    raw.merge_table(DIM_FX, raw_dir, FX_ROWS, run_id=RUN_A)
+
+    restated = [{**FX_ROWS[0], "rate_to_base": "7.999999"}]
+    with pytest.raises(raw.ImmutableRowChanged) as failure:
+        raw.merge_table(DIM_FX, raw_dir, restated, run_id=RUN_A)
+
+    message = str(failure.value)
+    assert "fx_rate" in message and "rate_to_base" in message
+    assert "7.100000" in message and "7.999999" in message
+
+
+def test_the_rate_lands_in_staging_as_a_decimal(spark, landed):
+    """Case 10a. `docs/adr/0026` says staging is typed. The loader typed only the
+    interval columns, which nothing noticed while every attribute in every model was a
+    string - the rate is the first attribute that is not."""
+    raw_dir, staging = landed(FX_ROWS, DIM_FX)
+    scd2.build(spark, DIM_FX, raw_dir, staging)
+
+    types = dict(scd2.frame(spark, DIM_FX, staging).dtypes)
+    assert types["rate_to_base"].startswith("decimal"), types["rate_to_base"]
+    assert types["currency"] == "string"
+
+
+def test_typing_by_contract_leaves_the_string_dimensions_alone(spark, landed):
+    """Case 10b. Both existing dimensions declare every attribute as a string, so
+    casting by declared type has to be a no-op for them."""
+    raw_dir, staging = landed()
+    scd2.build(spark, DIM_CC, raw_dir, staging)
+
+    types = dict(scd2.frame(spark, DIM_CC, staging).dtypes)
+    assert types["cc_code"] == "string"
+    assert types["dept_code"] == "string"
+    assert types["name"] == "string"

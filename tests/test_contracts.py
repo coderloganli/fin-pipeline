@@ -497,14 +497,24 @@ def test_immutability_is_declared_as_a_boolean_or_not_at_all():
         validated(dated(rows_are_immutable="true"))
 
 
-def test_the_two_effective_dated_dimensions_declare_immutability():
-    """Case 11, on the contracts that ship. Their primary keys carry the date the
-    version took effect, so the same key arriving changed is the source restating its
-    own past rather than updating a row. See docs/adr/0023."""
-    for table in ("dim_account_src", "dim_cost_center_src"):
+def test_the_date_keyed_sources_declare_immutability():
+    """The contracts whose primary key carries the date a version took effect: the same
+    key arriving changed is the source restating its own past rather than updating a
+    row. See docs/adr/0023.
+
+    `fx_rate` joined the list here rather than in the ticket that wrote the rule.
+    docs/adr/0023 held it back deliberately - the shape and the argument were identical,
+    but nothing consumed a rate yet, and deciding on behalf of a consumer that did not
+    exist would have been guessing. The point-in-time join is that consumer.
+
+    `dim_vendor` is keyed on the code alone with no date, so a supplier really does
+    change its name in place. The entry tables carry `version` for the purpose this
+    would serve, and whether their merge should refuse a changed row at an unchanged
+    version is a different ticket's question."""
+    for table in ("dim_account_src", "dim_cost_center_src", "fx_rate"):
         assert contracts.load(table).get("rows_are_immutable") is True, table
 
-    for table in ("gl_entry", "gl_adjustment", "fx_rate", "dim_vendor"):
+    for table in ("gl_entry", "gl_adjustment", "dim_vendor"):
         assert "rows_are_immutable" not in contracts.load(table), table
 
 

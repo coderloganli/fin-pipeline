@@ -20,7 +20,23 @@ CURRENCIES = ("CNY", "EUR", "USD", "GBP")
 # a question somebody has to answer. See docs/adr/0013-a-rate-is-not-an-amount.md.
 RATE_MIN_MICROS = 5_000_000   # 5.000000
 RATE_MAX_MICROS = 9_000_000   # 9.000000, exclusive
-DRIFT_PPM = 20_000            # the daily jitter, +/- 2 per cent in parts per million
+DRIFT_PPM = 3_000             # one day's step, +/- 0.3 per cent in parts per million
+
+# How much of the distance back to the centre one step closes, in parts per million.
+# A pure walk is unbounded - at +/-0.3% a day its standard deviation after a year is
+# about 5.7%, harmless over the twelve months generated today, but the date range is a
+# parameter. The pull keeps the series inside its band by construction rather than by
+# luck, and it is also what a real rate does. See docs/adr/0030.
+PULL_PPM = 20_000             # 2 per cent of the gap, per day
+
+WEEKEND = (5, 6)              # Saturday, Sunday: a rate feed does not publish
+
+# What one day can do, as a claim rather than as arithmetic to be re-derived: the step
+# itself, plus whatever the pull adds when the rate is away from its centre. The pull
+# only ever moves towards the centre, and the walk stays close enough to it that this
+# is comfortably above what is reached in practice. It is here so a test can hold the
+# model to a number instead of reconstructing the formula.
+MAX_DAILY_MOVE_PPM = 5_000    # 0.5 per cent
 
 ACCOUNT_TYPES = ("asset", "liability", "equity", "revenue", "expense")
 
@@ -356,7 +372,19 @@ def _rate(micros: int) -> Decimal:
 
 
 def fx_rates(seed: int, months: list[date]) -> list[dict[str, object]]:
-    """A rate per currency per day of the generated range."""
+    """A rate per currency per business day of the generated range.
+
+    The series is a random walk with a pull back towards the currency's centre, rather
+    than an independent draw around that centre every day. Independent jitter let two
+    consecutive days differ by four per cent, which no real rate series does, and which
+    made "the March rate, as it stood in March" a weak demonstration - against noise
+    around a constant, any date's rate is as good as any other's. See docs/adr/0030.
+
+    The walk advances on every calendar day; the weekend's value is simply not written.
+    Skipping the draw would move the stream cursor and shift every later currency, and
+    would also put Monday one step from Friday when a real rate moves further over a
+    weekend than within a week.
+    """
     rng = stream_for(seed, DIMENSIONS)
     rows = []
     for currency in CURRENCIES:
@@ -365,24 +393,32 @@ def fx_rates(seed: int, months: list[date]) -> list[dict[str, object]]:
             if currency == BASE_CURRENCY
             else rng.randrange(RATE_MIN_MICROS, RATE_MAX_MICROS)
         )
+        micros = centre
         for month in months:
             day = month
             while day.month == month.month:
                 # Drawn for every currency, including the base, whose value is then
-                # discarded. CNY is first in CURRENCIES, so dropping these draws would
-                # shift EUR, USD and GBP for a reason unrelated to precision.
+                # discarded, and on every calendar day including the weekend. CNY is
+                # first in CURRENCIES, so dropping either draw would shift EUR, USD and
+                # GBP for a reason unrelated to the rate.
                 drift = rng.randrange(-DRIFT_PPM, DRIFT_PPM + 1)
-                micros = (
-                    schema.RATE_MICROS
-                    if currency == BASE_CURRENCY
-                    else centre * (schema.RATE_MICROS + drift) // schema.RATE_MICROS
-                )
-                rows.append(
-                    {
-                        "currency": currency,
-                        "rate_date": schema.format_date(day),
-                        "rate_to_base": schema.format_rate(_rate(micros)),
-                    }
-                )
+                if currency != BASE_CURRENCY:
+                    # One step of the walk, then the pull. Both stay in integers: a
+                    # float has no exact decimal value, and once the pipeline multiplies
+                    # amounts by rates, where the rounding happened becomes a question
+                    # somebody has to answer. See docs/adr/0013.
+                    micros = micros * (schema.RATE_MICROS + drift) // schema.RATE_MICROS
+                    micros += (centre - micros) * PULL_PPM // schema.RATE_MICROS
+                if day.weekday() not in WEEKEND:
+                    rows.append(
+                        {
+                            "currency": currency,
+                            "rate_date": schema.format_date(day),
+                            "rate_to_base": schema.format_rate(
+                                _rate(schema.RATE_MICROS if currency == BASE_CURRENCY
+                                      else micros)
+                            ),
+                        }
+                    )
                 day += timedelta(days=1)
     return rows
