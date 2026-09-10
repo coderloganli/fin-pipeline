@@ -257,13 +257,22 @@ def test_a_run_that_selects_nothing_is_still_recorded(source, raw_dir):
 
 def test_an_unreadable_line_names_its_line_number(source, raw_dir):
     """Case 12. Not skipped: a log that quietly drops what it cannot parse reports a
-    history missing the very run somebody is looking for."""
+    history missing the very run somebody is looking for.
+
+    The expected number is counted rather than written down. It used to be a bare `3`,
+    which matched anywhere in the message - including the digits of a temporary path -
+    so the assertion passed on a machine whose tmpdir happened to contain a 3 and failed
+    in CI, where it did not. A run writes four events now rather than two, and a test
+    that pins the count of one thing while claiming to test another is how that went
+    unnoticed.
+    """
     load.load_source(source, raw_dir, tables=["gl_entry"])
     path = raw_dir / "_state" / "runs.jsonl"
+    corrupt = len(path.read_text(encoding="utf-8").splitlines()) + 1
     with path.open("a", encoding="utf-8") as handle:
         handle.write("this is not JSON\n")
 
-    with pytest.raises(runs.RunLogError, match="3"):
+    with pytest.raises(runs.RunLogError, match=rf"\bline {corrupt}\b"):
         runs.RunLog(raw_dir).read()
 
 
@@ -365,11 +374,14 @@ def test_a_corrupt_log_is_a_usage_error_at_the_command(source, raw_dir, capsys):
     the same division of labour as `ingest.validate`. See docs/adr/0012."""
     load.load_source(source, raw_dir, tables=["gl_entry"])
     path = raw_dir / "_state" / "runs.jsonl"
+    corrupt = len(path.read_text(encoding="utf-8").splitlines()) + 1
     with path.open("a", encoding="utf-8") as handle:
         handle.write("{ not json\n")
 
     assert runs.main(["--raw", str(raw_dir)]) == 2
-    assert "3" in capsys.readouterr().err
+    # `line N`, not a bare digit: a bare one matches the digits of a temporary path,
+    # which is how this passed locally and failed in CI.
+    assert f"line {corrupt}" in capsys.readouterr().err
 
 
 # --- the record over steps -------------------------------------------------
