@@ -35,7 +35,7 @@ requires = ["setuptools>=68"]
 build-backend = "setuptools.build_meta"
 
 [tool.setuptools]
-packages = ["generator", "ingest", "ingest.contracts", "transform", "transform.spark"]
+packages = ["generator", "ingest", "ingest.contracts", "pipeline", "transform", "transform.spark"]
 # transform/dbt/ is a dbt project, not a Python package: it holds SQL and YAML that dbt
 # reads, and nothing imports it. transform/load.py, transform/db.py and
 # transform/lineage.py sit beside it in transform/ and are ordinary modules.

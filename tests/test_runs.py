@@ -102,15 +102,25 @@ def test_a_successful_load_leaves_one_record(source, raw_dir):
     assert RUN_ID.match(recorded[0].run_id)
 
 
-def test_the_log_holds_a_started_and_a_finished_event(source, raw_dir):
-    """Case 2. Two lines, in that order: what is written first is what survives the
-    failure."""
+def test_the_log_holds_the_run_and_the_step_inside_it(source, raw_dir):
+    """Case 2, restated for docs/adr/0044.
+
+    This asserted two lines per run when docs/adr/0019 was the whole story. A run is now
+    a sequence of named steps and a load run alone is a run with one step in it, so the
+    shape is four events - and the argument the case exists for is unchanged and now
+    asserted at both levels: what is written first is what survives the failure, so the
+    run and the step each announce themselves before doing anything.
+    """
     load.load_source(source, raw_dir)
 
     written = lines(raw_dir)
-    assert [event["event"] for event in written] == ["started", "finished"]
-    assert written[0]["run_id"] == written[1]["run_id"]
+    assert [event["event"] for event in written] == [
+        "started", "step_started", "step_finished", "finished",
+    ]
+    assert len({event["run_id"] for event in written}) == 1
     assert sorted(written[0]["tables"]) == sorted(EVERY_TABLE)
+    assert written[0]["steps"] == ["load"]
+    assert written[1]["step"] == written[2]["step"] == "load"
 
 
 def test_two_identifiers_made_in_the_same_second_differ(monkeypatch):
@@ -247,13 +257,22 @@ def test_a_run_that_selects_nothing_is_still_recorded(source, raw_dir):
 
 def test_an_unreadable_line_names_its_line_number(source, raw_dir):
     """Case 12. Not skipped: a log that quietly drops what it cannot parse reports a
-    history missing the very run somebody is looking for."""
+    history missing the very run somebody is looking for.
+
+    The expected number is counted rather than written down. It used to be a bare `3`,
+    which matched anywhere in the message - including the digits of a temporary path -
+    so the assertion passed on a machine whose tmpdir happened to contain a 3 and failed
+    in CI, where it did not. A run writes four events now rather than two, and a test
+    that pins the count of one thing while claiming to test another is how that went
+    unnoticed.
+    """
     load.load_source(source, raw_dir, tables=["gl_entry"])
     path = raw_dir / "_state" / "runs.jsonl"
+    corrupt = len(path.read_text(encoding="utf-8").splitlines()) + 1
     with path.open("a", encoding="utf-8") as handle:
         handle.write("this is not JSON\n")
 
-    with pytest.raises(runs.RunLogError, match="3"):
+    with pytest.raises(runs.RunLogError, match=rf"\bline {corrupt}\b"):
         runs.RunLog(raw_dir).read()
 
 
@@ -355,8 +374,275 @@ def test_a_corrupt_log_is_a_usage_error_at_the_command(source, raw_dir, capsys):
     the same division of labour as `ingest.validate`. See docs/adr/0012."""
     load.load_source(source, raw_dir, tables=["gl_entry"])
     path = raw_dir / "_state" / "runs.jsonl"
+    corrupt = len(path.read_text(encoding="utf-8").splitlines()) + 1
     with path.open("a", encoding="utf-8") as handle:
         handle.write("{ not json\n")
 
     assert runs.main(["--raw", str(raw_dir)]) == 2
-    assert "3" in capsys.readouterr().err
+    # `line N`, not a bare digit: a bare one matches the digits of a temporary path,
+    # which is how this passed locally and failed in CI.
+    assert f"line {corrupt}" in capsys.readouterr().err
+
+
+# --- the record over steps -------------------------------------------------
+#
+# A run is a sequence of named steps, and the record holds that sequence. The step
+# events are docs/adr/0019's ordering argument applied one level down: what is written
+# first is what survives the failure, so a run that died at `facts` leaves a
+# `step_started` for `facts` and nothing after it. See docs/adr/0044.
+#
+# Cases 1-8 of orchestrate-the-daily-run.
+
+STEPS = ["validate", "load", "recompute", "mart-load", "dbt-build", "clear-affected"]
+
+
+def open_run(log, run_id, *, steps=STEPS, command="daily", **extra):
+    """A `started` event for a pipeline run, without going through the runner."""
+    log.start(run_id, command=command, source="data/source", raw="data/raw",
+              tables=[], steps=steps, **extra)
+
+
+def walk(log, run_id, done, *, status="succeeded", detail=None):
+    """Record `done` as completed steps, so a test can set up the run it is about."""
+    for step in done:
+        log.step_started(run_id, step)
+        log.step_finished(run_id, step, status=status, duration_seconds=0.5,
+                          detail=detail or {})
+
+
+def steps_of(record):
+    return [(step.step, step.status) for step in record.steps]
+
+
+def test_a_run_folds_into_the_steps_it_ran(raw_dir):
+    """Case 1. Three step pairs under one run become three StepRuns, in log order,
+    each carrying its status and duration."""
+    log = runs.RunLog(raw_dir)
+    run_id = runs.new_run_id()
+    open_run(log, run_id)
+    walk(log, run_id, ["validate", "load", "recompute"])
+    log.finish(run_id, status="succeeded", duration_seconds=9.0, tables=[])
+
+    recorded = log.read()
+
+    assert len(recorded) == 1
+    assert steps_of(recorded[0]) == [
+        ("validate", "succeeded"), ("load", "succeeded"), ("recompute", "succeeded"),
+    ]
+    assert [step.duration_seconds for step in recorded[0].steps] == [0.5, 0.5, 0.5]
+
+
+def test_an_interrupted_run_names_the_step_it_stopped_in(raw_dir):
+    """Case 2. A `step_started` with no `step_finished` and no `finished` event: the
+    absence of the line is what says where it died."""
+    log = runs.RunLog(raw_dir)
+    run_id = runs.new_run_id()
+    open_run(log, run_id)
+    walk(log, run_id, ["validate", "load"])
+    log.step_started(run_id, "recompute")
+
+    record = log.read()[0]
+
+    assert record.status == runs.INTERRUPTED
+    assert record.unfinished_step == "recompute"
+    assert steps_of(record)[-1] == ("recompute", runs.INTERRUPTED)
+
+
+def test_a_failed_run_names_the_step_and_keeps_the_ones_before_it(raw_dir):
+    """Case 3. The steps that worked are still recorded as having worked - a record
+    that only said the run failed would lose what it managed to do first."""
+    log = runs.RunLog(raw_dir)
+    run_id = runs.new_run_id()
+    open_run(log, run_id)
+    walk(log, run_id, ["validate", "load"])
+    log.step_started(run_id, "recompute")
+    log.step_finished(run_id, "recompute", status="failed", duration_seconds=1.0,
+                      detail={})
+    log.finish(run_id, status="failed", duration_seconds=4.0, tables=[],
+               failed_step="recompute", error="no such period 2026-13")
+
+    record = log.read()[0]
+
+    assert record.status == "failed"
+    assert record.failed_step == "recompute"
+    assert record.error == "no such period 2026-13"
+    assert steps_of(record) == [
+        ("validate", "succeeded"), ("load", "succeeded"), ("recompute", "failed"),
+    ]
+
+
+def test_a_step_finishing_without_starting_is_a_corrupt_log(raw_dir):
+    """Case 4. The same discipline the run level already applies: a log that cannot be
+    trusted is refused rather than half-read."""
+    log = runs.RunLog(raw_dir)
+    run_id = runs.new_run_id()
+    open_run(log, run_id)
+    log.step_finished(run_id, "load", status="succeeded", duration_seconds=1.0,
+                      detail={})
+
+    with pytest.raises(runs.RunLogError, match="load"):
+        log.read()
+
+
+def test_a_step_starting_again_after_it_finished_is_a_retry(raw_dir):
+    """Case 5. Airflow retries one task, not the DAG run, and the run identifier is
+    carried between tasks - so a retried step really does start twice under one run.
+    Both attempts are kept: that is what happened. See docs/adr/0045."""
+    log = runs.RunLog(raw_dir)
+    run_id = runs.new_run_id()
+    open_run(log, run_id)
+    log.step_started(run_id, "load")
+    log.step_finished(run_id, "load", status="failed", duration_seconds=1.0, detail={})
+    log.step_started(run_id, "load")
+    log.step_finished(run_id, "load", status="succeeded", duration_seconds=2.0,
+                      detail={})
+
+    record = log.read()[0]
+
+    assert steps_of(record) == [("load", "failed"), ("load", "succeeded")]
+    # Numbered by the reader, never by the writer: a retried Airflow task runs in a new
+    # process and has no idea it is the second try, so one that wrote its own number
+    # would write a second attempt 1.
+    assert [step.attempt for step in record.steps] == [1, 2]
+
+
+def test_a_step_starting_again_while_still_open_is_a_corrupt_log(raw_dir):
+    """Case 5b. The retry above is legitimate because the first attempt closed. A step
+    that starts again with its previous attempt still open is the concatenated or
+    edited log docs/adr/0019 refuses to read."""
+    log = runs.RunLog(raw_dir)
+    run_id = runs.new_run_id()
+    open_run(log, run_id)
+    log.step_started(run_id, "load")
+    log.step_started(run_id, "load")
+
+    with pytest.raises(runs.RunLogError, match="load"):
+        log.read()
+
+
+def test_a_log_in_the_two_event_shape_still_reads(source, raw_dir):
+    """Case 6. The file is appended to and never rewritten, so a log spanning this
+    change is the ordinary case rather than something to migrate. A run written before
+    steps existed reads as a run with none, with its tables intact."""
+    load.load_source(source, raw_dir)
+    path = raw_dir / "_state" / "runs.jsonl"
+    written = [json.loads(line) for line in path.read_text(encoding="utf-8").splitlines()]
+    # Strip what this task added, leaving exactly the two events docs/adr/0019 wrote.
+    written = [event for event in written
+               if event["event"] in ("started", "finished")]
+    for event in written:
+        event.pop("steps", None)
+        event.pop("failed_step", None)
+        event.pop("orchestrator", None)
+        event.pop("orchestrator_run_id", None)
+    path.write_text("".join(json.dumps(e) + "\n" for e in written), encoding="utf-8")
+
+    record = runs.RunLog(raw_dir).read()[0]
+
+    assert record.status == "succeeded"
+    assert record.steps == []
+    assert sorted(by_table(record)) == sorted(EVERY_TABLE)
+
+
+def test_the_command_shows_a_failed_run_as_its_steps(raw_dir, capsys):
+    """Case 7. This is the morning question, answered: which step, what did it say,
+    and what had already worked."""
+    log = runs.RunLog(raw_dir)
+    run_id = runs.new_run_id()
+    open_run(log, run_id)
+    walk(log, run_id, ["validate", "load"])
+    log.step_started(run_id, "recompute")
+    log.step_finished(run_id, "recompute", status="failed", duration_seconds=1.5,
+                      detail={})
+    log.finish(run_id, status="failed", duration_seconds=4.0, tables=[],
+               failed_step="recompute", error="no such period 2026-13")
+
+    assert runs.main(["--raw", str(raw_dir), "--run", run_id]) == 0
+
+    printed = capsys.readouterr().out
+    assert "recompute" in printed
+    assert "no such period 2026-13" in printed
+    for step in ("validate", "load"):
+        assert step in printed
+    assert "1.5" in printed
+
+
+def test_the_listing_shows_how_many_steps_a_run_ran(raw_dir, capsys):
+    """Case 8. The list is read to decide which run to open."""
+    log = runs.RunLog(raw_dir)
+    run_id = runs.new_run_id()
+    open_run(log, run_id)
+    walk(log, run_id, ["validate", "load", "recompute"])
+    log.finish(run_id, status="succeeded", duration_seconds=9.0, tables=[])
+
+    assert runs.main(["--raw", str(raw_dir)]) == 0
+
+    printed = capsys.readouterr().out
+    assert run_id in printed
+    assert "3 steps" in printed
+    assert "succeeded" in printed
+
+
+def test_a_step_event_after_the_run_finished_is_a_corrupt_log(raw_dir):
+    """A run has already said how it ended. A step event after that would retroactively
+    change a terminal record, which is the same defect as a run finishing twice."""
+    log = runs.RunLog(raw_dir)
+    run_id = runs.new_run_id()
+    open_run(log, run_id)
+    walk(log, run_id, ["validate"])
+    log.finish(run_id, status="succeeded", duration_seconds=1.0, tables=[])
+    log.step_started(run_id, "load")
+
+    with pytest.raises(runs.RunLogError, match="already finished"):
+        log.read()
+
+
+def test_a_step_event_for_a_run_that_never_started_is_a_corrupt_log(raw_dir):
+    """The log is appended to and never edited, so this means it was truncated or
+    written by something else - reading past it would report a history that is not what
+    happened."""
+    log = runs.RunLog(raw_dir)
+    log.step_started(runs.new_run_id(), "load")
+
+    with pytest.raises(runs.RunLogError, match="never started"):
+        log.read()
+
+
+def test_a_step_event_with_no_step_named_is_a_corrupt_log(raw_dir):
+    """Checked on the way in rather than tripping over a None several frames later."""
+    log = runs.RunLog(raw_dir)
+    run_id = runs.new_run_id()
+    open_run(log, run_id)
+    log.append({"event": "step_started", "run_id": run_id, "started_at": "now"})
+
+    with pytest.raises(runs.RunLogError, match="name its step"):
+        log.read()
+
+
+def test_a_step_cannot_claim_to_have_finished_by_not_finishing(raw_dir):
+    """`interrupted` is what the absence of the finished event means, so writing it as
+    a status would be a step reporting the one thing it cannot report."""
+    log = runs.RunLog(raw_dir)
+    run_id = runs.new_run_id()
+    open_run(log, run_id)
+
+    with pytest.raises(ValueError, match="succeeded"):
+        log.step_finished(run_id, "load", status=runs.INTERRUPTED,
+                          duration_seconds=1.0)
+
+
+def test_two_steps_can_be_open_at_once_and_each_closes_its_own(raw_dir):
+    """Not a shape this pipeline produces - steps run in order - but the folding is by
+    step rather than by position, and a reader that matched the most recent open step
+    regardless of name would attribute one step's outcome to another."""
+    log = runs.RunLog(raw_dir)
+    run_id = runs.new_run_id()
+    open_run(log, run_id)
+    log.step_started(run_id, "validate")
+    log.step_started(run_id, "load")
+    log.step_finished(run_id, "validate", status="succeeded", duration_seconds=1.0)
+
+    record = log.read()[0]
+
+    assert steps_of(record) == [("validate", "succeeded"), ("load", runs.INTERRUPTED)]
+    assert record.unfinished_step == "load"

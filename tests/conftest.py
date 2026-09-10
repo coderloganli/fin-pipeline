@@ -14,6 +14,7 @@ from pathlib import Path
 
 import pytest
 
+from pipeline import dbt as pipeline_dbt
 from transform.db import (  # noqa: F401  - re-exported for the tests that import them
     DEFAULTS,
     START_COMMAND,
@@ -244,7 +245,13 @@ class Build:
 
 
 def dbt_env(landing: str, mart: str) -> dict:
-    values = dict(os.environ)
+    """The environment dbt reads, with the connection this suite resolved.
+
+    `pipeline.dbt` builds the schema half; the connection half is added here because
+    `transform.db.settings` is what the suite already trusts to resolve it, and two
+    resolvers would drift.
+    """
+    values = pipeline_dbt.environment(landing, mart)
     values.update(settings())
     values["POSTGRES_LANDING_SCHEMA"] = landing
     values["POSTGRES_MART_SCHEMA"] = mart
@@ -252,11 +259,13 @@ def dbt_env(landing: str, mart: str) -> dict:
 
 
 def run_dbt(args: list[str], landing: str, mart: str) -> subprocess.CompletedProcess:
-    """Invoke dbt as a subprocess against this build's own schemas.
+    """Invoke dbt against this build's own schemas.
 
     A subprocess rather than dbt's Python entry point, because what CI runs is the
     command, and a gate that only fires through an in-process API is a gate whose
-    behaviour in CI is untested.
+    behaviour in CI is untested. That reasoning now lives in `pipeline/dbt.py`, which
+    the pipeline's own `dbt-build` step calls: one statement of how dbt is run here,
+    rather than one per caller.
     """
     return subprocess.run(
         [sys.executable, "-m", "dbt.cli.main", *args,
@@ -281,13 +290,7 @@ def dbt_manifest() -> Path:
     if target.is_file():
         return target
 
-    result = subprocess.run(
-        [sys.executable, "-m", "dbt.cli.main", "parse",
-         "--project-dir", str(DBT_PROJECT), "--profiles-dir", str(DBT_PROJECT)],
-        env=dbt_env(TEST_LANDING_SCHEMA, TEST_MART_SCHEMA),
-        capture_output=True,
-        text=True,
-    )
+    result = run_dbt(["parse"], TEST_LANDING_SCHEMA, TEST_MART_SCHEMA)
     if not target.is_file():
         raise AssertionError(
             f"`dbt parse` wrote no manifest at {target}:\n"

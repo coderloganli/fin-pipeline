@@ -1,8 +1,45 @@
 # Services this platform needs, for local development and for CI.
 #
-# Postgres serves the mart. Later services - Airflow, Spark - are added here by
-# the task that needs them; the host machine edits code and runs tests, it does
-# not run services. See docs/adr/0004-services-run-in-containers.md.
+# Postgres serves the mart, and Airflow orchestrates the runs against it. The host
+# machine edits code and runs tests; it does not run services. See
+# docs/adr/0004-services-run-in-containers.md and docs/adr/0047.
+#
+# Airflow is three long-running services plus a one-shot init, on LocalExecutor - so
+# the scheduler runs tasks in its own process and there is no worker service, no Redis
+# and no broker. Its metadata is a second database inside the Postgres below rather
+# than a Postgres of its own: the mart is dropped and rebuilt routinely, and Airflow's
+# history must not be inside that blast radius.
+
+# Shared by every Airflow service, so the connection string and the executor are
+# stated once. AIRFLOW_DB is a database inside the postgres service below, never the
+# mart's own.
+x-airflow-environment: &airflow-environment
+  AIRFLOW__CORE__EXECUTOR: LocalExecutor
+  AIRFLOW__CORE__LOAD_EXAMPLES: "false"
+  AIRFLOW__DATABASE__SQL_ALCHEMY_CONN: >-
+    postgresql+psycopg2://${POSTGRES_USER:-fin_pipeline}:${POSTGRES_PASSWORD:-fin_pipeline}@postgres:5432/${AIRFLOW_DB:-airflow}
+  AIRFLOW__CORE__DAGS_FOLDER: /opt/fin-pipeline/dags
+  # Named here as well as inside the connection string, because airflow-init has to
+  # create the database before anything can connect to it.
+  AIRFLOW_DB: ${AIRFLOW_DB:-airflow}
+  # The mart's own connection, for the steps a task runs.
+  POSTGRES_HOST: postgres
+  POSTGRES_PORT: "5432"
+  POSTGRES_DB: ${POSTGRES_DB:-fin_pipeline}
+  POSTGRES_USER: ${POSTGRES_USER:-fin_pipeline}
+  POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-fin_pipeline}
+  POSTGRES_LANDING_SCHEMA: ${POSTGRES_LANDING_SCHEMA:-landing}
+  POSTGRES_MART_SCHEMA: ${POSTGRES_MART_SCHEMA:-mart}
+
+# The repository, mounted over what the image copied, so that a DAG or a step edited
+# here is what the dag-processor parses - without an image rebuild.
+x-airflow-volumes: &airflow-volumes
+  - ./dags:/opt/fin-pipeline/dags
+  - ./pipeline:/opt/fin-pipeline/pipeline
+  - ./ingest:/opt/fin-pipeline/ingest
+  - ./transform:/opt/fin-pipeline/transform
+  - ./generator:/opt/fin-pipeline/generator
+  - ./data:/opt/fin-pipeline/data
 
 services:
   postgres:
@@ -27,6 +64,62 @@ services:
       interval: 2s
       timeout: 3s
       retries: 15
+
+  # --- Airflow -------------------------------------------------------------
+  #
+  # The database cannot be created by a script in /docker-entrypoint-initdb.d/: the
+  # Postgres image runs those only against an empty data directory, so on every machine
+  # that has already run this project the script would be skipped and Airflow would
+  # start against a database that is not there. This creates it, then migrates.
+  # See docs/adr/0047.
+  airflow-init:
+    build: .
+    depends_on:
+      postgres:
+        condition: service_healthy
+    environment:
+      <<: *airflow-environment
+    entrypoint: /bin/bash
+    command:
+      - -c
+      - |
+        set -e
+        python /opt/fin-pipeline/pipeline/create_metadata_database.py
+        airflow db migrate
+
+  airflow-apiserver:
+    build: .
+    depends_on:
+      airflow-init:
+        condition: service_completed_successfully
+    environment:
+      <<: *airflow-environment
+    ports:
+      - "${AIRFLOW_PORT:-8080}:8080"
+    volumes: *airflow-volumes
+    command: api-server
+
+  airflow-scheduler:
+    build: .
+    depends_on:
+      airflow-init:
+        condition: service_completed_successfully
+    environment:
+      <<: *airflow-environment
+    volumes: *airflow-volumes
+    command: scheduler
+
+  # Required in every Airflow 3 deployment, and always a standalone process: the
+  # scheduler is kept from reading DAG bundles or running author-provided code.
+  airflow-dag-processor:
+    build: .
+    depends_on:
+      airflow-init:
+        condition: service_completed_successfully
+    environment:
+      <<: *airflow-environment
+    volumes: *airflow-volumes
+    command: dag-processor
 
 volumes:
   postgres_data:

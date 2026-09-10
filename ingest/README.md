@@ -59,12 +59,18 @@ Lands source extracts into the raw layer and keeps the load replayable.
 
   An update that arrives after the overlap window has passed is missed. That is what a
   watermarked load is, and `--full` is what recovers from it.
-- **Run records.** Every run appends two lines to `data/raw/_state/runs.jsonl`: a
-  `started` event naming the run, its tables and its window, and a `finished` event
-  carrying each table's row counts, watermark range and source file digest, the
-  duration, and whether it succeeded. The record is opened before any table is read, so
-  a run that failed is written down - naming the table it failed on - and a run that
-  was killed leaves its first line and reads back as `interrupted`.
+- **Run records.** Every run appends to `data/raw/_state/runs.jsonl` and rewrites
+  nothing: a `started` event naming the run, its tables and its steps, a
+  `step_started`/`step_finished` pair around each step - the load's carrying each
+  table's row counts, watermark range and source file digest - and a `finished` event.
+  The record is opened before any table is read, so a run that failed is written down,
+  naming the step and the table it failed on, and a run that was killed leaves its
+  `started` line and the `step_started` of the step it was in and reads back as
+  `interrupted` naming that step. See `docs/adr/0019` and `docs/adr/0044`.
+
+  A load typed on its own is a run with one step in it. Under `python -m pipeline` it is
+  one step of a longer run, and the runner is what records it - `load_source` then
+  belongs to that run without writing to the log itself.
 
   ```
   python -m ingest.runs

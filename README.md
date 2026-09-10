@@ -2,12 +2,14 @@
 
 A finance data platform where the hard problems are data engineering ones: point-in-time correctness, slowly changing dimensions, late-arriving corrections, idempotent replay, schema contracts, and partitioned scale. An LLM layer sits on top as a consumer of the warehouse, not as its centrepiece.
 
-**Status: the batch path is built, from the generator to a queryable mart.** The
-generator, the source-table contracts and their validator, the watermarked idempotent
-load, the run record, the SCD2 dimensions, the point-in-time fact, the monthly balances,
-and the mart those become in Postgres — a star with six quality gates over it and a
-lineage graph that names what a source change would break. `ml/`, `insight/`, `app/` and
-`dags/` carry a README stating what each is for and no module yet.
+**Status: the batch path is built and orchestrated, from the generator to a queryable
+mart.** The generator, the source-table contracts and their validator, the watermarked
+idempotent load, the run record, the SCD2 dimensions, the point-in-time fact, the monthly
+balances, and the mart those become in Postgres — a star with six quality gates over it
+and a lineage graph that names what a source change would break. `pipeline/` puts those
+steps in order and records what each one did; `dags/` declares the daily run and the
+backfill for Airflow. `ml/`, `insight/` and `app/` carry a README stating what each is
+for and no module yet.
 `docs/architecture.md` is the file that says what is actually true today; the rest of
 this one describes what the platform is for. No measured numbers are published yet.
 
@@ -147,10 +149,11 @@ Airflow orchestrates the daily run and the backfills. Each directory carries a R
 generator/    synthetic ledger data, with switches for every failure mode the tests need
 ingest/       contract validation, watermarked incremental merge, run records
 transform/    spark/ for the point-in-time join and aggregation; dbt/ for models, tests, lineage
+pipeline/     the steps a run is made of, in order, and the record of what each one did
 ml/           anomaly detection over monthly balances, with time-series backtesting
 insight/      LLM explanations with mandatory source citations, and the golden-set evaluation
 app/          Streamlit self-service application
-dags/         Airflow DAGs for the daily run, backfills, and evaluation
+dags/         Airflow DAGs for the daily run and backfills — declarations only
 tests/        pytest suites
 docs/         architecture.md, and the decision records under adr/
 ```
@@ -167,6 +170,34 @@ docker compose up -d          # Postgres, on 127.0.0.1:5432
 pip install -e ".[dev,spark,dbt]"
 pytest -q
 ```
+
+## Running the pipeline
+
+A run is a sequence of named steps — validate, load, recompute, mart-load, dbt-build,
+clear-affected — and every one of them says afterwards what it did:
+
+```
+python -m generator                       # synthetic source extracts into data/source
+python -m pipeline daily                  # the whole run, in order, stopping on failure
+python -m ingest.runs                     # what the recent runs did
+python -m ingest.runs --run <run_id>      # one run, step by step
+```
+
+`python -m pipeline backfill --periods 2026-01:2026-06` rebuilds a range whether or not
+anything is recorded as owed, which is what recovers an update that arrived after the
+watermark window closed.
+
+To run it on a schedule instead, `docker compose up -d` also brings up Airflow —
+an API server, a scheduler and a DAG processor on `LocalExecutor`, built from the
+`Dockerfile` here, with their metadata in a second database inside the same Postgres.
+The UI is on `127.0.0.1:8080`, and
+
+```
+docker compose run --rm airflow-dag-processor airflow dags list
+```
+
+is what tells you the DAG files parse — the test suite deliberately never imports
+Airflow, so nothing in `pytest -q` can tell you that. See `docs/adr/0046` and `0047`.
 
 Connection settings come from the environment. The defaults in `.env.example`
 match what `compose.yaml` starts, so nothing needs setting to run the suite; copy
@@ -212,8 +243,10 @@ because a list of gates is exactly the kind of claim worth being able to check:
   period's mart figures, account by account.
 - **pytest — built, over what exists.** The generator's failure modes, the contracts and
   the validator, the raw layer, the watermarked merge's idempotency, the SCD2 loading and
-  point-in-time join, the monthly balances, the mart and its gates, and the lineage
-  graph. Backfill scoping is not covered because it is not written.
+  point-in-time join, the monthly balances, the mart and its gates, the lineage graph,
+  backfill scoping, and the run end to end: three runs over an unchanged source leave the
+  mart's row counts and checksums where they were, a backdated adjustment rewrites only
+  the partitions it affects, and a run that died names the step it died in.
 
 `pytest -q` is the whole of the test suite. CI runs it, then generates the dbt docs and
 renders `transform/dbt/target/lineage.html` as a build artefact.

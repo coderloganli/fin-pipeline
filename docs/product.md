@@ -6,8 +6,10 @@ validator, the watermarked incremental load, the run record, the effective-dated
 account, cost-centre and exchange-rate dimensions, the point-in-time attribution of each
 entry, the monthly balances built from it, and the relational layer those become in
 Postgres: a star an analyst can query, six quality gates over it, and a lineage graph
-that names what a source change would break. The intraday path, the anomaly model, the
-explanation layer and the application are designed and not yet built.
+that names what a source change would break. Those steps are now a scheduled run rather
+than a sequence somebody types, and every step of it says afterwards what it did. The
+intraday path, the anomaly model, the explanation layer and the application are designed
+and not yet built.
 `docs/architecture.md` states what is true today; this file states what is being
 built toward, and the two are not the same document.
 
@@ -62,6 +64,13 @@ difference is the entries that have not arrived yet.
 **Reproduces an old report.** Re-running a closed period returns what it returned
 at the time, and the run can say which version of the org hierarchy and which
 day's rates it used.
+
+**Says what last night's run did.** A run is a named sequence of steps, and each one
+records what it handled and how long it took before it hands over to the next. A run that
+died is reported as having died, naming the step it died in — not as silence to be
+reconstructed from whoever still has the terminal open. This is the same principle as
+lineage pointed at the pipeline rather than at the data: a run that cannot say what it
+did is a defect, not a limitation.
 
 **Fails loudly when a source changes.** A new column, or a changed type, in the
 upstream ledger table breaks the run in CI and names the downstream models that

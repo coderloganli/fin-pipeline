@@ -34,11 +34,26 @@ import logging
 import os
 import sys
 import time
-from dataclasses import dataclass, field
+from dataclasses import asdict, dataclass, field
 from datetime import datetime, timedelta
 from pathlib import Path
 
 from . import affected, contracts, raw, runs, validate
+
+# What this is called when it is one step of a pipeline run. Named here rather than in
+# the runner, so the step's identity belongs to the thing that performs it.
+STEP = "load"
+
+
+def describe_failure(failure: BaseException) -> str:
+    """A failure as one line, without trusting it to describe itself. Formatting an
+    exception calls its `__str__`, and one that raises there would replace the failure
+    it was being asked about."""
+    name = type(failure).__name__
+    try:
+        return f"{name}: {failure}"
+    except Exception:
+        return f"{name}: (its __str__ raised)"
 
 __all__ = [
     "DEFAULT_OVERLAP_DAYS",
@@ -588,6 +603,8 @@ def load_source(
     *,
     overlap_days: int = DEFAULT_OVERLAP_DAYS,
     full: bool = False,
+    run_id: str | None = None,
+    run_log: "runs.RunLog | None" = None,
 ) -> LoadReport:
     """Load a source directory into a raw layer, and record that the run happened.
 
@@ -599,6 +616,19 @@ def load_source(
     unchanged, so the exit code is decided exactly where it was before. A record
     written only on the paths that worked would be missing from the run somebody is
     investigating. See docs/adr/0019.
+
+**`run_log` is what says this is one step of somebody else's run.** Given one, the
+    load belongs to `run_id` - which is what stamps its rows, per docs/adr/0018 - and
+    writes nothing to the log at all. The runner records the step, as it does for every
+    step and with no exception for this one; what the load has to say for itself is
+    returned as `step_detail` and recorded there. A rule with an exception is a rule
+    everybody has to check the exception list for, and this one would be checked in the
+    middle of an incident.
+
+    Given no `run_log`, the load opens a run of its own with one step in it, using
+    `run_id` as its identifier if one was passed and generating one otherwise - so
+    `python -m ingest.load` leaves a complete record rather than a shape of its own.
+    See docs/adr/0044 and 0045.
     """
     source = Path(source_dir)
     if not source.is_dir():
@@ -607,10 +637,13 @@ def load_source(
         raise NotADirectoryError(f"no source directory at {source}")
 
     names = list(tables) if tables is not None else contracts.tables()
-    run_id = runs.new_run_id()
-    log = runs.RunLog(raw_dir)
-    log.start(run_id, command="load", source=str(source), raw=str(Path(raw_dir)),
-              tables=names, overlap_days=overlap_days, full=full)
+    owns_the_run = run_log is None
+    run_id = run_id or runs.new_run_id()
+    log = run_log or runs.RunLog(raw_dir)
+    if owns_the_run:
+        log.start(run_id, command="load", source=str(source), raw=str(Path(raw_dir)),
+                  tables=names, steps=[STEP], overlap_days=overlap_days, full=full)
+        log.step_started(run_id, STEP)
 
     started = time.monotonic()
     report = LoadReport(run_id=run_id)
@@ -627,14 +660,51 @@ def load_source(
             failed_table = None
         watermarks.save()
     except Exception as failure:
-        log.finish(run_id, status=runs.FAILED, duration_seconds=time.monotonic() - started,
-                   tables=report.as_table_runs(), failed_table=failed_table,
-                   error=f"{type(failure).__name__}: {failure}")
+        elapsed = time.monotonic() - started
+        if owns_the_run:
+            log.step_finished(run_id, STEP, status=runs.FAILED,
+                              duration_seconds=elapsed,
+                              detail=step_detail(report, failed_table=failed_table))
+            log.finish(run_id, status=runs.FAILED, duration_seconds=elapsed,
+                       tables=report.as_table_runs(), failed_table=failed_table,
+                       failed_step=STEP,
+                       error=describe_failure(failure))
+        else:
+            # Inside somebody else's run, the runner writes the record - but only this
+            # knows which table it got to and what the tables before it did. Attaching
+            # it to the exception is how that survives; the failure itself is re-raised
+            # unchanged, so what it means is still the caller's to decide.
+            try:
+                failure.step_detail = step_detail(report, failed_table=failed_table)
+            except Exception:
+                # Broad on purpose. Building the detail or attaching it can fail - an
+                # exception type with a `__setattr__` of its own can raise anything at
+                # all - and the detail is a courtesy while the failure is the thing.
+                # Losing the second in order to report the first would be exactly
+                # backwards, and this is the path where something is already wrong.
+                pass
         raise
 
-    log.finish(run_id, status=runs.SUCCEEDED, duration_seconds=time.monotonic() - started,
-               tables=report.as_table_runs())
+    if owns_the_run:
+        elapsed = time.monotonic() - started
+        log.step_finished(run_id, STEP, status=runs.SUCCEEDED,
+                          duration_seconds=elapsed, detail=step_detail(report))
+        log.finish(run_id, status=runs.SUCCEEDED, duration_seconds=elapsed,
+                   tables=report.as_table_runs())
     return report
+
+
+def step_detail(report: LoadReport, failed_table: str | None = None) -> dict:
+    """What the load has to say for itself as one step of a run.
+
+    The same per-table figures the `finished` event carries when the load is a run of
+    its own. They are recorded in both places rather than in neither: a load run by hand
+    is read at the run level, and a load inside a pipeline is read at the step.
+    """
+    detail: dict = {"tables": [asdict(table) for table in report.as_table_runs()]}
+    if failed_table is not None:
+        detail["failed_table"] = failed_table
+    return detail
 
 
 # --- the command -----------------------------------------------------------
@@ -658,6 +728,9 @@ def build_parser() -> argparse.ArgumentParser:
                              f"(default: {DEFAULT_OVERLAP_DAYS})")
     parser.add_argument("--full", action="store_true",
                         help="ignore the stored watermark and re-read the whole source")
+    parser.add_argument("--run-id", dest="run_id", default=None,
+                        help="record this load under an identifier chosen by the "
+                             "caller, rather than generating one")
     return parser
 
 
@@ -672,9 +745,13 @@ def main(argv: list[str] | None = None) -> int:
     logging.basicConfig(stream=sys.stderr, level=logging.WARNING, format="%(message)s")
 
     try:
+        # No `run_log`, so this opens a run of its own and `--run-id` names it. A
+        # command that joined a run it had not opened would write step events under a
+        # `started` event that does not exist, which `RunLog.read` refuses outright.
         report = load_source(
             args.source, args.raw, tables=args.tables,
             overlap_days=args.overlap_days, full=args.full,
+            run_id=args.run_id,
         )
     except (NotADirectoryError, FileNotFoundError, LoadError) as failure:
         print(f"{failure}", file=sys.stderr)

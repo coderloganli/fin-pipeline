@@ -24,9 +24,10 @@ also what first installs PySpark. `transform/load.py` copies the staging layer i
 Postgres and `transform/dbt/` models it as a star with six quality gates over it; late
 entries, adjustments and dimension changes recompute only the periods they affect;
 `transform/lineage.py` renders the graph and answers what a column change would break.
-`ml/`, `insight/`, `app/` and `dags/` exist and each carries a README stating what that
-layer is and is not responsible for, but no module has landed in them. Read the READMEs
-for intent; read this file for what is actually true today.
+`pipeline/` puts those in order and writes down what each one did, and `dags/` declares the
+two Airflow DAGs that call it. `ml/`, `insight/` and `app/` exist and each carries a README
+stating what that layer is and is not responsible for, but no module has landed in them.
+Read the READMEs for intent; read this file for what is actually true today.
 
 ## Shape
 
@@ -47,7 +48,8 @@ generator ──▶ raw (Parquet) ──▶ staging (Parquet, PySpark) ──▶
 | `ml/` | Anomaly detection over monthly balances |
 | `insight/` | The LLM investigation loop and its golden-set evaluation |
 | `app/` | Streamlit application; queries the mart, computes nothing |
-| `dags/` | Airflow DAGs: daily run, backfill, evaluation |
+| `pipeline/` | The steps a run is made of, in order, and the record of what each one did |
+| `dags/` | Airflow DAGs: the daily run and the backfill. Declarations only — see `docs/adr/0046` |
 | `tests/` | pytest suites |
 
 ## Boundaries
@@ -69,9 +71,16 @@ settings so the test suite can point at schemas of its own. See `docs/adr/0034`.
 carries its own `profiles.yml` rather than expecting one in `~/.dbt`, so the same
 command works on a machine, in CI and in an image with nothing to place first.
 
-Every service this platform grows — Airflow — is added to the same
-`compose.yaml` by the task that needs it. The host machine edits code and runs tests;
-it does not run services. See `docs/adr/0004-services-run-in-containers.md`.
+Every service this platform grows is added to the same `compose.yaml` by the task that
+needs it. The host machine edits code and runs tests; it does not run services. See
+`docs/adr/0004-services-run-in-containers.md`.
+
+**Airflow is three of those services** — `airflow-apiserver`, `airflow-scheduler` and
+`airflow-dag-processor`, the last required by Airflow 3 as a standalone process. They run
+`LocalExecutor`, so there is no worker and no broker, and their metadata is a second
+database inside the same Postgres. They are built from a `Dockerfile` extending
+`apache/airflow:3.3.1-python3.13` with a JRE and this project installed; `apache-airflow`
+is deliberately absent from `pyproject.toml`. See `docs/adr/0047`.
 
 **Spark is the exception, and it is not a service.** It runs in local mode inside the
 process that imports it, so it is a library with a toolchain requirement rather than
@@ -162,8 +171,8 @@ does not count itself, which is what keeps the graph acyclic. See docs/adr/0036.
 the tests over them, so a gate that goes red does so after the table it guards has been
 written. `dbt build` stops there and exits non-zero, and nothing reads the mart yet — but
 what is missing is an atomic swap, not a check. Adding one means building into a schema
-of the run's own and renaming it into place, which is a decision about what a run is;
-`orchestrate-the-daily-run` owns that. See docs/adr/0034.
+of the run's own and renaming it into place, which reaches every schema name and the
+whole test harness; `swap-the-mart-into-place` owns it. See docs/adr/0034.
 
 **The mart is a function of its inputs, so nothing in it names the build that wrote
 it.** Rebuilding from an unchanged staging snapshot is identical in every column. A full
@@ -318,14 +327,34 @@ renders the declared columns of every row as text, sorts them, and hashes that �
 the Parquet bytes, which carry the writer's version, and not any ingestion metadata,
 which differs between runs. See docs/adr/0017.
 
-**Every run leaves a record, and it is written before the run is over.**
-`data/raw/_state/runs.jsonl` is appended to twice per run: a `started` event naming the
-run, its tables and its window, and a `finished` event carrying each table's row
-counts, watermark range and source file digest, the duration, and whether it
-succeeded. A run that dies leaves only its first line and is reported as
-`interrupted` — a record written only on the paths that worked would be missing from
-exactly the run someone is investigating. `python -m ingest.runs` reads the log. See
-docs/adr/0019.
+**Every run leaves a record, step by step, and it is written before the run is over.**
+`data/raw/_state/runs.jsonl` is appended to and never rewritten: a `started` event, a
+`step_started`/`step_finished` pair around each step, and a `finished` event. A step's
+finished event carries what that step has to say — for `load`, each table's row counts,
+watermark range and source file digest. A run that dies leaves its `started` line and the
+`step_started` of the step it died in, and is reported as `interrupted` naming that step;
+a record written only on the paths that worked would be missing from exactly the run
+someone is investigating. `python -m ingest.runs --run` prints a run as its steps. See
+docs/adr/0019 and 0044.
+
+**The run identifier is the platform's; the orchestrator's is recorded beside it.** It
+keeps the shape `docs/adr/0019` fixed, because `docs/adr/0018` stamps it on rows and the
+lineage chain follows it backwards. Airflow's own run id is a field on the `started`
+event, so the UI and the record name each other without the data layer gaining a second
+identity. See docs/adr/0045.
+
+**A run is a sequence of named steps, and the sequence lives outside the DAG.**
+`pipeline/steps.py` declares them — `validate`, `load`, `recompute`, `mart-load`,
+`dbt-build`, `clear-affected`; a backfill is the last four over an explicit period range.
+`pipeline/run.py` is `open_run`, `run_step`, `close_run` and `run_pipeline`, the three
+primitives separate so that one Airflow task can be one step while the record still spans
+the DAG run. `clear-affected` is last for the reason the watermark moves last in
+`docs/adr/0016`: what is cleared first is what goes missing when the run dies. Files under
+`dags/` declare a schedule and a task graph and import nothing below `pipeline`; the suite
+tests the runner directly and the DAG files by parsing them, never by importing Airflow.
+Nothing on the host proves the DAGs parse under Airflow — `docker compose run --rm
+airflow-dag-processor airflow dags list` does, and it is a command rather than a test. See
+docs/adr/0046.
 
 **A raw row says which run first landed it and which run last wrote it.**
 `_first_run_id` survives every rewrite — a merge that reopened the partition for some

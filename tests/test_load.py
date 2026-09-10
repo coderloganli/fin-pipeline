@@ -1590,3 +1590,92 @@ def test_a_restatement_is_an_exit_code_rather_than_a_traceback(tmp_path, raw_dir
     assert "rows_are_immutable" in printed.err
     assert "CC-002" in printed.err
     assert printed.out == "", "a failed load should not also report success"
+
+
+# --- the run identifier, injected ------------------------------------------
+#
+# `record-every-pipeline-run` designed `run_id` and `run_log` parameters for
+# `load_source` and then declined to add them, on the grounds that nothing called
+# them. The runner calls them now: under a pipeline run, the load is one step of
+# somebody else's run rather than a run of its own. See docs/adr/0044 and 0045.
+#
+# Cases 9-12 of orchestrate-the-daily-run.
+
+def events(raw_dir):
+    path = raw_dir / "_state" / "runs.jsonl"
+    return [json.loads(line) for line in path.read_text(encoding="utf-8").splitlines()]
+
+
+def test_an_injected_load_writes_nothing_to_the_log(source, raw_dir):
+    """Case 9. Given a run to belong to, the load writes no events at all: the runner
+    records every step, and this one is not an exception to that.
+
+    The load recorded itself here at first, and the result was two `step_started`
+    events for `load` under one run - which docs/adr/0044's own rule against a step
+    starting again while its previous attempt is still open correctly refuses to read.
+    The identifier is still what belongs to the run: it is what stamps the rows, per
+    docs/adr/0018.
+    """
+    log = runs.RunLog(raw_dir)
+    run_id = runs.new_run_id()
+    log.start(run_id, command="daily", source=str(source), raw=str(raw_dir),
+              tables=[], steps=["load"])
+
+    load.load_source(source, raw_dir, tables=["gl_entry"], run_id=run_id, run_log=log)
+
+    assert [event["event"] for event in events(raw_dir)] == ["started"]
+
+
+def test_the_step_detail_carries_what_each_table_did(source, raw_dir):
+    """Case 9, continued. Nothing is lost by the load not writing its own events: what
+    it has to say is handed back for the runner to record, so the per-table counts reach
+    the step record the way every other step's detail does."""
+    log = runs.RunLog(raw_dir)
+    run_id = runs.new_run_id()
+    log.start(run_id, command="daily", source=str(source), raw=str(raw_dir),
+              tables=[], steps=["load"])
+
+    report = load.load_source(source, raw_dir, tables=["gl_entry"],
+                              run_id=run_id, run_log=log)
+
+    detail = load.step_detail(report)
+    assert {table["table"] for table in detail["tables"]} == {
+        table.table for table in report.tables}
+
+
+def test_a_load_with_no_run_given_opens_a_one_step_run(source, raw_dir):
+    """Case 10. `python -m ingest.load` on its own still produces a complete record -
+    a run with one step in it, rather than a shape of its own."""
+    load.load_source(source, raw_dir, tables=["gl_entry"])
+
+    record = runs.RunLog(raw_dir).read()[0]
+    assert record.status == "succeeded"
+    assert [step.step for step in record.steps] == ["load"]
+
+
+def test_raw_rows_carry_the_injected_run_id(source, raw_dir):
+    """Case 11. The identifier reaching the rows is the whole point of injecting it:
+    docs/adr/0018 follows it backwards from a figure to the run that landed it."""
+    log = runs.RunLog(raw_dir)
+    run_id = runs.new_run_id()
+    log.start(run_id, command="daily", source=str(source), raw=str(raw_dir),
+              tables=[], steps=["load"])
+
+    load.load_source(source, raw_dir, tables=["gl_entry"], run_id=run_id, run_log=log)
+
+    rows = raw.read_partition(GL_ENTRY, raw.partition_path(raw_dir, GL_ENTRY, "2026-01"),
+                              metadata=True)
+    assert {row[raw.LAST_RUN_ID] for row in rows} == {run_id}
+
+
+def test_the_command_takes_a_run_id(source, raw_dir):
+    """Case 12. A shell that already knows the identifier passes it in rather than
+    having a second one generated underneath it."""
+    given = runs.new_run_id()
+
+    assert load.main(["--source", str(source), "--raw", str(raw_dir),
+                      "--table", "gl_entry", "--run-id", given]) == 0
+
+    record = runs.RunLog(raw_dir).read()[0]
+    assert record.run_id == given
+    assert [step.step for step in record.steps] == ["load"]

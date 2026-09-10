@@ -25,7 +25,7 @@ holding the raw layer's consistency.
 ## Decision
 
 `data/raw/_state/runs.jsonl`, one JSON object per line, appended and never rewritten.
-A run writes two lines:
+A run writes a line when it starts and a line when it ends:
 
     {"event": "started",  "run_id": ..., "started_at": ..., "command": "load", ...}
     {"event": "finished", "run_id": ..., "finished_at": ..., "status": "succeeded", ...}
@@ -65,12 +65,24 @@ said anything again.
 Reporting an unfinished run as `interrupted` rather than guessing is the same
 discipline as `docs/adr/0012`: the log says what it knows. A process that is genuinely
 still running looks identical, and inventing a heartbeat to tell them apart would be
-building a scheduler inside an ingest package that a scheduler will eventually run.
+building a scheduler inside an ingest package that a scheduler will eventually run. That
+scheduler has since arrived — `docs/adr/0047` — and it did not change this: it keeps its
+own history in its own database, and this log stays readable when that database is the
+thing that is broken.
 
 A file rather than a table also keeps the run record readable when the database is the
 thing that is broken. When the mart lands and something needs to join on a run
 identifier, that is a mart-layer concern with its own loading step, and this log is the
 source it loads from.
 
-The log grows by two lines per run and is never compacted. At one run a day that is
-under a megabyte a decade; a rotation policy would be code with no reader.
+The log is never compacted. At one run a day it grew by two lines a day when this was
+written, which is under a megabyte a decade; `docs/adr/0044` has since added a pair of
+lines per step inside the run's own pair, which makes it under a megabyte a year. A
+rotation policy would still be code with no reader.
+
+**Superseded in one respect: a run no longer writes only two lines.** A run is now a
+sequence of named steps and the log carries `step_started`/`step_finished` events between
+the two written here — see `docs/adr/0044`. Everything this record decided holds
+unchanged: the file, the append-only rule, the ordering argument, the identifier's shape,
+and `interrupted` as the honest reading of a run that never spoke again. The step events
+are that same ordering argument applied one level down.
