@@ -1,0 +1,81 @@
+"""One dirty-set-driven pass over the staging layer.
+
+The order is the design. The dimensions are rebuilt first because resolving a dimension
+version needs the validity intervals as they now stand; the versions are then resolved
+against those and against the fact as it currently is; the facts are rebuilt for the
+periods that changed; and the aggregate is rebuilt for the closure of those periods.
+
+It does not clear the affected-period set. That is `python -m ingest.affected --clear`,
+and it is the orchestrator's own step: a module that silently cleared shared state on
+success cannot be run twice, or alone, without consequences that are not visible where
+the command is typed. See docs/adr/0039.
+
+    python -m transform.backfill --raw data/raw --staging data/staging \\
+        --periods 2026-01:2026-12
+"""
+
+import argparse
+
+from ingest import affected as affected_state
+from ingest import contracts
+from transform.spark import affected as resolve
+from transform.spark import balances, facts, scd2
+
+__all__ = ["run", "main"]
+
+
+def run(spark, raw_dir, staging_dir, *, periods: str) -> set[str]:
+    """Rebuild what the affected-period set says is owed. Returns the periods written."""
+    first, last = balances.parse_periods(periods)
+
+    # Whole, and first. They are tens of rows - docs/adr/0026 keeps them rebuilt - and
+    # the resolution below reads the intervals they produce.
+    for table in sorted(scd2.MODELS):
+        scd2.build(spark, contracts.load(table), raw_dir, staging_dir)
+
+    owed = affected_state.read(raw_dir)
+    if owed.is_empty():
+        return set()
+
+    dirty = resolve.resolve(spark, raw_dir, staging_dir, owed, last_period=last)
+    dirty = {period for period in dirty if first <= period <= last}
+    if not dirty:
+        return set()
+
+    for model in sorted(facts.SOURCES):
+        facts.build(spark, raw_dir, staging_dir, model=model, dirty=dirty)
+    balances.build(spark, staging_dir, periods=periods, dirty=dirty)
+    return dirty
+
+
+def build_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(prog="transform.backfill", description=__doc__)
+    parser.add_argument("--raw", default="data/raw")
+    parser.add_argument("--staging", default="data/staging")
+    parser.add_argument("--periods", required=True,
+                        help="the reporting range, as YYYY-MM:YYYY-MM")
+    return parser
+
+
+def main(argv: list[str] | None = None) -> int:
+    from transform.spark import session
+
+    args = build_parser().parse_args(argv)
+
+    borrowed = session.active() is not None
+    spark = session.build("fin-pipeline-backfill")
+    try:
+        written = run(spark, args.raw, args.staging, periods=args.periods)
+    finally:
+        if not borrowed:
+            spark.stop()
+
+    if written:
+        print(f"rebuilt {len(written)} periods: {', '.join(sorted(written))}")
+    else:
+        print("nothing owed")
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

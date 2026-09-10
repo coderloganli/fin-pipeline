@@ -148,16 +148,39 @@ def test_a_dropped_column_names_the_downstream_models(tmp_path, dbt_manifest):
     assert "mart.dim_vendor" not in output
 
 
-def test_a_table_that_feeds_nothing_says_so(manifest):
-    """66. `gl_adjustment` is consumed by nothing yet. An empty list is a statement,
-    and reporting it as an unknown would be reporting a fact as an absence."""
-    from ingest import validate
+def test_a_table_that_feeds_nothing_says_so(manifest, monkeypatch):
+    """66. An empty `feeds` list is a statement, and reporting it as an unknown would be
+    reporting a fact as an absence.
 
-    assert contract_yaml("gl_adjustment")["feeds"] == []
+    `gl_adjustment` used to be the table this was asserted against. It now reaches
+    `mart.fct_gl_adjustment` and no contract declares an empty list any more, so the
+    behaviour is asserted against a contract that does rather than against whichever
+    table happens to be unconsumed - which is what made this test fragile in the first
+    place. The property belongs to `downstream_impact`, not to a table.
+    """
+    from ingest import contracts, validate
+
+    real = contracts.load
+
+    def unconsumed(table: str):
+        return {**real(table), "feeds": []}
+
+    monkeypatch.setattr(contracts, "load", unconsumed)
     message = validate.downstream_impact(["gl_adjustment"])
 
     assert "no model consumes" in message.lower()
     assert "unknown" not in message.lower()
+
+
+def test_every_contract_now_names_what_it_feeds(manifest):
+    """66b. The counterpart. `gl_adjustment` was the last table consumed by nothing;
+    with it landed, every source table reaches a model and the impact list can name
+    something for any of them. See docs/adr/0042."""
+    from ingest import contracts
+
+    empty = [table for table in contracts.tables()
+             if not contracts.load(table)["feeds"]]
+    assert empty == []
 
 
 def test_a_missing_manifest_says_so_and_names_the_command(tmp_path, monkeypatch):
@@ -284,8 +307,8 @@ def test_a_renamed_source_is_reported_rather_than_dropped(manifest):
 
 
 def test_a_table_that_feeds_something_and_one_that_does_not(manifest):
-    """66a. Asked about both at once, the message has to name the models rather than
-    fall back to the sentence for a table that feeds nothing."""
+    """66a. Asked about both at once, the message names the models each one reaches
+    rather than falling back to the sentence for a table that feeds nothing."""
     from ingest import validate
 
     message = validate.downstream_impact(["gl_entry", "gl_adjustment"])
@@ -305,3 +328,16 @@ def test_re_rendering_an_unchanged_manifest_is_byte_identical(manifest, tmp_path
     lineage.render(manifest, second)
 
     assert first.read_bytes() == second.read_bytes()
+
+
+def test_the_adjustment_table_now_feeds_something(manifest):
+    """Case 41. `gl_adjustment` declared `feeds: []` because nothing consumed it. The
+    impact list is how a schema failure names what it would break, so a table that has
+    reached the mart has to say so."""
+    from ingest import contracts, validate
+
+    assert contracts.load("gl_adjustment")["feeds"] == ["landing.fct_gl_adjustment"]
+
+    message = validate.downstream_impact(["gl_adjustment"])
+    assert "mart.fct_gl_adjustment" in message
+    assert "no model consumes" not in message.lower()

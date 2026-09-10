@@ -23,10 +23,28 @@ from pathlib import Path
 from ingest import contracts, raw
 from transform.spark import scd2
 
-__all__ = ["MODEL", "Unattributed", "Multiplied", "AMOUNT_PRECISION", "RATE_PRECISION",
-           "BASE_PRECISION", "build", "read", "frame", "checksum", "main"]
+__all__ = ["MODEL", "ADJUSTMENT_MODEL", "MODELS", "SOURCES", "Unattributed",
+           "Multiplied", "AMOUNT_PRECISION", "RATE_PRECISION", "BASE_PRECISION",
+           "build", "read", "frame", "checksum", "partitions", "main"]
 
 MODEL = "fct_gl_entry"
+ADJUSTMENT_MODEL = "fct_gl_adjustment"
+
+# Two facts, one attribution. An adjustment is not a row of `fct_gl_entry`: gate 3
+# requires the rows sharing a `doc_id` to balance, and an adjustment is a single-sided
+# delta against a voucher that already balanced, so folding it in would turn a gate red
+# on correct data. See docs/adr/0042.
+MODELS = {"gl_entry": MODEL, "gl_adjustment": ADJUSTMENT_MODEL}
+SOURCES = {model: table for table, model in MODELS.items()}
+
+# The columns an adjustment carries and an entry does not: which line it revises, and
+# whether it amends the period's figure or restates it. `adjusts_entry_id` is a trail to
+# follow rather than a constraint - see docs/adr/0042.
+ADJUSTMENT_COLUMNS = ("adjusts_entry_id", "adjustment_type")
+
+# The column the staging facts are partitioned by, derived from the accounting date the
+# same way the raw layer derives its own. See docs/adr/0026.
+PARTITION = "accounting_period"
 
 # Measured, not assumed: decimal(18,2) * decimal(18,6) is decimal(37,8) in Spark, and
 # round(_, 2) reduces that to decimal(32,2). 37 is one short of Spark's maximum of 38,
@@ -65,19 +83,89 @@ class Unattributed(RuntimeError):
     """
 
 
-def staging_path(staging_dir) -> Path:
-    return Path(staging_dir) / MODEL
+def staging_path(staging_dir, *, model: str = MODEL) -> Path:
+    return Path(staging_dir) / model
 
 
-def build(spark, raw_dir, staging_dir) -> Path:
-    """Read the entries and the three chained dimensions, attribute, write."""
+def partitions(staging_dir, *, model: str = MODEL) -> list[str]:
+    """The accounting periods this model currently holds on disk."""
+    root = staging_path(staging_dir, model=model)
+    if not root.is_dir():
+        return []
+    return sorted(
+        directory.name.split("=", 1)[1]
+        for directory in root.glob(f"{PARTITION}=*") if directory.is_dir()
+    )
+
+
+def write_partitions(frame_, staging_dir, *, model: str, periods) -> Path:
+    """Write one partition per period, each by overwriting its own directory.
+
+    Not `partitionBy` over the whole frame. Spark's
+    `spark.sql.sources.partitionOverwriteMode` defaults to `STATIC`, under which
+    `mode("overwrite")` on a partitioned write replaces the entire table directory - so
+    a backfill of one period would silently rewrite every other one, and the property
+    this whole ticket is judged on would be false with nothing raised. Writing the
+    directory makes the guarantee structural: this cannot touch a partition it was not
+    given. See docs/adr/0041.
+
+    A period whose filter leaves no rows has its directory removed rather than written
+    empty, which is `raw.write_partition`'s rule and holds here for the same reason: a
+    zero-row file makes the layout claim a period exists that holds nothing.
+    """
+    import shutil
+
     from pyspark.sql import functions as F
 
-    gl = contracts.load("gl_entry")
+    root = staging_path(staging_dir, model=model)
+    root.mkdir(parents=True, exist_ok=True)
+    periods = sorted(periods)
+    if not periods:
+        return root
+
+    # Cached, and the non-empty periods asked for once. Without this every partition
+    # write re-evaluates the whole plan - for the aggregate that is the dense grid, the
+    # dimension joins, the window functions and the group-by - so a dirty set of N
+    # periods would recompute the answer N times over, plus an emptiness job each. One
+    # pass, then N writes off the cached result.
+    frame_ = frame_.persist()
+    try:
+        present = {
+            row[PARTITION]
+            for row in frame_.select(PARTITION).distinct().collect()
+        }
+        for period in periods:
+            directory = root / f"{PARTITION}={period}"
+            if period not in present:
+                # The period emptied out. A zero-row file would make the layout claim a
+                # period exists that holds nothing, which is `raw.write_partition`'s
+                # rule and holds here for the same reason.
+                if directory.is_dir():
+                    shutil.rmtree(directory)
+                continue
+            (
+                frame_.where(F.col(PARTITION) == period).drop(PARTITION)
+                .coalesce(1).write.mode("overwrite").parquet(str(directory))
+            )
+    finally:
+        frame_.unpersist()
+    return root
+
+
+def build(spark, raw_dir, staging_dir, *, model: str = MODEL, dirty=None) -> Path:
+    """Read one fact's source and the three chained dimensions, attribute, write.
+
+    `dirty` is the set of accounting periods to rebuild. None is every period the raw
+    layer holds, which is the behaviour this had before selective recomputation and is
+    still what a full run does.
+    """
+    from pyspark.sql import functions as F
+
+    gl = contracts.load(SOURCES[model])
+    carried = list(ADJUSTMENT_COLUMNS) if model == ADJUSTMENT_MODEL else []
+    source = read_source(spark, raw_dir, gl, dirty)
     entries = (
-        # The table directory, not one partition: `gl_entry` is partitioned by
-        # accounting period, and Spark discovers those directories itself.
-        spark.read.parquet(str(raw.table_dir(raw_dir, gl["table"])))
+        source
         .select(*raw.columns_of(gl), raw.FIRST_RUN_ID, raw.LAST_RUN_ID)
         .withColumn("accounting_date", F.to_date("accounting_date"))
         .withColumn("posted_at", F.to_date("posted_at"))
@@ -85,6 +173,9 @@ def build(spark, raw_dir, staging_dir) -> Path:
         .withColumn("amount_cr", F.col("amount_cr").cast(AMOUNT_TYPE))
         .withColumnRenamed(raw.FIRST_RUN_ID, "source_first_run_id")
         .withColumnRenamed(raw.LAST_RUN_ID, "source_last_run_id")
+        # Derived rather than read off the directory name, so the staging partition is
+        # a function of the row and cannot disagree with where raw put it.
+        .withColumn(PARTITION, F.date_format("accounting_date", "yyyy-MM"))
     )
 
     def attributed(left, contract, left_key, carry, prefix):
@@ -121,7 +212,7 @@ def build(spark, raw_dir, staging_dir) -> Path:
     if missing := orphans.count():
         sample = [row["entry_id"] for row in orphans.select("entry_id").limit(SAMPLE).collect()]
         raise Unattributed(
-            f"{missing} entries matched no account, cost centre or rate on their "
+            f"{missing} rows of {model} matched no account, cost centre or rate on their "
             f"accounting date, so they would carry no base-currency amount. "
             f"For example: {', '.join(sample)}. A dimension that does not cover an "
             f"entry's date is the failure this check exists for - see docs/adr/0029."
@@ -144,29 +235,71 @@ def build(spark, raw_dir, staging_dir) -> Path:
         .withColumn("amount_cr_base", F.round(F.col("amount_cr") * F.col("rate_to_base"), 2))
     )
 
-    target = staging_path(staging_dir)
-    (
-        priced.select(
-            "entry_id", "version", "accounting_date", "posted_at",
-            "account_key", "cost_center_key", "fx_key",
-            "account_code", "account_type", "parent_code",
-            "cost_center_code", "dept_code",
-            "currency", "rate_to_base",
-            "amount_dr", "amount_cr", "amount_dr_base", "amount_cr_base",
-            "doc_id", "vendor_code", "description",
-            "source_first_run_id", "source_last_run_id",
-        )
-        .coalesce(1).write.mode("overwrite").parquet(str(target))
+    selected = priced.select(
+        "entry_id", "version", "accounting_date", "posted_at",
+        "account_key", "cost_center_key", "fx_key",
+        "account_code", "account_type", "parent_code",
+        "cost_center_code", "dept_code",
+        "currency", "rate_to_base",
+        "amount_dr", "amount_cr", "amount_dr_base", "amount_cr_base",
+        "doc_id", *carried, "vendor_code", "description",
+        "source_first_run_id", "source_last_run_id",
+        PARTITION,
     )
-    return target
+    # Which periods to write: the ones asked for, or every period the source holds. A
+    # dirty period the source no longer has rows for is still written - as a removal.
+    writing = set(dirty) if dirty is not None else set(
+        row[PARTITION] for row in selected.select(PARTITION).distinct().collect()
+    )
+    return write_partitions(selected, staging_dir, model=model, periods=writing)
 
 
-def frame(spark, staging_dir):
-    return spark.read.parquet(str(staging_path(staging_dir)))
+def read_source(spark, raw_dir, contract: dict, dirty=None):
+    """The raw rows to attribute: every partition, or only the dirty ones.
+
+    An entry's attribution is a function of that entry and the dimensions and nothing
+    else, so unlike the aggregate this can scope its read as narrowly as its write. See
+    docs/adr/0041.
+    """
+    directory = raw.table_dir(raw_dir, contract["table"])
+    if dirty is None:
+        # The table directory, not one partition: the raw layer is partitioned by
+        # accounting period, and Spark discovers those directories itself.
+        if not any(directory.rglob("*.parquet")):
+            return empty_source(spark, contract)
+        return spark.read.parquet(str(directory))
+
+    # A directory that holds no Parquet file is not a partition to read. It occurs
+    # while a period is being emptied out, and handing it to Spark raises
+    # UNABLE_TO_INFER_SCHEMA rather than reading nothing.
+    paths = [
+        str(directory / f"{PARTITION}={period}")
+        for period in sorted(dirty)
+        if any((directory / f"{PARTITION}={period}").glob("*.parquet"))
+    ]
+    if not paths:
+        return empty_source(spark, contract)
+    # basePath so Spark still reads `accounting_period` off the directory names when it
+    # is handed the partitions rather than the table.
+    return spark.read.option("basePath", str(directory)).parquet(*paths)
 
 
-def read(spark, staging_dir) -> list[dict]:
-    return [row.asDict() for row in frame(spark, staging_dir).collect()]
+def empty_source(spark, contract: dict):
+    """No partitions to read. A frame with the right columns rather than a raise: a
+    dirty period the source has emptied out is a removal, not an error."""
+    from pyspark.sql import types as T
+
+    names = [*raw.columns_of(contract), raw.FIRST_RUN_ID, raw.LAST_RUN_ID, PARTITION]
+    schema = T.StructType([T.StructField(name, T.StringType(), True) for name in names])
+    return spark.createDataFrame([], schema)
+
+
+def frame(spark, staging_dir, *, model: str = MODEL):
+    return spark.read.parquet(str(staging_path(staging_dir, model=model)))
+
+
+def read(spark, staging_dir, *, model: str = MODEL) -> list[dict]:
+    return [row.asDict() for row in frame(spark, staging_dir, model=model).collect()]
 
 
 def checksum(rows) -> str:
@@ -191,13 +324,21 @@ def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(prog="transform.spark.facts", description=__doc__)
     parser.add_argument("--raw", default="data/raw")
     parser.add_argument("--staging", default="data/staging")
+    parser.add_argument("--models", nargs="*", default=None,
+                        help=f"which facts to build; defaults to all of {sorted(SOURCES)}")
     args = parser.parse_args(argv)
+
+    models = args.models or sorted(SOURCES)
+    unknown = [model for model in models if model not in SOURCES]
+    if unknown:
+        parser.error(f"unknown models {unknown}; this module builds {sorted(SOURCES)}")
 
     borrowed = session.active() is not None
     spark = session.build("fin-pipeline-facts")
     try:
-        target = build(spark, args.raw, args.staging)
-        print(f"{MODEL} -> {target}")
+        for model in models:
+            target = build(spark, args.raw, args.staging, model=model)
+            print(f"{model} -> {target}")
     finally:
         if not borrowed:
             spark.stop()

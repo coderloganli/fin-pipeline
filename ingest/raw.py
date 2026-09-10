@@ -243,6 +243,10 @@ class MergeCounts:
     updated: int = 0
     kept: int = 0
     periods: list[str] = field(default_factory=list)
+    # Which keys were new, not just how many. A dimension change can only be an insert -
+    # every effective-dated contract declares `rows_are_immutable` - so this is the
+    # exact trigger `ingest.affected` records. See docs/adr/0039.
+    inserted_keys: list[tuple[str, ...]] = field(default_factory=list)
 
 
 class ImmutableRowChanged(RuntimeError):
@@ -331,6 +335,7 @@ def merge_table(contract: dict, raw_dir, rows, *, run_id: str) -> "MergeCounts":
                 counts.updated += 1
         else:
             counts.inserted += 1
+            counts.inserted_keys.append(key)
         incoming[key] = row
     counts.kept = len(held) - (len(incoming) - counts.inserted)
 

@@ -38,7 +38,7 @@ from dataclasses import dataclass, field
 from datetime import datetime, timedelta
 from pathlib import Path
 
-from . import contracts, raw, runs, validate
+from . import affected, contracts, raw, runs, validate
 
 __all__ = [
     "DEFAULT_OVERLAP_DAYS",
@@ -201,6 +201,12 @@ class TableLoad:
     partitions_written: int = 0
     watermark_from: str | None = None
     watermark_to: str | None = None
+    # What this load dirtied. Both are observations: the periods it wrote, and the
+    # effective-dated versions it inserted. Turning a version into periods belongs to
+    # transform/, which is the layer that knows the validity intervals. See
+    # docs/adr/0039.
+    periods: list[str] = field(default_factory=list)
+    dimension_versions: list[dict] = field(default_factory=list)
 
     def describe(self) -> str:
         return (
@@ -308,7 +314,8 @@ def select_rows(contract: dict, path, bound: str | None):
                 yield row
 
 
-def merge_partition(contract: dict, path, incoming, *, run_id: str) -> tuple[int, int]:
+def merge_partition(contract: dict, path, incoming, *, run_id: str,
+                    changed: list | None = None) -> tuple[int, int]:
     """Apply `incoming` to one partition by primary key. Returns (inserted, updated).
 
     The incoming row wins, which is what makes the result a function of the union
@@ -320,14 +327,23 @@ def merge_partition(contract: dict, path, incoming, *, run_id: str) -> tuple[int
     is not the run that restated it. Rows the batch never mentions are carried across
     with theirs intact, which is what stops a partition reopened for one row from
     claiming this run landed all of them. See docs/adr/0018.
+
+    `changed` is appended to when a declared column actually differs, or a key is new.
+    That is a stricter question than `updated` answers - every extract re-presents rows
+    this layer already holds, and those count as updates here because the reported
+    number has always meant "keys the batch touched that were already present". The
+    affected-period set needs the stricter one: a run that re-presented history it had
+    already landed owes no recomputation. The two are kept apart rather than merged so
+    that the summary line keeps saying what it has always said. See docs/adr/0039.
     """
     key_columns = contract["primary_key"]
 
     def key(row):
         return tuple(row[name] for name in key_columns)
 
+    declared = raw.columns_of(contract)
     existing = {key(row): row for row in raw.read_partition(contract, path, metadata=True)}
-    held = set(existing)
+    previous = {landed: dict(row) for landed, row in existing.items()}
     # Counted over the keys the batch carries, not the rows: two incoming rows for one
     # key produce one row, and reporting two insertions would make the summary line
     # disagree with the partition it describes. `load_table` already collapses a
@@ -337,15 +353,55 @@ def merge_partition(contract: dict, path, incoming, *, run_id: str) -> tuple[int
         first = existing.get(landed, {}).get(raw.FIRST_RUN_ID)
         existing[landed] = {**row, raw.FIRST_RUN_ID: first} if first else dict(row)
     touched = {key(row) for row in incoming}
-    updated = len(touched & held)
+    updated = len(touched & set(previous))
     inserted = len(touched) - updated
+
+    if changed is not None and any(
+        landed not in previous
+        or any(previous[landed][name] != existing[landed][name] for name in declared)
+        for landed in touched
+    ):
+        changed.append(path)
 
     raw.write_partition(contract, path, list(existing.values()), run_id=run_id)
     return inserted, updated
 
 
+# The column an effective-dated table dates its versions with. Read from the contract's
+# primary key rather than named here: the key is `(natural key..., effective column)`
+# for all three, and a second list would be a second thing that can disagree with them.
+EFFECTIVE_COLUMNS = ("effective_date", "rate_date")
+
+
+def effective_column(contract: dict) -> str | None:
+    """The date column of an effective-dated table, or None if it is not one.
+
+    A table qualifies when it declares `rows_are_immutable` and ends its primary key
+    with a date column. That pairing is not a coincidence: docs/adr/0023 gives the
+    immutability rule to exactly the tables whose key carries the date a version took
+    effect, and docs/adr/0027 leans on it - a change to one of them can only ever be an
+    insert, never an overwrite, so an inserted key *is* a new version.
+    """
+    if not contract.get("rows_are_immutable"):
+        return None
+    last = contract["primary_key"][-1]
+    return last if last in EFFECTIVE_COLUMNS else None
+
+
+def versions_from(contract: dict, inserted_keys) -> list[dict]:
+    """The inserted primary keys, as dimension versions. Empty for a table that is not
+    effective-dated - `dim_vendor` is immutable in neither sense and has no date."""
+    column = effective_column(contract)
+    if column is None:
+        return []
+    return [
+        {"table": contract["table"], "key": list(key[:-1]), "effective_date": key[-1]}
+        for key in inserted_keys
+    ]
+
+
 def evict_moved_keys(contract: dict, raw_dir, home: dict[tuple[str, ...], str],
-                     *, run_id: str) -> tuple[int, int]:
+                     *, run_id: str, record: bool = True) -> tuple[int, list[str]]:
     """Remove each key in `home` from every partition except the one it now belongs to.
 
     A row's partition comes from its accounting date, which is not part of its primary
@@ -360,10 +416,21 @@ def evict_moved_keys(contract: dict, raw_dir, home: dict[tuple[str, ...], str],
 
     Only the key columns of a partition are read; Parquet is columnar, so this does not
     pay for the rest of the row, and a partition holding none of the moved keys is not
-    rewritten. Returns (rows evicted, partitions rewritten).
+    rewritten. Returns (rows evicted, the periods rewritten).
+
+    The periods rather than a count of them: a key that left March changed March, so
+    March is owed a recomputation and `ingest.affected` needs to be told which one it
+    was. See docs/adr/0039.
+
+    Each one is recorded as it is rewritten, not after the sweep returns, for the reason
+    the merge loop records as it writes: an eviction that rewrites March and then raises
+    has already changed March, and a retry finds March already evicted and the
+    destination already correct, so neither path would ever record it. `record=False` is
+    for callers testing the sweep in isolation.
     """
     key_columns = contract["primary_key"]
-    evicted = rewritten = 0
+    evicted = 0
+    rewritten: list[str] = []
 
     for path in raw.partitions(contract, raw_dir):
         period = path.parent.name.split("=", 1)[1]
@@ -379,7 +446,9 @@ def evict_moved_keys(contract: dict, raw_dir, home: dict[tuple[str, ...], str],
         # Rows, not keys. A partition already holding two rows for one key is exactly
         # the state this repairs, so saying "1" would understate what it did.
         evicted += len(rows) - len(kept)
-        rewritten += 1
+        rewritten.append(period)
+        if record:
+            affected.record(raw_dir, periods=[period], versions=[])
         if kept:
             raw.write_partition(contract, path, kept, run_id=run_id)
         else:
@@ -441,6 +510,13 @@ def load_table(
         result.rows_inserted = counts.inserted
         result.rows_updated = counts.updated
         result.partitions_written = max(len(counts.periods), 1)
+        result.dimension_versions = versions_from(contract, counts.inserted_keys)
+        # A table loaded in full is rewritten whole, so every period it landed is a
+        # period that changed. An unpartitioned one has no period to name.
+        if counts.inserted or counts.updated:
+            result.periods = list(counts.periods)
+        affected.record(raw_dir, periods=result.periods,
+                        versions=result.dimension_versions)
         return result
 
     if not batch:
@@ -462,20 +538,40 @@ def load_table(
             row = {**row, raw.FIRST_RUN_ID: first}
         grouped.setdefault(raw.partition_of(row[contract["partition_by"]]), []).append(row)
 
+    dirtied: list[str] = []
     for period, rows in sorted(grouped.items()):
+        # The periods that actually changed, not the periods the batch happened to
+        # overlap. A run that re-presents what raw already holds owes no recomputation.
+        touched: list = []
         inserted, updated = merge_partition(
-            contract, raw.partition_path(raw_dir, contract, period), rows, run_id=run_id
+            contract, raw.partition_path(raw_dir, contract, period), rows,
+            run_id=run_id, changed=touched,
         )
         result.rows_inserted += inserted
         result.rows_updated += updated
         result.partitions_written += 1
+        if touched:
+            dirtied.append(period)
+            # Recorded as the partition lands, not at the end of the loop. A run that
+            # dies after writing March and before writing April has already changed
+            # March, and the retry would find March correct and record nothing - so the
+            # only signal that staging still owes March would be gone. Each unit of work
+            # marks itself owed as soon as it has actually happened, which is the same
+            # shape as the watermark moving last. See docs/adr/0039.
+            affected.record(raw_dir, periods=[period], versions=[])
 
     home = {
         key: raw.partition_of(row[contract["partition_by"]]) for key, row in batch.items()
     }
     evicted, rewritten = evict_moved_keys(contract, raw_dir, home, run_id=run_id)
     result.rows_evicted = evicted
-    result.partitions_written += rewritten
+    result.partitions_written += len(rewritten)
+    result.periods = sorted(set(dirtied) | set(rewritten))
+
+    # Every one of those periods is already on disk in the affected set: the merge loop
+    # and the eviction sweep each record as they write, so there is nothing left to
+    # record here and nothing that a crash between here and the watermark could lose.
+    # See docs/adr/0039.
 
     # Last, and only now: every partition is on disk.
     if highest is not None:

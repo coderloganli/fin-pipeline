@@ -55,6 +55,60 @@ models:
       - name: cost_center_name
         data_tests: [not_null]
 
+  - name: fct_gl_adjustment
+    description: >
+      One row per adjustment version, attributed the same way an entry is and widened
+      with names. Not part of fct_gl_entry: an adjustment is a single-sided delta
+      against a voucher that already balanced, so gate 3 would go red on a correct
+      ledger. See docs/adr/0042.
+    data_tests:
+      - unique:
+          name: unique_fct_gl_adjustment_entry_id_version
+          arguments:
+            column_name: "entry_id || '|' || version"
+    columns:
+      - name: entry_id
+        data_tests: [not_null]
+      - name: version
+        data_tests: [not_null]
+      - name: adjustment_type
+        # The two bases depend on this telling them apart, so a null here would put an
+        # adjustment into neither. See docs/adr/0043.
+        data_tests:
+          - not_null
+          - accepted_values:
+              name: accepted_values_fct_gl_adjustment_adjustment_type
+              arguments:
+                values: ["correction", "restatement"]
+      - name: account_key
+        data_tests:
+          - not_null
+          - relationships:
+              name: relationships_fct_gl_adjustment_account_key
+              arguments:
+                to: ref('dim_account')
+                field: surrogate_key
+      - name: cost_center_key
+        data_tests:
+          - not_null
+          - relationships:
+              name: relationships_fct_gl_adjustment_cost_center_key
+              arguments:
+                to: ref('dim_cost_center')
+                field: surrogate_key
+      - name: fx_key
+        data_tests:
+          - not_null
+          - relationships:
+              name: relationships_fct_gl_adjustment_fx_key
+              arguments:
+                to: ref('dim_fx_rate')
+                field: surrogate_key
+      - name: account_name
+        data_tests: [not_null]
+      - name: cost_center_name
+        data_tests: [not_null]
+
   - name: agg_monthly_balance
     description: A dense monthly grid, signed by the account's normal side.
     data_tests:
@@ -68,6 +122,15 @@ models:
       - name: cost_center_code
         data_tests: [not_null]
       - name: accounting_period
+        data_tests: [not_null]
+      # The two bases and the column that bridges them. Nullable none of them: a null
+      # here would make `balance_as_reported + restatement_delta` null too, and the
+      # report would show a blank where a zero belongs. See docs/adr/0043.
+      - name: balance_as_reported
+        data_tests: [not_null]
+      - name: restatement_delta
+        data_tests: [not_null]
+      - name: balance_as_restated
         data_tests: [not_null]
       # The as-of join is a left join on a date range, so a dimension that leaves a gap
       # over a period end produces a row with no name rather than no row. The fact has

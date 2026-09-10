@@ -14,6 +14,7 @@ sources:
     # assert something no run makes true.
     tables:
       - name: fct_gl_entry
+      - name: fct_gl_adjustment
       - name: agg_monthly_balance
       - name: dim_account
       - name: dim_cost_center

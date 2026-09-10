@@ -74,10 +74,21 @@ storage layer's own history, and adopting one would put a substantial dependency
 between the reader and the thing being demonstrated. Plain Parquet keeps the semantics
 in the model, where they can be read.
 
-**One gap this exposes, which is not closed here.** Affected periods are currently
-derived from entries' accounting dates. A dimension change produces no entry, so under
-the present mechanism it triggers no recomputation at all: a change in the hierarchy
-would leave every downstream figure at its old value until something else forced a
-rebuild. That is true today regardless of restatement, and it is the mechanism
-`backfill-only-affected-periods` has to account for. It is recorded here because this
-is where it was found.
+**One gap this exposed, and it is now closed.** Affected periods were derived from
+entries' accounting dates alone. A dimension change produces no entry, so under that
+mechanism it triggered no recomputation at all: a change in the hierarchy would leave
+every downstream figure at its old value until something else forced a rebuild.
+
+`backfill-only-affected-periods` closed it. A dimension change can only ever be the
+insert of a new `(natural key, effective_date)` version, because all three
+effective-dated tables declare `rows_are_immutable` - which is this record's own
+decision, and it turns out to make the trigger exact rather than approximate. Ingest
+records the inserted versions, and transform turns each into the periods its validity
+interval covers, intersected with the periods that carry entries on that key. `fx_rate`
+is included on the same footing as the two org dimensions: a new rate changes every
+converted amount on its dates, and leaving it out would have reproduced this gap in the
+one table where it is easiest to overlook. See `docs/adr/0039`.
+
+None of that brings restatement into scope. The trigger is a version taking effect, not
+a version's effective date being revised, and an extract that contradicts a held version
+still fails the run.

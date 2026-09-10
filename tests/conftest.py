@@ -157,7 +157,11 @@ def build_staging(spark, root: Path, **config) -> Staging:
     ingest_load.load_source(source, raw_dir)
     for table in sorted(scd2.MODELS):
         scd2.build(spark, contracts_load(table), raw_dir, staging_dir)
-    facts.build(spark, raw_dir, staging_dir)
+    # Two facts, not one. An adjustment is a single-sided delta against a voucher that
+    # already balanced, so it is a fact of its own rather than a row of the entry fact -
+    # see docs/adr/0042.
+    for model in sorted(facts.SOURCES):
+        facts.build(spark, raw_dir, staging_dir, model=model)
     balances.build(spark, staging_dir, periods=TEST_PERIODS)
     return Staging(root=root, source=source, raw=raw_dir, staging=staging_dir)
 

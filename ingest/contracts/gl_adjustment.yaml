@@ -7,10 +7,12 @@
 table: gl_adjustment
 primary_key: [entry_id, version]
 
-# What this table reaches downstream.
-# Nothing consumes this table yet. An empty list is a statement, and validation
-# says so out loud rather than reporting the impact as unknown. See docs/adr/0035.
-feeds: []
+# What this table reaches downstream. An adjustment is a fact of its own rather than a
+# row of fct_gl_entry: gate 3 requires the rows sharing a doc_id to balance, and an
+# adjustment is a single-sided delta against a voucher that already did. See
+# docs/adr/0035 and 0042.
+feeds:
+  - landing.fct_gl_adjustment
 
 # The incremental load advances on posted_at - when the row actually landed.
 # There is no updated_at in this source; see

@@ -28,6 +28,10 @@ select
     entries.entry_id,
     entries.version,
     entries.accounting_date,
+    -- The period the entry belongs to, carried through from the staging partition. It
+    -- is what agg_monthly_balance is keyed by, so a query that drills from a balance to
+    -- its entries joins on it rather than re-deriving it from the date.
+    entries.accounting_period,
     entries.posted_at,
 
     entries.account_key,

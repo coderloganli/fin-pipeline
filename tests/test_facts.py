@@ -279,3 +279,213 @@ def test_the_product_keeps_its_full_precision_before_rounding(spark, built):
         (F.col("amount_dr") * F.col("rate_to_base")).alias("product")
     )
     assert dict(product.dtypes)["product"] == "decimal(37,8)"
+
+
+# --- the adjustment fact (ADR 0042) -----------------------------------------
+#
+# Cases 17-21 of task.md. `gl_adjustment` has been ingested since the incremental load
+# landed and consumed by nothing. It becomes a fact of its own rather than rows in
+# `fct_gl_entry`, because gate 3 requires the rows sharing a `doc_id` to balance and an
+# adjustment is a single-sided delta against a voucher that already balanced.
+
+GL_ADJUSTMENT = contracts.load("gl_adjustment")
+
+
+def adjustment(entry_id, accounting_date, adjusts, kind, **overrides):
+    row = {
+        "entry_id": entry_id, "version": "2",
+        "accounting_date": accounting_date, "posted_at": accounting_date,
+        "account_code": "660204", "cost_center_code": "CC-002",
+        "currency": "EUR", "amount_dr": "100.00", "amount_cr": "0.00",
+        "doc_id": entry_id, "adjusts_entry_id": adjusts, "adjustment_type": kind,
+        "vendor_code": "V-0001", "description": "Adjustment",
+    }
+    row.update(overrides)
+    return row
+
+
+ADJUSTMENTS = [
+    adjustment("A-CORR-000000", "2026-03-16", "E-MAR", "correction"),
+    adjustment("A-REST-000000", "2026-07-15", "E-JUL", "restatement"),
+]
+
+
+@pytest.fixture
+def built_with_adjustments(tmp_path, spark):
+    def build(entries=ENTRIES, adjustments=ADJUSTMENTS, accounts=ACCOUNTS,
+              centres=COST_CENTRES, rates=RATES):
+        raw_dir, staging = tmp_path / "raw", tmp_path / "staging"
+        raw.merge_table(GL_ENTRY, raw_dir, entries, run_id=RUN_A)
+        raw.merge_table(GL_ADJUSTMENT, raw_dir, adjustments, run_id=RUN_A)
+        raw.merge_table(DIM_ACCOUNT, raw_dir, accounts, run_id=RUN_A)
+        raw.merge_table(DIM_CC, raw_dir, centres, run_id=RUN_A)
+        raw.merge_table(DIM_FX, raw_dir, rates, run_id=RUN_A)
+        for contract in (DIM_ACCOUNT, DIM_CC, DIM_FX):
+            scd2.build(spark, contract, raw_dir, staging)
+        facts.build(spark, raw_dir, staging)
+        facts.build(spark, raw_dir, staging, model=facts.ADJUSTMENT_MODEL)
+        return raw_dir, staging
+    return build
+
+
+def adjustments_by_id(spark, staging):
+    return {
+        row["entry_id"]: row
+        for row in facts.read(spark, staging, model=facts.ADJUSTMENT_MODEL)
+    }
+
+
+def test_the_adjustment_fact_is_built_and_carries_its_own_columns(spark,
+                                                                  built_with_adjustments):
+    """Case 17. One row per adjustment, and the two columns that make it an adjustment
+    rather than an entry survive into staging."""
+    _, staging = built_with_adjustments()
+    landed = adjustments_by_id(spark, staging)
+
+    assert set(landed) == {"A-CORR-000000", "A-REST-000000"}
+    assert landed["A-CORR-000000"]["adjusts_entry_id"] == "E-MAR"
+    assert landed["A-CORR-000000"]["adjustment_type"] == "correction"
+    assert landed["A-REST-000000"]["adjustment_type"] == "restatement"
+
+
+def test_an_adjustment_is_attributed_by_the_same_three_joins(spark,
+                                                             built_with_adjustments):
+    """Case 18. As of its own accounting date, not today's structure: the July
+    adjustment gets the department the cost centre moved to, the March one does not."""
+    _, staging = built_with_adjustments()
+    landed = adjustments_by_id(spark, staging)
+
+    for row in landed.values():
+        assert row["account_key"] is not None
+        assert row["cost_center_key"] is not None
+        assert row["fx_key"] is not None
+
+    assert landed["A-CORR-000000"]["dept_code"] == "DEPT-RND"
+    assert landed["A-REST-000000"]["dept_code"] == "DEPT-OPS"
+
+
+def test_an_adjustment_converts_and_rounds_at_the_line(spark, built_with_adjustments):
+    """Case 19. The same rule as an entry: docs/adr/0031 rounds at the line so a total
+    of the detail is the number the report shows."""
+    _, staging = built_with_adjustments()
+    landed = adjustments_by_id(spark, staging)
+
+    row = landed["A-CORR-000000"]
+    assert row["rate_to_base"] == Decimal("7.800000")
+    assert row["amount_dr_base"] == Decimal("780.00")
+
+
+def test_adjustments_are_absent_from_the_entry_fact(spark, built_with_adjustments):
+    """Case 20. Folding them in would turn gate 3 red on correct data, because an
+    adjustment's doc_id has one side."""
+    _, staging = built_with_adjustments()
+
+    assert not [row for row in facts.read(spark, staging)
+                if row["entry_id"].startswith("A-")]
+
+
+def test_an_unattributable_adjustment_raises(spark, built_with_adjustments):
+    """Case 21. The same gate as an entry: a dimension gap drops rows out of an inner
+    join with nothing raised, so the count is checked rather than trusted."""
+    orphan = adjustment("A-CORR-000001", "2019-01-01", "E-MAR", "correction")
+
+    with pytest.raises(facts.Unattributed):
+        built_with_adjustments(adjustments=[*ADJUSTMENTS, orphan])
+
+
+# --- partitioned, and selectively written (ADR 0026, 0041) ------------------
+#
+# Cases 22-26 of task.md. A partition is written by overwriting its own directory, not
+# by `partitionBy` over the whole frame: Spark's `partitionOverwriteMode` defaults to
+# STATIC, under which an overwrite replaces the entire table directory.
+
+
+def partition_mtimes(staging, model=None) -> dict[str, int]:
+    """Every partition directory's newest file modification time, in nanoseconds."""
+    root = facts.staging_path(staging, model=model or facts.MODEL)
+    found = {}
+    for directory in sorted(root.glob("accounting_period=*")):
+        period = directory.name.split("=", 1)[1]
+        found[period] = max(
+            path.stat().st_mtime_ns for path in directory.iterdir() if path.is_file()
+        )
+    return found
+
+
+SPREAD = [
+    entry("E-JAN", "2026-01-15"),
+    entry("E-MAR", "2026-03-16"),
+    entry("E-JUN", "2026-06-15"),
+    entry("E-JUL", "2026-07-15"),
+]
+
+
+def test_the_entry_fact_is_partitioned_by_accounting_period(spark, built):
+    """Case 22. One directory per period present in raw, matching the raw layout."""
+    raw_dir, staging = built(entries=SPREAD)
+
+    landed = set(partition_mtimes(staging))
+    assert landed == {"2026-01", "2026-03", "2026-06", "2026-07"}
+
+
+def test_a_dirty_build_rewrites_only_the_dirty_partition(spark, built, tmp_path):
+    """Case 23. The acceptance criterion, at the fact layer: the other partitions'
+    files are not touched, which a modification time is what records."""
+    raw_dir, staging = built(entries=SPREAD)
+    before = partition_mtimes(staging)
+
+    facts.build(spark, raw_dir, staging, dirty={"2026-03"})
+    after = partition_mtimes(staging)
+
+    assert after["2026-03"] != before["2026-03"]
+    for period in ("2026-01", "2026-06", "2026-07"):
+        assert after[period] == before[period], period
+
+
+def test_a_selective_rebuild_equals_a_full_rebuild(spark, built, tmp_path):
+    """Case 24. Selective recomputation is required to be indistinguishable from the
+    rebuild - that is what makes it an optimisation rather than a second answer."""
+    raw_dir, staging = built(entries=SPREAD)
+
+    late = entry("E-MAR-LATE", "2026-03-20", posted_at="2026-05-30")
+    raw.merge_table(GL_ENTRY, raw_dir, [late], run_id=RUN_A)
+
+    facts.build(spark, raw_dir, staging, dirty={"2026-03"})
+    selective = sorted(facts.read(spark, staging), key=lambda row: row["entry_id"])
+
+    other = tmp_path / "full"
+    for contract in (DIM_ACCOUNT, DIM_CC, DIM_FX):
+        scd2.build(spark, contract, raw_dir, other)
+    facts.build(spark, raw_dir, other)
+    full = sorted(facts.read(spark, other), key=lambda row: row["entry_id"])
+
+    assert facts.checksum(selective) == facts.checksum(full)
+
+
+def test_no_dirty_set_writes_every_partition(spark, built):
+    """Case 25. The behaviour before this change, and what a full rebuild still is."""
+    raw_dir, staging = built(entries=SPREAD)
+    before = partition_mtimes(staging)
+
+    facts.build(spark, raw_dir, staging, dirty=None)
+    after = partition_mtimes(staging)
+
+    assert set(after) == set(before)
+    for period in before:
+        assert after[period] != before[period], period
+
+
+def test_a_period_that_emptied_out_loses_its_partition(spark, built, tmp_path):
+    """Case 26. A zero-row file would make the layout claim a period exists that holds
+    nothing, which is `raw.write_partition`'s rule and applies here for the same
+    reason."""
+    raw_dir, staging = built(entries=SPREAD)
+    assert "2026-06" in partition_mtimes(staging)
+
+    for path in raw.partitions(GL_ENTRY, raw_dir):
+        if path.parent.name == "accounting_period=2026-06":
+            path.unlink()
+
+    facts.build(spark, raw_dir, staging, dirty={"2026-06"})
+
+    assert "2026-06" not in partition_mtimes(staging)
