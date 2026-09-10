@@ -234,3 +234,66 @@ def test_a_dimension_change_reaches_the_mart(pipeline, mart, db):
     assert after and set(after.values()) == {renamed}
     assert before and renamed not in set(before.values()), \
         "a period that closed before the change kept the name it reported at the time"
+
+
+# --- a forced range ignores the affected-period set ------------------------
+#
+# `run` returns without rebuilding anything when nothing is owed, which is right for a
+# nightly run and wrong for a backfill: the reason to type a range by hand is precisely
+# that the set does not name it - a bug that has been fixed, or the update that arrived
+# after the watermark window closed, which docs/adr/0016 names as the case this
+# recovers. See docs/adr/0046.
+#
+# Case 34 of orchestrate-the-daily-run.
+
+def test_an_empty_affected_set_rebuilds_nothing_without_force(spark, pipeline):
+    """The daily path, unchanged: nothing owed, nothing rewritten."""
+    from transform import backfill
+
+    affected.clear(pipeline.raw)
+
+    assert backfill.run(spark, pipeline.raw, pipeline.staging,
+                        periods=TEST_PERIODS) == set()
+
+
+def test_force_rebuilds_the_range_even_when_nothing_is_owed(spark, pipeline):
+    """The backfill path. Without this the backfill DAG is a no-op in the only
+    situation it exists for."""
+    from transform import backfill
+
+    affected.clear(pipeline.raw)
+    before = staging_mtimes(pipeline.staging)
+
+    written = backfill.run(spark, pipeline.raw, pipeline.staging,
+                           periods="2026-03:2026-05", force=True)
+
+    assert written == {"2026-03", "2026-04", "2026-05"}
+    after = staging_mtimes(pipeline.staging)
+    # The range was rebuilt, and periods outside it were left alone.
+    assert after[("fct_gl_entry", "2026-03")] != before[("fct_gl_entry", "2026-03")]
+    assert after[("fct_gl_entry", "2026-01")] == before[("fct_gl_entry", "2026-01")]
+
+
+def test_the_command_forwards_force(monkeypatch):
+    """`--force` reaches `run`. Asserting that argparse parsed it would say nothing: a
+    flag the parser accepts and then drops is worse than one that is missing, and that
+    is exactly the version this test would still pass."""
+    from transform import backfill
+
+    seen = {}
+
+    def record(spark, raw_dir, staging_dir, *, periods, force=False):
+        seen.update(periods=periods, force=force)
+        return {"2026-01"}
+
+    from transform.spark import session
+
+    monkeypatch.setattr(backfill, "run", record)
+    # `main` builds a session before calling `run`; this test is about the flag, and
+    # starting a JVM to establish that a boolean was passed along would be absurd.
+    monkeypatch.setattr(session, "build", lambda *a, **k: None)
+    monkeypatch.setattr(session, "active", lambda: object())
+
+    assert backfill.main(["--periods", "2026-01:2026-02", "--force"]) == 0
+
+    assert seen == {"periods": "2026-01:2026-02", "force": True}

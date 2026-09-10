@@ -68,15 +68,9 @@ def test_the_dbt_project_parses():
     """73. Against its own `profiles.yml`, with connection settings from the
     environment. A project that does not parse has no manifest, and without a manifest
     the impact list in case 65 has nothing to read."""
-    from conftest import dbt_env
+    from conftest import run_dbt
 
-    result = subprocess.run(
-        [sys.executable, "-m", "dbt.cli.main", "parse",
-         "--project-dir", str(DBT_PROJECT), "--profiles-dir", str(DBT_PROJECT)],
-        env=dbt_env("landing", "mart"),
-        capture_output=True,
-        text=True,
-    )
+    result = run_dbt(["parse"], "landing", "mart")
 
     assert result.returncode == 0, result.stdout + result.stderr
 

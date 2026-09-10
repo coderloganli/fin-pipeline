@@ -7,8 +7,11 @@ connection.
 ## Context
 
 `transform/spark/` writes its models to Parquet under `data/staging/`, and
-`docs/adr/0026` settles that this is what staging is: typed, unpartitioned, rebuilt on
-every run. dbt-postgres can only model tables that are already in Postgres. Nothing in
+`docs/adr/0026` settles that this is what staging is: typed, and rebuilt from raw. (It
+said "unpartitioned" when this record was written; `docs/adr/0026` has since been edited
+so that the facts and the aggregate are partitioned by accounting period and a run
+rewrites only the partitions it has reason to. Nothing below depends on which it is —
+this loader reads whole models either way.) dbt-postgres can only model tables that are already in Postgres. Nothing in
 the repository has ever written to Postgres — `psycopg` is a core dependency that only
 the test fixture uses.
 
@@ -105,6 +108,14 @@ atomic swap.
 
 Adding one means building into a schema of the run's own and renaming it into place on
 success, which changes every schema name here and the shape of the test harness with it.
-That belongs with `orchestrate-the-daily-run`, which is the ticket that decides what a
-run is and what happens when one fails; it is recorded here rather than left for someone
-to discover from a report.
+It was recorded here rather than left for someone to discover from a report.
+
+This was handed to `orchestrate-the-daily-run`, on the grounds that it is the ticket that
+decides what a run is. That ticket settled what a run is and declined the swap, and the
+work now has a backlog entry of its own — `swap-the-mart-into-place`. The reasoning for
+moving it: the failure this fixes is a red gate leaving its rows where something could
+read them, which is a different failure from the one orchestration was built to answer,
+and the change reaches every schema name, `profiles.yml` and the whole test harness. It
+also has two questions of its own to settle — who removes the intermediate schema a
+failed swap leaves behind, and what happens to `mart.model_row_count`, which
+`docs/adr/0036` makes a memory that has to survive the build being renamed around it.

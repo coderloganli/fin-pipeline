@@ -28,7 +28,8 @@ selected.
 ## Reasoning
 
 One identifier on the row and the facts in the run record is normalisation, and the
-join is a lookup in a file with two lines per run. Nothing is lost: from any row,
+join is a lookup in a small append-only file - two lines per run when this was written,
+and a pair more per step since `docs/adr/0044`, which does not change the lookup. Nothing is lost: from any row,
 `_first_run_id` reaches the run that landed it and therefore the digest of the file it
 came from, and `_last_run_id` reaches the run that last wrote it.
 

@@ -1,0 +1,9 @@
+# The image installs the project; none of this belongs in it.
+.venv/
+.git/
+data/
+**/__pycache__/
+*.egg-info/
+transform/dbt/target/
+transform/dbt/logs/
+.env
