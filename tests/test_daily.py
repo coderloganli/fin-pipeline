@@ -13,11 +13,14 @@ Cases 29-33 of orchestrate-the-daily-run. See docs/adr/0044 and 0046.
 
 import pytest
 
-from conftest import TEST_PERIODS, run_dbt, schema_for, TEST_LANDING_SCHEMA, TEST_MART_SCHEMA
+from conftest import (TEST_PERIODS, TEST_LANDING_SCHEMA, TEST_MART_SCHEMA,
+                      drop_schemas_under, run_dbt, schema_for, schemas_under)
 from ingest import affected, contracts, raw, runs
 from pipeline import run as runner
 from pipeline import steps as step_list
 from test_mart_load import row_count, table_checksum
+from test_mart_promotion import RESERVE as BUILD_RESERVE, baseline
+from transform import promote
 from transform.spark import balances
 
 pytestmark = pytest.mark.db
@@ -44,7 +47,10 @@ def daily(request, db, spark, tmp_path_factory):
                     entries_per_period=40, late_entries=True, restatements=True))
 
     landing = schema_for(request.node.nodeid, TEST_LANDING_SCHEMA)
-    mart = schema_for(request.node.nodeid, TEST_MART_SCHEMA)
+    # Room for `__b<run_id>`: this fixture runs the real pipeline, so its mart schema is
+    # what a build schema is derived from. Without the reserve, dbt's audit suffix pushes
+    # the name past Postgres's 63 characters and it truncates silently.
+    mart = schema_for(request.node.nodeid, TEST_MART_SCHEMA, reserve=BUILD_RESERVE)
     context = runner.Context(
         source_dir=source,
         raw_dir=root / "raw",
@@ -57,10 +63,7 @@ def daily(request, db, spark, tmp_path_factory):
 
     yield context
 
-    with db.cursor() as cursor:
-        for schema in (landing, mart, mart + "_dbt_test__audit"):
-            cursor.execute(f'DROP SCHEMA IF EXISTS "{schema}" CASCADE')
-    db.commit()
+    drop_schemas_under(db, landing, mart)
 
 
 def mart_state(db, schema):
@@ -254,3 +257,76 @@ def append_source_row(source_dir, contract, row):
     with path.open("a", newline="", encoding="utf-8") as handle:
         csv.DictWriter(handle, fieldnames=columns).writerow(
             {name: row.get(name, "") for name in columns})
+
+
+# docs/adr/0036: five previous builds is what the drift gate needs before it will fire,
+# and dbt_project.yml is where the number lives.
+DRIFT_WINDOW = 5
+
+
+def seed_the_baseline(db, mart_schema: str, model: str, count: int) -> None:
+    """A history the next build's real count cannot match.
+
+    The drift gate is the one gate that can be turned red without touching the ledger,
+    which is what this needs: `mart-load` rebuilds the landing schema from the staging
+    Parquet on every run, so a failure planted in landing would be gone before dbt saw
+    it. Seeded into the promoted mart, the history is carried into the build schema by
+    `prepare` and the gate reads it there.
+    """
+    with db.cursor() as cursor:
+        for index in range(DRIFT_WINDOW):
+            cursor.execute(
+                f'INSERT INTO "{mart_schema}".model_row_count '
+                "(invocation_id, built_at, model, row_count) "
+                "VALUES (%s, now(), %s, %s)",
+                (f"seeded-{index}", model, count),
+            )
+    db.commit()
+
+
+def test_a_red_gate_leaves_the_previous_runs_mart_in_place(db, daily):
+    """31. The whole point, through the entry point somebody actually types. The run
+    fails, the record says which step and which schema, and an analyst reading the mart
+    sees the figures the last successful run left."""
+    runner.run_pipeline(daily, command="daily", steps=step_list.DAILY)
+    entries = row_count(db, daily.mart_schema, "fct_gl_entry")
+    seed_the_baseline(db, daily.mart_schema, "fct_gl_entry", entries * 3)
+    before = mart_state(db, daily.mart_schema)
+    before_baseline = baseline(db, daily.mart_schema)
+
+    with pytest.raises(Exception):
+        runner.run_pipeline(daily, command="daily", steps=step_list.DAILY)
+
+    record = daily.log().read()[-1]
+    assert record.status == runs.FAILED
+    assert record.failed_step == "dbt-build"
+    detail = detail_of(record, "dbt-build")
+    assert detail["promoted"] is False
+    assert detail["build_schema"] in promote.build_schemas(db, daily.mart_schema)
+    assert mart_state(db, daily.mart_schema) == before
+    # "The drift gate's baseline is likewise untouched by the failed build" - which the
+    # business tables' counts and checksums do not say, because the snapshot is not one
+    # of them.
+    assert baseline(db, daily.mart_schema) == before_baseline
+
+
+def test_the_teardown_rule_takes_a_kept_build_schema_with_it(db, daily):
+    """32. A build schema is kept on purpose when a gate goes red, so a teardown that
+    dropped three names by name would leak one into the developer's database on every
+    run of the suite. The fixtures share one rule and this is it under test - asserted
+    rather than trusted, because the leak is invisible until somebody counts schemas."""
+    from pipeline import dbt as pipeline_dbt
+
+    runner.run_pipeline(daily, command="daily", steps=step_list.DAILY)
+    entries = row_count(db, daily.mart_schema, "fct_gl_entry")
+    seed_the_baseline(db, daily.mart_schema, "fct_gl_entry", entries * 3)
+    with pytest.raises(pipeline_dbt.DbtFailed):
+        pipeline_dbt.build_and_promote(
+            landing=daily.landing_schema, mart=daily.mart_schema,
+            run_id=runs.new_run_id(), connection=db,
+        )
+    assert promote.build_schemas(db, daily.mart_schema), "nothing was left to leak"
+
+    drop_schemas_under(db, daily.landing_schema, daily.mart_schema)
+
+    assert schemas_under(db, daily.landing_schema, daily.mart_schema) == []

@@ -49,7 +49,10 @@ Two readings of "the same run three times over" were both live, and they are not
 same claim:
 
 **Three mart rebuilds over one fixed staging snapshot** — load, `dbt build`, three
-times. Everything is identical, every column included. This is the property this task
+times. Everything is identical, every column included, over every table but
+`mart.model_row_count` — which `docs/adr/0036` excludes from this check by name, because
+a table whose whole purpose is to append one row per build cannot also be invariant
+across builds. This is the property this task
 owns, and it is the one the acceptance criterion is checked against.
 
 **Three complete pipeline reruns** — generator through mart. Here `source_last_run_id`

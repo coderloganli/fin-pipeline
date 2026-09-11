@@ -12,6 +12,10 @@ after the watermark window closed, or a range somebody has reason to rebuild. It
 the affected-period set is empty - and the reason to type a range by hand is precisely
 that the set does not name it.
 
+**`dbt-build` builds into a schema of the run's own and renames it into place.** That is
+why it needs `context.run_id`: the schema is named after the run so the two can be read
+against each other. See docs/adr/0048.
+
 **`clear-affected` is last.** The set is owed until everything downstream of it has been
 rebuilt, so a run that dies at `dbt-build` leaves it owed and the next run redoes the
 work. That is the same ordering argument as the watermark moving last in
@@ -23,8 +27,8 @@ See docs/adr/0046.
 from dataclasses import dataclass
 from typing import Callable
 
-__all__ = ["Step", "VALIDATE", "LOAD", "RECOMPUTE", "MART_LOAD", "DBT_BUILD",
-           "CLEAR_AFFECTED", "DAILY", "BACKFILL", "by_name"]
+__all__ = ["Step", "MissingRunId", "VALIDATE", "LOAD", "RECOMPUTE", "MART_LOAD",
+           "DBT_BUILD", "CLEAR_AFFECTED", "DAILY", "BACKFILL", "by_name"]
 
 
 @dataclass(frozen=True)
@@ -93,7 +97,20 @@ def _mart_load(context) -> dict:
 def _dbt_build(context) -> dict:
     from pipeline import dbt
 
-    return dbt.build(landing=context.landing_schema, mart=context.mart_schema)
+    if not context.run_id:
+        # The build schema is named after the run, and inventing one would build into a
+        # schema no record mentions - which is the opposite of what docs/adr/0048 is
+        # for. `run_step` sets this for every step under both entry points, so a context
+        # without it is a caller that reached here some other way.
+        raise MissingRunId(
+            "dbt-build needs the run's run_id to name the schema it builds into; the "
+            "context carries none. Steps are run through pipeline.run.run_step, which "
+            "sets it."
+        )
+    return dbt.build_and_promote(
+        landing=context.landing_schema, mart=context.mart_schema,
+        run_id=context.run_id,
+    )
 
 
 def _clear_affected(context) -> dict:
@@ -110,6 +127,10 @@ def _clear_affected(context) -> dict:
 
 class ValidationFailed(RuntimeError):
     """A source extract no longer matches its contract. See docs/adr/0009 and 0012."""
+
+
+class MissingRunId(RuntimeError):
+    """A step that needs the run's identifier was handed a context without one."""
 
 
 # --- the steps, and the pipelines they make --------------------------------

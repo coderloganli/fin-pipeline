@@ -83,3 +83,11 @@ cause — but it constrains how the gate can be tested: the scenario that halves
 ledger has to leave every other gate green, or it is exercising the skip and not the
 drift. Deleting whole accounting periods does that, because both lines of a voucher
 carry the same accounting date; deleting a random sample of rows does not.
+
+**The baseline is a history of promoted builds.** `docs/adr/0048` builds the mart into a
+schema of its own and renames it into place on success, and `model_row_count` is copied
+into that schema and swapped with it. So a build that appends its row and then fails a
+gate takes that row away with the schema it was discarded in. The window of five is five
+builds whose figures were accepted, which is what a baseline should be made of — a
+rejected build setting the expectation for the next one would be the gate arguing with
+itself.
