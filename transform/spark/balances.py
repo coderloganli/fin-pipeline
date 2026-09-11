@@ -385,14 +385,9 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--periods", help="FROM:TO, as YYYY-MM:YYYY-MM")
     args = parser.parse_args(argv)
 
-    borrowed = session.active() is not None
-    spark = session.build("fin-pipeline-balances")
-    try:
+    with session.acquire("fin-pipeline-balances") as spark:
         target = build(spark, args.staging, periods=args.periods)
         print(f"{MODEL} -> {target}")
-    finally:
-        if not borrowed:
-            spark.stop()
     return 0
 
 

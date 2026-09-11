@@ -658,3 +658,20 @@ def test_a_selective_build_equals_a_full_build(spark, adjusted):
     full = balances.checksum(balances.read(spark, staging))
 
     assert selective == full
+
+
+# --- the command ------------------------------------------------------------
+
+def test_the_command_does_not_stop_a_session_that_is_active_on_another_thread(
+        spark, aggregated):
+    """Case 3. As cases 1 and 2, for `python -m transform.spark.balances`. See
+    docs/adr/0049."""
+    from conftest import run_off_thread, session_is_stopped
+
+    staging = aggregated([entry("E1", "2026-01-15", "660204", dr="500.00"),
+                          entry("E2", "2026-02-15", "660204", dr="700.00")])
+
+    code = run_off_thread(lambda: balances.main(["--staging", str(staging)]))
+
+    assert code == 0
+    assert not session_is_stopped(spark)

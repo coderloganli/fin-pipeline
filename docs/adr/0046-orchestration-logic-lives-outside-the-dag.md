@@ -46,13 +46,13 @@ the step modules take `spark` as an argument, which they already do. **No step s
 session it was handed.** Under `python -m pipeline daily` that is one session for all six
 steps; under a DAG it is one per task, out of the same code.
 
-That deliberately does not reuse the `borrowed = session.active() is not None` inference
-in the `__main__` blocks of `scd2`, `facts`, `balances` and `backfill`, because the
-inference is unsound. `session.active()` is `SparkSession.getActiveSession()`, which is
-thread-local and returns `None` when a session exists in the process but is not active in
-the calling thread; `session.build()` goes through `getOrCreate`, which hands back that
-existing session. `borrowed` is then `False` and the caller stops a session belonging to
-someone else. Ownership has to be held, not inferred, which is why the runner holds it.
+That deliberately did not reuse the `borrowed = session.active() is not None` inference
+the `__main__` blocks of `scd2`, `facts`, `balances` and `backfill` carried at the time,
+because the inference was unsound: it read a thread-local to answer a question about the
+process. Those four now hold ownership too, through `session.acquire`, and the inference
+is gone from the repository. The runner keeps its own mechanism — `owns_spark` declared by
+the entry point, held across a list of steps rather than around one command. The rule is
+shared; the mechanism does not have to be. See `docs/adr/0049`.
 
 **A backfill over an explicit range ignores the affected-period set.**
 `transform.backfill.run` returns without rebuilding anything when the set is empty, which
