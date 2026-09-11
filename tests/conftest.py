@@ -116,16 +116,60 @@ AUDIT_SUFFIX = "_dbt_test__audit"
 MAX_SCHEMA = 63 - len(AUDIT_SUFFIX)
 
 
-def schema_for(node_id: str, prefix: str) -> str:
+def schema_for(node_id: str, prefix: str, reserve: int = 0) -> str:
     """A schema name unique to one test, short enough to survive dbt's audit suffix.
 
     The readable part is kept and the rest is a digest, so a failure names something a
     person can find in psql.
+
+    `reserve` is for a mart schema a build schema will be derived from: docs/adr/0048
+    appends `__b<run_id>` to it, and the audit suffix goes on the end of that. A fixture
+    that promotes passes the reserve; one that only builds does not, and keeps the
+    longer readable name.
     """
     digest = hashlib.sha256(node_id.encode("utf-8")).hexdigest()[:8]
     readable = "".join(c if c.isalnum() else "_" for c in node_id.rsplit("::", 1)[-1])
-    budget = MAX_SCHEMA - len(prefix) - len(digest) - 2
+    budget = MAX_SCHEMA - reserve - len(prefix) - len(digest) - 2
+    if budget < 1:
+        raise ValueError(
+            f"no room for a readable name: prefix {prefix!r} and a reserve of "
+            f"{reserve} leave {budget} characters of the {MAX_SCHEMA} available"
+        )
     return f"{prefix}_{readable[:budget]}_{digest}".lower()
+
+
+def like_prefix(name: str) -> str:
+    """A LIKE pattern matching this name and anything suffixed to it.
+
+    `_` is a single-character wildcard and every schema name here is full of them, so an
+    unescaped prefix would match schemas belonging to other tests.
+    """
+    escaped = name.replace("\\", "\\\\").replace("_", "\\_").replace("%", "\\%")
+    return escaped + "%"
+
+
+def schemas_under(connection, *prefixes: str) -> list[str]:
+    """Every schema whose name starts with one of these, sorted."""
+    clause = " OR ".join(["nspname LIKE %s ESCAPE '\\'"] * len(prefixes))
+    with connection.cursor() as cursor:
+        cursor.execute(
+            f"SELECT nspname FROM pg_namespace WHERE {clause}",
+            tuple(like_prefix(one) for one in prefixes),
+        )
+        return sorted(row[0] for row in cursor.fetchall())
+
+
+def drop_schemas_under(connection, *prefixes: str) -> None:
+    """The teardown rule both mart fixtures use.
+
+    By prefix rather than by name, because docs/adr/0048 keeps a failed build's schema
+    on purpose - and a teardown naming the landing schema, the mart and its audit schema
+    would leave that one in the developer's database on every run of the suite.
+    """
+    with connection.cursor() as cursor:
+        for schema in schemas_under(connection, *prefixes):
+            cursor.execute(f'DROP SCHEMA IF EXISTS "{schema}" CASCADE')
+    connection.commit()
 
 
 @dataclass
@@ -322,7 +366,4 @@ def mart(request, db):
 
     yield build
 
-    with db.cursor() as cursor:
-        for schema in (landing, mart_schema, mart_schema + AUDIT_SUFFIX):
-            cursor.execute(f'DROP SCHEMA IF EXISTS "{schema}" CASCADE')
-    db.commit()
+    drop_schemas_under(db, landing, mart_schema)

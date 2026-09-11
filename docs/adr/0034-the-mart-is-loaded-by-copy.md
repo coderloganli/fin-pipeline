@@ -91,31 +91,20 @@ The schema names are configuration, not constants. `POSTGRES_LANDING_SCHEMA` and
 `POSTGRES_MART_SCHEMA` default to `landing` and `mart`; the loader reads the first and
 the dbt project reads both through `env_var`. The test suite points them at
 `landing_test` and `mart_test`, so running the suite does not overwrite the schemas a
-developer has been looking at in the same database.
+developer has been looking at in the same database. `POSTGRES_MART_SCHEMA` has a length
+budget it did not have when this was written; `docs/adr/0048` says what it is and why.
 
 The mart is one full rebuild. Loading only the periods that changed is what
 `backfill-only-affected-periods` exists for, and this decision does not stand in its
 way: a load that writes whole tables can become a load that writes whole partitions
 without the reader of those tables changing.
 
-**There is no promotion boundary, and a failed build leaves what failed in place.** dbt
-builds the models and then runs the tests over them, so a gate that goes red does so
-after the table it guards has been written. `dbt build` stops there and nothing further
-runs, but the mart schema is holding the figures that failed the gate until the next
-successful build replaces them. Nothing in this repository reads that schema yet, and
-the run that produced it exits non-zero — so what is missing is not a check, it is an
-atomic swap.
+**The mart is not written in place.** dbt builds the models and then runs the tests over
+them, so a gate that goes red does so after the table it guards has been written. That
+is why a run builds into a schema of its own and renames it into place only when the
+build comes back green: what this decision lands is the landing schema, and what a
+reader sees is promoted rather than accumulated. See `docs/adr/0048`.
 
-Adding one means building into a schema of the run's own and renaming it into place on
-success, which changes every schema name here and the shape of the test harness with it.
-It was recorded here rather than left for someone to discover from a report.
-
-This was handed to `orchestrate-the-daily-run`, on the grounds that it is the ticket that
-decides what a run is. That ticket settled what a run is and declined the swap, and the
-work now has a backlog entry of its own — `swap-the-mart-into-place`. The reasoning for
-moving it: the failure this fixes is a red gate leaving its rows where something could
-read them, which is a different failure from the one orchestration was built to answer,
-and the change reaches every schema name, `profiles.yml` and the whole test harness. It
-also has two questions of its own to settle — who removes the intermediate schema a
-failed swap leaves behind, and what happens to `mart.model_row_count`, which
-`docs/adr/0036` makes a memory that has to survive the build being renamed around it.
+The landing schema is not promoted, and does not need to be. Nothing reads it, and a
+`mart-load` that dies stops the run before `dbt-build`, so a half-rebuilt landing is
+never modelled into a mart anyone sees.

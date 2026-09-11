@@ -167,15 +167,22 @@ counted model per build, and the gate compares the current count against the med
 the previous five, excluding the build being tested, failing outside ten percent. It
 does not count itself, which is what keeps the graph acyclic. See docs/adr/0036.
 
-**A failed build leaves what failed in the mart.** dbt builds the models and then runs
+**A failed build changes nothing a reader can see.** dbt builds the models and then runs
 the tests over them, so a gate that goes red does so after the table it guards has been
-written. `dbt build` stops there and exits non-zero, and nothing reads the mart yet — but
-what is missing is an atomic swap, not a check. Adding one means building into a schema
-of the run's own and renaming it into place, which reaches every schema name and the
-whole test harness; `swap-the-mart-into-place` owns it. See docs/adr/0034.
+written — which is why a run does not build the mart in place. It builds into
+`<mart>__b<run_id>` and renames that schema into place in one transaction when
+`dbt build` comes back green. A build that fails leaves its schema behind, named in the
+run record, with its offending rows still readable in the schema's `_dbt_test__audit`;
+the mart keeps the last figures that passed. The next build that succeeds sweeps them,
+so evidence survives until the problem is fixed rather than until the next attempt. `mart.model_row_count` is copied into the build schema and promoted with it, so
+the drift gate's baseline is a history of builds that were accepted. The promotion is
+`transform/promote.py`, called by the `dbt-build` step; a bare `dbt build` still writes
+`POSTGRES_MART_SCHEMA` directly, and that schema may be at most 21 characters because
+Postgres truncates at 63 and dbt appends sixteen of them. See docs/adr/0048.
 
 **The mart is a function of its inputs, so nothing in it names the build that wrote
-it.** Rebuilding from an unchanged staging snapshot is identical in every column. A full
+it.** Rebuilding from an unchanged staging snapshot is identical in every column, over
+every table but `mart.model_row_count`, which docs/adr/0036 excludes by name. A full
 pipeline rerun is identical in every reported column and moves `source_last_run_id`,
 because docs/adr/0018 has that set by whichever run wrote the partition — so the mart
 checksum excludes the two provenance columns, exactly as docs/adr/0017 excludes

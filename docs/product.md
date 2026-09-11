@@ -145,7 +145,9 @@ organisation reorganises, which is the failure the whole project exists to avoid
 
 **Breaking is better than drifting.** When a source contract is violated, the run
 stops. A pipeline that keeps going and reports a wrong number is worse than one
-that fails.
+that fails. Stopping means the report tables are left holding the last figures that
+passed every gate: a run that fails publishes nothing, rather than publishing and then
+saying so.
 
 **The application is a way to see the data, not a place data is decided.** Logic
 lives in the models. Streamlit is used because it is enough.
