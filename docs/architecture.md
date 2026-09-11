@@ -89,6 +89,14 @@ either as `java` on the PATH or through `JAVA_HOME` — either one, and the list
 list rather than a floor. CI installs Temurin 21. Tests that need it fail rather than skip, for the reason the database
 fixture does. See `docs/adr/0028-spark-runs-in-process.md`.
 
+**One session per process, and whoever started it is the only one who stops it.**
+`session.acquire` holds it for the length of a command and stops only what that call
+created; `pipeline/run.py` declares ownership with `owns_spark` and holds it across a run's
+steps. Everything else — every `build` function, every step — is handed a session and
+neither stops nor reconfigures it. Ownership is established before the session is built,
+never inferred afterwards from `getActiveSession()`, which answers for the calling thread
+and not for the process. See `docs/adr/0049`.
+
 **DeepSeek V4 Flash** is called by the insight layer once that layer exists. See
 `docs/adr/0001-llm-for-the-insight-layer.md`.
 

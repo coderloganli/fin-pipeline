@@ -280,6 +280,10 @@ def test_the_spark_session_fails_with_a_message_that_says_what_to_install(monkey
     def refuses(*args, **kwargs):
         raise RuntimeError("Java gateway process exited before sending its port number")
 
+    # `build` returns an existing session rather than making a second one, so the
+    # creating path - the only one that can fail this way - is reached only when the
+    # process has none. See docs/adr/0049.
+    monkeypatch.setattr(spark_session, "_existing", lambda: None)
     monkeypatch.setattr(spark_session, "_build_session", refuses)
 
     with pytest.raises(spark_session.SparkUnavailable) as failure:

@@ -216,19 +216,13 @@ def main(argv: list[str] | None = None) -> int:
         print(f"not an effective-dated dimension: {unknown}", file=sys.stderr)
         return 2
 
-    # Stop only a session this call started. `build` goes through `getOrCreate`, so
-    # when something in this process already has one, that is what comes back and
-    # stopping it would take it away from its owner.
-    borrowed = session.active() is not None
-    spark = session.build("fin-pipeline-scd2")
-    try:
+    # Ownership is held by the block, not worked out from a thread-local. See
+    # docs/adr/0049.
+    with session.acquire("fin-pipeline-scd2") as spark:
         for table in tables:
             contract = contracts.load(table)
             target = build(spark, contract, args.raw, args.staging)
             print(f"{table}: {MODELS[table][0]} -> {target}")
-    finally:
-        if not borrowed:
-            spark.stop()
     return 0
 
 

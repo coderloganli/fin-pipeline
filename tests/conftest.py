@@ -27,6 +27,76 @@ from transform.db import (  # noqa: F401  - re-exported for the tests that impor
 REPO_ROOT = Path(__file__).resolve().parent.parent
 
 
+# --- holding a Spark session, and being somewhere that has none -------------
+#
+# Ownership of the session is held rather than inferred - see docs/adr/0049. These two
+# helpers construct the conditions the inference used to get wrong, and both are needed
+# by tests in several modules.
+
+def run_off_thread(call):
+    """Run `call` on a plain thread, join it, and hand back what it did.
+
+    Deliberately `threading.Thread` and not `pyspark.InheritableThread`. The latter
+    exists precisely to copy the JVM thread-locals across, and these tests need them
+    absent: on a plain thread `SparkSession.getActiveSession()` is `None` while the
+    process's session is very much alive, which is the condition ownership must never be
+    inferred from.
+
+    Anything the thread raised is re-raised here, because a failure that stayed in the
+    child would be reported as a passing test.
+    """
+    import threading
+
+    caught, returned = [], []
+
+    def body():
+        try:
+            returned.append(call())
+        except BaseException as failure:  # noqa: BLE001 - re-raised below, unchanged
+            caught.append(failure)
+
+    thread = threading.Thread(target=body)
+    thread.start()
+    thread.join()
+    if caught:
+        raise caught[0]
+    return returned[0]
+
+
+def session_is_stopped(spark) -> bool:
+    """Whether this session has been stopped, without raising when it has.
+
+    A stopped session loses its `_jsc`, so the direct
+    `spark.sparkContext._jsc.sc().isStopped()` raises `AttributeError` instead of
+    answering - which reports the interesting case as an error rather than as the
+    assertion it is.
+    """
+    context = spark.sparkContext._jsc
+    return context is None or context.sc().isStopped()
+
+
+def in_a_fresh_process(body: str) -> str:
+    """Run a snippet in a process that has built no Spark session, and return its stdout.
+
+    The suite's session-scoped fixture makes "this process has no session" unreachable in
+    process, and it is the condition half of the ownership cases are about. The snippet
+    is dedented, so it can be written as an indented triple-quoted string.
+    """
+    import subprocess
+    import sys
+    import textwrap
+
+    finished = subprocess.run(
+        [sys.executable, "-c", textwrap.dedent(body)],
+        capture_output=True, text=True, cwd=REPO_ROOT,
+    )
+    assert finished.returncode == 0, (
+        f"the snippet exited {finished.returncode}\n"
+        f"--- stdout ---\n{finished.stdout}\n--- stderr ---\n{finished.stderr}"
+    )
+    return finished.stdout
+
+
 @pytest.fixture(scope="session")
 def db():
     """A connection to Postgres. Only tests that ask for it pay for it.
@@ -64,14 +134,15 @@ def spark():
     It fails rather than skips when Spark cannot start, for the reason the database
     fixture does: a skipped test reports success, and a CI run that verified nothing
     comes back green.
+
+    It acquires rather than builds, so that it too stops only a session it created. A
+    fixture that unconditionally stopped whatever `build` handed back would be breaking
+    the ownership rule the suite exists to enforce - see docs/adr/0049.
     """
     from transform.spark import session as spark_session
 
-    built = spark_session.build("fin-pipeline-tests")
-    try:
+    with spark_session.acquire("fin-pipeline-tests") as built:
         yield built
-    finally:
-        built.stop()
 
 
 # --- the mart: one pipeline run, many builds --------------------------------

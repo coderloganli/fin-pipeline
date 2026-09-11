@@ -2,7 +2,8 @@
 
 PySpark jobs for the work that has to scale.
 
-**Landed:** `session.py`, which builds the local SparkSession; `scd2.py`, which turns
+**Landed:** `session.py`, which builds the local SparkSession and hands it out for the
+length of a command through `acquire`, stopping only what it started; `scd2.py`, which turns
 the effective-dated sources into validity intervals; `facts.py`, which attributes each
 entry to the structure in force on its accounting date; and `balances.py`, which
 aggregates the result by month.

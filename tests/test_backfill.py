@@ -286,14 +286,35 @@ def test_the_command_forwards_force(monkeypatch):
         seen.update(periods=periods, force=force)
         return {"2026-01"}
 
+    from contextlib import contextmanager
+
     from transform.spark import session
 
+    @contextmanager
+    def without_a_jvm(name):
+        yield None
+
     monkeypatch.setattr(backfill, "run", record)
-    # `main` builds a session before calling `run`; this test is about the flag, and
+    # `main` acquires a session before calling `run`; this test is about the flag, and
     # starting a JVM to establish that a boolean was passed along would be absurd.
-    monkeypatch.setattr(session, "build", lambda *a, **k: None)
-    monkeypatch.setattr(session, "active", lambda: object())
+    monkeypatch.setattr(session, "acquire", without_a_jvm)
 
     assert backfill.main(["--periods", "2026-01:2026-02", "--force"]) == 0
 
     assert seen == {"periods": "2026-01:2026-02", "force": True}
+
+
+def test_the_command_does_not_stop_a_session_that_is_active_on_another_thread(
+        spark, pipeline):
+    """Case 4. As cases 1 to 3, for `python -m transform.backfill`. It used to read the
+    thread-local `session.active()` to decide whether the session was its to stop, and
+    from a thread that has none the answer was always "mine". See docs/adr/0049."""
+    from conftest import run_off_thread, session_is_stopped
+    from transform import backfill
+
+    code = run_off_thread(lambda: backfill.main(
+        ["--raw", str(pipeline.raw), "--staging", str(pipeline.staging),
+         "--periods", TEST_PERIODS, "--force"]))
+
+    assert code == 0
+    assert not session_is_stopped(spark)

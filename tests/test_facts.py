@@ -489,3 +489,22 @@ def test_a_period_that_emptied_out_loses_its_partition(spark, built, tmp_path):
     facts.build(spark, raw_dir, staging, dirty={"2026-06"})
 
     assert "2026-06" not in partition_mtimes(staging)
+
+
+# --- the command ------------------------------------------------------------
+
+def test_the_command_does_not_stop_a_session_that_is_active_on_another_thread(
+        spark, built):
+    """Case 2. `python -m transform.spark.facts` used to infer whether the session was
+    its to stop from `session.active()`, which is thread-local. Called from a thread that
+    has none, it stopped the process's session out from under its owner. See
+    docs/adr/0049."""
+    from conftest import run_off_thread, session_is_stopped
+
+    raw_dir, staging = built()
+
+    code = run_off_thread(lambda: facts.main(
+        ["--raw", str(raw_dir), "--staging", str(staging)]))
+
+    assert code == 0
+    assert not session_is_stopped(spark)

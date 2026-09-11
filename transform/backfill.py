@@ -74,15 +74,12 @@ def main(argv: list[str] | None = None) -> int:
 
     args = build_parser().parse_args(argv)
 
-    borrowed = session.active() is not None
-    spark = session.build("fin-pipeline-backfill")
-    try:
+    with session.acquire("fin-pipeline-backfill") as spark:
         written = run(spark, args.raw, args.staging, periods=args.periods,
                       force=args.force)
-    finally:
-        if not borrowed:
-            spark.stop()
 
+    # After the block, as it was after the `finally`: the session goes down, then the run
+    # says what it rebuilt.
     if written:
         print(f"rebuilt {len(written)} periods: {', '.join(sorted(written))}")
     else:

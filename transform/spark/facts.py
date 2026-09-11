@@ -333,15 +333,10 @@ def main(argv: list[str] | None = None) -> int:
     if unknown:
         parser.error(f"unknown models {unknown}; this module builds {sorted(SOURCES)}")
 
-    borrowed = session.active() is not None
-    spark = session.build("fin-pipeline-facts")
-    try:
+    with session.acquire("fin-pipeline-facts") as spark:
         for model in models:
             target = build(spark, args.raw, args.staging, model=model)
             print(f"{model} -> {target}")
-    finally:
-        if not borrowed:
-            spark.stop()
     return 0
 
 

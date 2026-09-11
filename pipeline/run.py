@@ -9,12 +9,10 @@ by XCom, and closed by a last task whose trigger rule fires however the run ende
 is its own process, so nothing else can - a SparkSession in particular cannot be handed
 from one task to the next. The context therefore holds a session for the process it is
 in rather than across steps, and no step stops a session it was handed. Ownership is
-held here, not inferred: `session.active()` is thread-local and returns None when a
-session exists in the process but is not active in the calling thread, while
-`session.build()` goes through `getOrCreate` and hands that existing session back, so a
-caller inferring ownership from the first can stop a session belonging to someone else.
+held here, not inferred - the rule the whole platform now follows, and the reasoning for
+it is in docs/adr/0049.
 
-See docs/adr/0044, 0045 and 0046.
+See docs/adr/0044, 0045, 0046 and 0049.
 """
 
 import time
@@ -61,12 +59,13 @@ class Context:
     controls, and nothing else does.
 
     Ownership is declared rather than inferred, and that is the whole point.
-    `session.build` goes through `getOrCreate`, so in a process that already has a
-    session it hands that one back; a run that inferred ownership from having called
-    `build` would then stop a session belonging to somebody else. That is a live defect
-    in the `__main__` blocks of `scd2`, `facts`, `balances` and `backfill`, which infer
-    it from `session.active()` - thread-local, and None when a session exists but is not
-    active in the calling thread. See `hold-the-spark-session-not-guess-it`.
+    `session.build` hands back a session the process already has rather than making a
+    second one, so a run that inferred ownership from having called `build` would stop a
+    session belonging to somebody else. The four `__main__` blocks under `transform/`
+    once inferred exactly that, from the thread-local `session.active()`; they now hold
+    it with `session.acquire`, and `active` is gone. This runner keeps its own mechanism
+    because it holds a session across a list of steps rather than around one command.
+    See docs/adr/0049.
     """
 
     source_dir: Path = DEFAULT_SOURCE

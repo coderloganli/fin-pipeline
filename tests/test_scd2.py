@@ -344,6 +344,25 @@ def test_the_command_does_not_stop_a_session_it_was_handed(spark, landed):
     assert not spark.sparkContext._jsc.sc().isStopped()
 
 
+def test_the_command_does_not_stop_a_session_that_is_active_on_another_thread(
+        spark, landed):
+    """Case 1. The same claim as the test above, under the condition that breaks the
+    inference the command used to make: the process has a session, and the thread calling
+    `main` does not. `getActiveSession()` is thread-local, so it answered `None` here
+    while `getOrCreate` handed the very session back - and the command stopped it. See
+    docs/adr/0049."""
+    from conftest import run_off_thread, session_is_stopped
+
+    raw_dir, staging = landed()
+
+    code = run_off_thread(lambda: scd2.main(
+        ["--raw", str(raw_dir), "--staging", str(staging),
+         "--table", "dim_cost_center_src"]))
+
+    assert code == 0
+    assert not session_is_stopped(spark)
+
+
 def test_a_table_that_is_not_an_effective_dated_dimension_is_a_usage_error(tmp_path, capsys):
     """Exit 2, the code the ingest commands return for the same mistake - and returned
     before a session is built, so a typo does not pay for a JVM."""
