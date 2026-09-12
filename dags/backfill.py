@@ -70,6 +70,11 @@ with DAG(
         runner.run_step(context_for(context["params"]), run_id, step_list.DBT_BUILD)
         return run_id
 
+    @task(task_id="judge")
+    def judge(run_id: str, **context) -> str:
+        runner.run_step(context_for(context["params"]), run_id, step_list.JUDGE)
+        return run_id
+
     @task(task_id="clear-affected")
     def clear_affected(run_id: str, **context) -> str:
         runner.run_step(context_for(context["params"]), run_id,
@@ -85,6 +90,6 @@ with DAG(
     opened = open_run()
     closed = close_run(opened)
     step = opened
-    for stage in (recompute, mart_load, dbt_build, clear_affected):
+    for stage in (recompute, mart_load, dbt_build, judge, clear_affected):
         step = stage(step)
     step >> closed

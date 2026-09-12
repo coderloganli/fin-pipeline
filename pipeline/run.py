@@ -75,6 +75,7 @@ class Context:
     force: bool = False
     landing_schema: str | None = None
     mart_schema: str | None = None
+    anomaly_schema: str | None = None
     spark: object = None
     owns_spark: bool = False
 
@@ -89,12 +90,18 @@ class Context:
         self.source_dir = Path(self.source_dir)
         self.raw_dir = Path(self.raw_dir)
         self.staging_dir = Path(self.staging_dir)
-        if self.landing_schema is None or self.mart_schema is None:
+        if (self.landing_schema is None or self.mart_schema is None
+                or self.anomaly_schema is None):
             from transform import db
 
             values = db.settings()
             self.landing_schema = self.landing_schema or values["POSTGRES_LANDING_SCHEMA"]
             self.mart_schema = self.mart_schema or values["POSTGRES_MART_SCHEMA"]
+            # Resolved here rather than reached for inside the step, so a test that
+            # isolates a run by passing schemas can isolate this one too. A resolver
+            # default alone would have every pipeline test writing into whatever
+            # `anomaly` resolves to in the developer's own database.
+            self.anomaly_schema = self.anomaly_schema or values["POSTGRES_ANOMALY_SCHEMA"]
 
     def log(self) -> runs.RunLog:
         return runs.RunLog(self.raw_dir)

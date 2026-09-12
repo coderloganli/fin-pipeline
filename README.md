@@ -167,7 +167,7 @@ way the Python interpreter is; see `docs/adr/0028-spark-runs-in-process.md`.
 
 ```
 docker compose up -d          # Postgres, on 127.0.0.1:5432
-pip install -e ".[dev,spark,dbt]"
+pip install -e ".[dev,spark,dbt,ml]"
 pytest -q
 ```
 

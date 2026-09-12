@@ -499,6 +499,32 @@ def test_growing_account_refuses_a_range_too_short_to_show_growth(tmp_path):
         ))
 
 
+def test_growing_account_needs_room_after_the_anchor(tmp_path):
+    """Case 31 of judge-anomalies-by-interval. docs/adr/0056 moved the planted rise
+    from the start of the range to its middle, so that the anomaly model - which
+    consumes twelve periods of history before it judges anything (docs/adr/0055) - can
+    actually see it. The window now has to fit after the anchor, so the floor is twice
+    GROWTH_MONTHS rather than GROWTH_MONTHS.
+
+    Four periods used to be enough and is not any more. Twelve still is, and the shape
+    is unchanged: `has_growing_account` looks for three consecutive rises anywhere in
+    the series and does not care where they sit.
+    """
+    from generator.entries import GROWTH_MONTHS
+
+    floor = 2 * GROWTH_MONTHS
+    # Named, so a regression to some other arbitrary minimum does not pass: the bound
+    # is twice GROWTH_MONTHS because the window has to fit after the anchor.
+    for periods in ("2026-01:2026-04", f"2026-01:2026-{floor - 1:02d}"):
+        with pytest.raises(ValueError, match=f"growing_account needs at least {floor}"):
+            generate(Config(
+                seed=42, out_dir=tmp_path / f"short_{periods[-2:]}",
+                periods=periods, growing_account=True,
+            ))
+
+    assert has_growing_account(run(tmp_path, growing_account=True))
+
+
 # --- Exchange-rate precision ------------------------------------------------
 #
 # A rate is not a currency amount. Two decimal places on a rate near 7.87 is a

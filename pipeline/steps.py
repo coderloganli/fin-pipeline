@@ -16,6 +16,12 @@ that the set does not name it.
 why it needs `context.run_id`: the schema is named after the run so the two can be read
 against each other. See docs/adr/0048.
 
+**`judge` runs after `dbt-build` and before `clear-affected`.** After, because it trains
+on the published mart (docs/adr/0051) and because a model that fails must not be able to
+stop the mart being published - by the time it runs, the figures are already out.
+Before, because on a daily run the affected set is how it knows which periods to judge,
+and after the clear there is nothing left to read. See docs/adr/0050.
+
 **`clear-affected` is last.** The set is owed until everything downstream of it has been
 rebuilt, so a run that dies at `dbt-build` leaves it owed and the next run redoes the
 work. That is the same ordering argument as the watermark moving last in
@@ -28,7 +34,7 @@ from dataclasses import dataclass
 from typing import Callable
 
 __all__ = ["Step", "MissingRunId", "VALIDATE", "LOAD", "RECOMPUTE", "MART_LOAD",
-           "DBT_BUILD", "CLEAR_AFFECTED", "DAILY", "BACKFILL", "by_name"]
+           "DBT_BUILD", "JUDGE", "CLEAR_AFFECTED", "DAILY", "BACKFILL", "by_name"]
 
 
 @dataclass(frozen=True)
@@ -113,6 +119,73 @@ def _dbt_build(context) -> dict:
     )
 
 
+def _judge(context) -> dict:
+    """Flag the balances that fell outside their interval, for the periods this run
+    touched.
+
+    After `dbt-build`, because the model trains on the published mart rather than on the
+    landing layer - the mart is the last set of figures that passed all six gates, and
+    training upstream of them is a way for rejected figures to reach a reader anyway.
+    See docs/adr/0051.
+
+    Which periods is worked out here rather than handed over by `recompute`.
+    `docs/adr/0046` keeps step-to-step handoff out of the DAG, so this step reads what it
+    needs for itself.
+
+    **`force` is what separates the two cases, not whether a range was given.** A daily
+    run carries `--periods` too - it is the reporting range, and `recompute` cannot run
+    without one - so branching on the range would have every nightly run re-judge three
+    years. `force` is set by `python -m pipeline backfill` and by the backfill DAG's
+    `context_for`, and it means what it means in `transform.backfill.run`: rebuild the
+    range I was given whether or not anything is owed.
+
+    So a backfill judges its range, and a daily run judges the affected set widened by
+    the same closure `recompute` used - called rather than restated, because a window
+    rule written down twice is one that stops being backfilled when it widens
+    (docs/adr/0040). The closure is capped by the end of the reporting range, because a
+    period outside it has no row in the mart to judge.
+    """
+    from ingest import affected
+    from ml import judge
+    from transform import db
+    from transform.spark import balances
+
+    if not context.run_id:
+        raise MissingRunId(
+            "judge needs the run's run_id: every flag carries the run that produced it, "
+            "which is how a reader gets back to the mart build it was computed against. "
+            "Steps are run through pipeline.run.run_step, which sets it."
+        )
+
+    first, last = balances.parse_periods(context.periods) if context.periods else (None, None)
+
+    if context.force:
+        periods = balances.period_range(first, last)
+    else:
+        owed = affected.read(context.raw_dir)
+        if not owed.periods:
+            return {"periods": [], "flagged": 0, "intervals_crossed": 0}
+        closure = balances.dirty_closure(
+            set(owed.periods), last_period=last or max(owed.periods)
+        )
+        periods = sorted(p for p in closure if first is None or p >= first)
+
+    with db.connection_from() as connection:
+        detail = judge.run(
+            connection=connection,
+            mart_schema=context.mart_schema,
+            anomaly_schema=context.anomaly_schema,
+            periods=periods,
+            run_id=context.run_id,
+        )
+    # `not_judged` reaches the run record too. A period with no history in front of it
+    # is not a period that was judged and found clean, and an operator reading
+    # `flagged: 0` at eight in the morning has to be able to tell which happened.
+    return {"periods": detail.periods, "flagged": detail.flagged,
+            "intervals_crossed": detail.intervals_crossed,
+            "not_judged": detail.not_judged}
+
+
 def _clear_affected(context) -> dict:
     from ingest import affected
 
@@ -140,10 +213,11 @@ LOAD = Step(name="load", run=_load)
 RECOMPUTE = Step(name="recompute", run=_recompute)
 MART_LOAD = Step(name="mart-load", run=_mart_load)
 DBT_BUILD = Step(name="dbt-build", run=_dbt_build)
+JUDGE = Step(name="judge", run=_judge)
 CLEAR_AFFECTED = Step(name="clear-affected", run=_clear_affected)
 
-DAILY = [VALIDATE, LOAD, RECOMPUTE, MART_LOAD, DBT_BUILD, CLEAR_AFFECTED]
-BACKFILL = [RECOMPUTE, MART_LOAD, DBT_BUILD, CLEAR_AFFECTED]
+DAILY = [VALIDATE, LOAD, RECOMPUTE, MART_LOAD, DBT_BUILD, JUDGE, CLEAR_AFFECTED]
+BACKFILL = [RECOMPUTE, MART_LOAD, DBT_BUILD, JUDGE, CLEAR_AFFECTED]
 
 PIPELINES = {"daily": DAILY, "backfill": BACKFILL}
 

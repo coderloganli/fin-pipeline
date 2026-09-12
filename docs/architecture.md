@@ -25,16 +25,21 @@ Postgres and `transform/dbt/` models it as a star with six quality gates over it
 entries, adjustments and dimension changes recompute only the periods they affect;
 `transform/lineage.py` renders the graph and answers what a column change would break.
 `pipeline/` puts those in order and writes down what each one did, and `dags/` declares the
-two Airflow DAGs that call it. `ml/`, `insight/` and `app/` exist and each carries a README
-stating what that layer is and is not responsible for, but no module has landed in them.
-Read the READMEs for intent; read this file for what is actually true today.
+two Airflow DAGs that call it. `ml/` has landed: it fits a prediction interval per monthly
+balance and writes the ones that fall outside theirs to `anomaly_flag`, and `judge` is a
+step of both pipelines. `insight/` and `app/` still carry only a README stating what that
+layer is and is not responsible for. Read the READMEs for intent; read this file for what
+is actually true today.
 
 ## Shape
 
 ```
 generator ──▶ raw (Parquet) ──▶ staging (Parquet, PySpark) ──▶ mart (Postgres, dbt)
                                                                       │
-                                    anomaly model ──▶ LLM investigation ──▶ Streamlit
+                                          │
+                              anomaly model ──▶ anomaly_flag (Postgres)
+                                                      │
+                                          LLM investigation ──▶ application
 ```
 
 | Directory | Responsibility |
@@ -45,7 +50,7 @@ generator ──▶ raw (Parquet) ──▶ staging (Parquet, PySpark) ──▶
 | `transform/dbt/` | The mart: a star in Postgres, and the six gates over it |
 | `transform/load.py` | Copies the staging Parquet into Postgres so dbt has sources |
 | `transform/lineage.py` | Reads dbt's manifest: the impact list, and the HTML graph |
-| `ml/` | Anomaly detection over monthly balances |
+| `ml/` | Anomaly detection over monthly balances: the design matrix, the two arms, the backtest, and the flags |
 | `insight/` | The LLM investigation loop and its golden-set evaluation |
 | `app/` | Streamlit application; queries the mart, computes nothing |
 | `pipeline/` | The steps a run is made of, in order, and the record of what each one did |
@@ -66,6 +71,14 @@ it. `.env.example` records the shape and `.env` is ignored.
 than `staging` because `docs/adr/0026` already owns that name for the Parquet layer, and
 one name for two things is what this repository argues against everywhere else. Both are
 settings so the test suite can point at schemas of its own. See `docs/adr/0034`.
+
+**The anomaly flags are a third schema, outside the mart.**
+`POSTGRES_ANOMALY_SCHEMA` holds `anomaly_flag`, written by Python because it is model
+output rather than a transformation dbt could express. Outside the mart for two reasons,
+the second deciding: a promotion drops that schema wholesale, and `docs/product.md` says
+deleting this layer changes no reported number - so a model that fails must not be able
+to stop the mart being published. `judge` runs after `dbt-build` has promoted and before
+`clear-affected` clears the set it reads. See docs/adr/0050 and 0051.
 
 **dbt runs against that Postgres and needs no toolchain of its own.** `transform/dbt/`
 carries its own `profiles.yml` rather than expecting one in `~/.dbt`, so the same
@@ -107,13 +120,13 @@ asserts the two agree, because they had already drifted apart once before anythi
 checked.
 
 **Dependencies live in `pyproject.toml` only**, installed with
-`pip install -e '.[dev,spark,dbt]'` — the same command locally, in CI, and in any image.
+`pip install -e '.[dev,spark,dbt,ml]'` — the same command locally, in CI, and in any image.
 The core set is small — `psycopg`, `pyyaml`, and `pyarrow`, which ingest writes the raw
-layer with. `spark` has been claimed by `transform/spark/` and `dbt` by `transform/dbt/`, and both
-are in the install line rather than optional because the tests that need them fail
-rather than skip, so the suite does not pass without them. `ml` and `app` are declared
-but installed by nobody yet; the task that first needs one of them is the task that
-makes it install.
+layer with. `spark` has been claimed by `transform/spark/`, `dbt` by `transform/dbt/` and `ml` by
+`ml/`, and all three are in the install line rather than optional because the tests that
+need them fail rather than skip, so the suite does not pass without them. `app` is
+declared but installed by nobody yet; the task that first needs it is the task that makes
+it install.
 
 **Tests that need the database fail when it is absent — they never skip.** A skipped
 test reports success, and a green CI run that verified nothing defeats the point of
@@ -388,6 +401,17 @@ disagree, and a test that compares them is what turns a drift into a decision. T
 contracts' business rules are checked against data with every failure-mode switch on,
 because a late entry or a cost centre that moved department is a legitimate business
 event, not malformed input. See docs/adr/0008-contracts-are-written-by-hand.md.
+
+**A balance is flagged by a fitted interval, and both arms fit one.** Lags of the
+series' own past at one, three and twelve periods, the calendar month and a cost-centre
+size band predict the balance; a row is flagged when the actual falls outside the fitted
+5th-to-95th percentile interval. Both arms are quantile regressions, because an interval
+has to widen where a series is dispersed and a band added around a point prediction does
+not. The lag of twelve sets the history - no row until a series' thirteenth period, and
+nothing imputed - and the folds are cut on the accounting period by a splitter written
+here, because this is a panel and `TimeSeriesSplit` cuts row positions. CI gates
+behaviour and the anomalies the generator planted; the scores are recorded, not
+thresholded. See docs/adr/0052 through 0056.
 
 **Everything in this repository is written in English** — code, comments, commit
 messages, identifiers, configuration, and documents.

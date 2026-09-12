@@ -47,6 +47,10 @@ DEFAULTS = {
     "POSTGRES_PASSWORD": "fin_pipeline",
     "POSTGRES_LANDING_SCHEMA": "landing",
     "POSTGRES_MART_SCHEMA": "mart",
+    # The anomaly flags are not in the mart and not built by dbt: a promotion drops the
+    # mart schema and renames a build into place, and this layer must not be able to
+    # stop the mart being published. See docs/adr/0050.
+    "POSTGRES_ANOMALY_SCHEMA": "anomaly",
 }
 
 

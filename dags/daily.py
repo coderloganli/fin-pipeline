@@ -1,4 +1,4 @@
-"""The nightly run: validate, load, recompute, land, build, clear.
+"""The nightly run: validate, load, recompute, land, build, judge, clear.
 
 A declaration and nothing else. The order, the stop-on-failure rule, what each step
 records and the fact that `clear-affected` runs last all live in `pipeline/`, which the
@@ -67,6 +67,11 @@ with DAG(
         runner.run_step(runner.Context(), run_id, step_list.DBT_BUILD)
         return run_id
 
+    @task(task_id="judge")
+    def judge(run_id: str) -> str:
+        runner.run_step(runner.Context(), run_id, step_list.JUDGE)
+        return run_id
+
     @task(task_id="clear-affected")
     def clear_affected(run_id: str) -> str:
         runner.run_step(runner.Context(), run_id, step_list.CLEAR_AFFECTED)
@@ -81,6 +86,7 @@ with DAG(
     opened = open_run()
     closed = close_run(opened)
     step = opened
-    for stage in (validate, load, recompute, mart_load, dbt_build, clear_affected):
+    for stage in (validate, load, recompute, mart_load, dbt_build, judge,
+                  clear_affected):
         step = stage(step)
     step >> closed

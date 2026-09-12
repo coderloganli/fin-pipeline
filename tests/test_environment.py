@@ -201,8 +201,13 @@ def test_core_and_dev_dependencies_are_declared():
 
 
 def test_ci_installs_the_same_way_the_readme_says_to():
-    """Success criterion 3: CI uses the same install line as a developer does."""
-    command = 'pip install -e ".[dev,spark,dbt]"'
+    """Success criterion 3: CI uses the same install line as a developer does.
+
+    The extras grow as tasks claim them - docs/adr/0003 has each one installed by the
+    first task that needs it - so this constant moves with them. `ml` was added by
+    judge-anomalies-by-interval, which is what made scikit-learn a dependency the suite
+    fails without rather than skips around."""
+    command = 'pip install -e ".[dev,spark,dbt,ml]"'
 
     steps = [
         step.get("run", "")
