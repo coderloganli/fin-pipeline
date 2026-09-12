@@ -278,7 +278,10 @@ def build_staging(spark, root: Path, **config) -> Staging:
     # see docs/adr/0042.
     for model in sorted(facts.SOURCES):
         facts.build(spark, raw_dir, staging_dir, model=model)
-    balances.build(spark, staging_dir, periods=TEST_PERIODS)
+    # The range the caller generated, not the suite's default: a fixture that
+    # generated three years and then aggregated one would hand the ml cases a grid with
+    # no history in it, and every assertion about lags would pass vacuously.
+    balances.build(spark, staging_dir, periods=settings_["periods"])
     return Staging(root=root, source=source, raw=raw_dir, staging=staging_dir)
 
 
@@ -412,6 +415,55 @@ def dbt_manifest() -> Path:
             f"{result.stdout}\n{result.stderr}"
         )
     return target
+
+
+# --- the anomaly layer ------------------------------------------------------
+#
+# Three years, because docs/adr/0055 consumes twelve periods of history before a series
+# contributes a row: on the suite's usual twelve-period range every ml case would be
+# vacuously true. The flags land in a schema of the test's own for the reason the other
+# two do - see docs/adr/0034 and 0050.
+
+TEST_ANOMALY_SCHEMA = "anomaly_test"
+ML_PERIODS = "2024-01:2026-12"
+
+# Where docs/adr/0056 anchors both planted shapes: the middle of the generated range,
+# which is the first place the anomaly model is able to look at them.
+PLANTED_PERIOD = "2025-07"
+
+
+@pytest.fixture(scope="session")
+def ml_staging(spark, tmp_path_factory) -> Staging:
+    """Three years of a clean ledger, built through to Parquet."""
+    return build_staging(spark, tmp_path_factory.mktemp("ml"), periods=ML_PERIODS)
+
+
+@pytest.fixture(scope="session")
+def planted_staging(spark, tmp_path_factory) -> Staging:
+    """Three years with both anomaly shapes planted, for the effect gate of
+    docs/adr/0054."""
+    return build_staging(
+        spark, tmp_path_factory.mktemp("planted"), periods=ML_PERIODS,
+        growing_account=True, long_tail_anomaly=True,
+    )
+
+
+FLAG_COLUMNS = (
+    "account_code", "cost_center_code", "accounting_period", "actual", "predicted",
+    "lower_bound", "upper_bound", "residual", "score", "side", "model_family",
+    "nominal_coverage", "run_id",
+)
+
+
+def flags_in(connection, schema: str) -> list[dict]:
+    """Every flag in a schema, ordered so two judgements can be compared directly."""
+    columns = ", ".join(f'"{name}"' for name in FLAG_COLUMNS)
+    with connection.cursor() as cursor:
+        cursor.execute(
+            f'SELECT {columns} FROM "{schema}".anomaly_flag '
+            f'ORDER BY account_code, cost_center_code, accounting_period, model_family'
+        )
+        return [dict(zip(FLAG_COLUMNS, row)) for row in cursor.fetchall()]
 
 
 @pytest.fixture

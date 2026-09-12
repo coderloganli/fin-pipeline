@@ -282,18 +282,25 @@ def planted(config, months: list[date], books: "Books", centres: list[str]):
         )
 
     if config.growing_account:
-        if len(months) < GROWTH_MONTHS:
-            # Otherwise the switch is on and quietly does nothing: three
-            # month-on-month increases need four monthly totals.
+        if len(months) < 2 * GROWTH_MONTHS:
+            # Otherwise the switch is on and quietly does nothing: three month-on-month
+            # increases need four monthly totals, and the window now starts at the
+            # middle of the range rather than at its beginning, so it needs room after
+            # the anchor as well as the totals themselves. See docs/adr/0056.
             raise ValueError(
-                f"growing_account needs at least {GROWTH_MONTHS} periods, "
+                f"growing_account needs at least {2 * GROWTH_MONTHS} periods, "
                 f"got {len(months)} from {config.periods!r}"
             )
         # Constructed, not discovered. Finding a growing account by scanning would
         # mean holding every row, which is what streaming exists to avoid.
         stream_for(config.seed, GROWING_ACCOUNT)
         amount_cents = GROWTH_START_CENTS
-        for index, month in enumerate(months[:GROWTH_MONTHS]):
+        # Anchored at the middle of the range, where the long-tail switch already puts
+        # its own raised period. At the beginning it landed inside the twelve periods
+        # the anomaly model consumes as history before it judges anything, so the rise
+        # was planted somewhere no consumer could reach. See docs/adr/0055 and 0056.
+        anchor = len(months) // 2
+        for index, month in enumerate(months[anchor:anchor + GROWTH_MONTHS]):
             yield from _voucher(
                 entry_id_debit=f"X-GROW-{index:06d}-D",
                 entry_id_credit=f"X-GROW-{index:06d}-C",

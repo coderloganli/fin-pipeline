@@ -51,7 +51,7 @@ jobs:
         with:
           distribution: temurin
           java-version: '21'
-      - run: pip install -e ".[dev,spark,dbt]"
+      - run: pip install -e ".[dev,spark,dbt,ml]"
       - run: pytest -q
       # The lineage graph is one of this project's answers to "what would a column
       # change break", so CI produces it rather than leaving it to a developer's

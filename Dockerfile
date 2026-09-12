@@ -35,4 +35,4 @@ USER airflow
 # image is runnable on its own.
 COPY --chown=airflow:root . /opt/fin-pipeline
 WORKDIR /opt/fin-pipeline
-RUN pip install --no-cache-dir -e ".[spark,dbt]"
+RUN pip install --no-cache-dir -e ".[spark,dbt,ml]"
