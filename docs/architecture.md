@@ -15,26 +15,26 @@ entries it relied on. The hard problems here are time semantics — point-in-tim
 correctness, slowly changing dimensions, late-arriving corrections, idempotent
 replay — not volume.
 
-**Status: the batch path is complete.** `generator/` has landed. `ingest/` has its
+**Status: the batch path is complete.** `eval/generator/` has landed. `ingest/` has its
 source-table contracts, the validator that applies them, the watermarked incremental
 load that lands entries in the raw layer, and the run record every load writes.
-`transform/spark/` has the SCD2 loader — which builds the two dimensions and the
-exchange rate alike — the point-in-time fact build, and the monthly aggregation; it is
-also what first installs PySpark. `transform/load.py` copies the staging layer into
-Postgres and `transform/dbt/` models it as a star with six quality gates over it; late
-entries, adjustments and dimension changes recompute only the periods they affect;
+`transform/load.py` copies the six source tables into Postgres, and `transform/dbt/`
+is where every transformation happens: the SCD2 dimensions — which build the two org
+dimensions and the exchange rate alike — the point-in-time facts, and the monthly
+aggregate, modelled as a star with five quality gates over it. The mart is rebuilt whole
+on each run and promoted by rename, so a red gate publishes nothing;
 `transform/lineage.py` renders the graph and answers what a column change would break.
-`pipeline/` puts those in order and writes down what each one did, and `dags/` declares the
-two Airflow DAGs that call it. `ml/` has landed: it fits a prediction interval per monthly
+`pipeline/` puts those in order and writes down what each one did; scheduling a run is a
+cron entry and nothing more. `ml/` has landed: it fits a prediction interval per monthly
 balance and writes the ones that fall outside theirs to `anomaly_flag`, and `judge` is a
-step of both pipelines. `insight/` and `app/` still carry only a README stating what that
-layer is and is not responsible for. Read the READMEs for intent; read this file for what
+step of both pipelines. `app/` still carries only a README stating what that layer is and
+is not responsible for, and the investigation layer is not written. Read the READMEs for intent; read this file for what
 is actually true today.
 
 ## Shape
 
 ```
-generator ──▶ raw (Parquet) ──▶ staging (Parquet, PySpark) ──▶ mart (Postgres, dbt)
+generator ──▶ raw (Parquet) ──▶ mart (Postgres, dbt)
                                                                       │
                                           │
                               anomaly model ──▶ anomaly_flag (Postgres)
@@ -44,17 +44,15 @@ generator ──▶ raw (Parquet) ──▶ staging (Parquet, PySpark) ──▶
 
 | Directory | Responsibility |
 |---|---|
-| `generator/` | Synthetic ledger data, with a switch for every failure mode the tests need. Writes CSV to `data/source/`, reproducible from a seed. The chart of accounts follows the accounting standard two levels deep, and expense-side vouchers carry a vendor |
+| `eval/generator/` | Synthetic ledger data, with a switch for every failure mode the tests need. Writes CSV to `data/source/`, reproducible from a seed. The chart of accounts follows the accounting standard two levels deep, and expense-side vouchers carry a vendor |
 | `ingest/` | Contract validation, watermarked incremental merge, run records |
-| `transform/spark/` | SCD2 loading, the point-in-time join, monthly aggregation |
-| `transform/dbt/` | The mart: a star in Postgres, and the six gates over it |
-| `transform/load.py` | Copies the staging Parquet into Postgres so dbt has sources |
+| `transform/dbt/` | The mart: a star in Postgres, and the five gates over it |
+| `transform/load.py` | Copies the six source tables into Postgres so dbt has sources |
 | `transform/lineage.py` | Reads dbt's manifest: the impact list, and the HTML graph |
 | `ml/` | Anomaly detection over monthly balances: the design matrix, the two arms, the backtest, and the flags |
 | `insight/` | The LLM investigation loop and its golden-set evaluation |
-| `app/` | Streamlit application; queries the mart, computes nothing |
+| `app/` | The application; queries the mart, computes nothing. Not written |
 | `pipeline/` | The steps a run is made of, in order, and the record of what each one did |
-| `dags/` | Airflow DAGs: the daily run and the backfill. Declarations only — see `docs/adr/0046` |
 | `tests/` | pytest suites |
 
 ## Boundaries
@@ -88,30 +86,14 @@ Every service this platform grows is added to the same `compose.yaml` by the tas
 needs it. The host machine edits code and runs tests; it does not run services. See
 `docs/adr/0004-services-run-in-containers.md`.
 
-**Airflow is three of those services** — `airflow-apiserver`, `airflow-scheduler` and
-`airflow-dag-processor`, the last required by Airflow 3 as a standalone process. They run
-`LocalExecutor`, so there is no worker and no broker, and their metadata is a second
-database inside the same Postgres. They are built from a `Dockerfile` extending
-`apache/airflow:3.3.1-python3.13` with a JRE and this project installed; `apache-airflow`
-is deliberately absent from `pyproject.toml`. See `docs/adr/0047`.
+**There is no orchestrator service.** A run is `python -m pipeline daily` and a schedule
+is a cron entry. Airflow was here and was removed: the DAG files, the image this
+repository built for them and the four Compose services are gone. What it had been
+demonstrating — that the scheduler holds none of the run's logic — is still true and is
+now stated by the cron entry instead. See `docs/adr/0046` and `0047`.
 
-**Spark is the exception, and it is not a service.** It runs in local mode inside the
-process that imports it, so it is a library with a toolchain requirement rather than
-something to stand up. It needs a JDK: Spark 4.2 runs on Java 17, 21 or 25, found
-either as `java` on the PATH or through `JAVA_HOME` — either one, and the list is a
-list rather than a floor. CI installs Temurin 21. Tests that need it fail rather than skip, for the reason the database
-fixture does. See `docs/adr/0028-spark-runs-in-process.md`.
+**There is no engine to stand up.** Every transformation is SQL that dbt runs against the Postgres Compose brings up, so the host needs Python and Docker and nothing else. The three transformations that used to need one - the SCD2 dimension load, the point-in-time join and the monthly aggregation - are models in `transform/dbt/`; see `docs/adr/0028`, which records why Spark was here and why it left.
 
-**One session per process, and whoever started it is the only one who stops it.**
-`session.acquire` holds it for the length of a command and stops only what that call
-created; `pipeline/run.py` declares ownership with `owns_spark` and holds it across a run's
-steps. Everything else — every `build` function, every step — is handed a session and
-neither stops nor reconfigures it. Ownership is established before the session is built,
-never inferred afterwards from `getActiveSession()`, which answers for the calling thread
-and not for the process. See `docs/adr/0049`.
-
-**DeepSeek V4 Flash** is called by the insight layer once that layer exists. See
-`docs/adr/0001-llm-for-the-insight-layer.md`.
 
 ## Conventions that are not obvious from the code
 
@@ -120,9 +102,9 @@ asserts the two agree, because they had already drifted apart once before anythi
 checked.
 
 **Dependencies live in `pyproject.toml` only**, installed with
-`pip install -e '.[dev,spark,dbt,ml]'` — the same command locally, in CI, and in any image.
+`pip install -e '.[dev,dbt,ml]'` — the same command locally and in CI.
 The core set is small — `psycopg`, `pyyaml`, and `pyarrow`, which ingest writes the raw
-layer with. `spark` has been claimed by `transform/spark/`, `dbt` by `transform/dbt/` and `ml` by
+layer with. `dbt` has been claimed by `transform/dbt/` and `ml` by
 `ml/`, and all three are in the install line rather than optional because the tests that
 need them fail rather than skip, so the suite does not pass without them. `app` is
 declared but installed by nobody yet; the task that first needs it is the task that makes
@@ -133,7 +115,7 @@ test reports success, and a green CI run that verified nothing defeats the point
 having gates at all. The failure message names the command that starts the
 containers.
 
-**Test data is generated, never committed.** `generator/` writes the six source
+**Test data is generated, never committed.** `eval/generator/` writes the six source
 tables to `data/source/`, which is ignored — `raw/` is the layer that exists after
 ingest, and the two names are not interchangeable. The same seed gives byte-identical
 files, so a scenario test can plant a failure and assert on it. Each failure mode
@@ -221,7 +203,7 @@ whose grain has no vendor.
 
 **The lineage graph is rendered from dbt's manifest, and a contract says what it
 feeds.** dbt's graph starts at the landing tables; the hop from `gl_entry.csv` to one of
-them happens inside `transform/spark/` and appears in no manifest, so every contract
+them is the copy `transform/load.py` performs, which is no model, so every contract
 declares a `feeds` list of dbt source names and `transform/lineage.py` walks `child_map`
 downward from them. Every contract now names something: `gl_adjustment` reaches
 `mart.fct_gl_adjustment`, and the empty `feeds` it used to declare is gone. The HTML artefact is
@@ -248,7 +230,7 @@ overwriting. See docs/adr/0023.
 **The dimensions are effective-dated at the source, so their history is read rather
 than inferred.** `dim_account_src` and `dim_cost_center_src` key on
 `(code, effective_date)` and carry every version in every extract, so one run over one
-extract reconstructs the whole history. `transform/spark/` turns those versions into
+extract reconstructs the whole history. The dimension models turn those versions into
 validity intervals: `valid_from` is the effective date, `valid_to` is the next
 version's effective date less a day, and the version in force ends at `9999-12-31`
 rather than at null — a null end makes `BETWEEN` evaluate to null and drops the current
@@ -306,11 +288,11 @@ still owed. Two triggers, not one: an entry landing in a period, and a dimension
 taking effect over one. All three effective-dated tables declare `rows_are_immutable`, so
 a dimension change can only be the insert of a new `(natural key, effective_date)`
 version, which makes that trigger exact. Ingest records those inserts as observations;
-`transform/spark/affected.py` turns each into the periods its validity interval covers,
-intersected with the periods carrying entries on that key. `fx_rate` counts, like the two
+`transform/` turns each into the periods its validity interval covers, intersected with
+the periods carrying entries on that key. `fx_rate` counts, like the two
 org dimensions. See docs/adr/0039.
 
-**A dirty period drags its windows with it, and recomputation bounds writes rather
+**A dirty period drags its windows with it, and that closure decides what is re-judged rather
 than reads.** `balances.py` computes month-on-month with `lag(1)`, year-on-year with
 `lag(12)` and the rolling mean over three periods, so a dirty period M also dirties M+1,
 M+2 and M+12 — a closure computed from those constants rather than written down beside
@@ -367,22 +349,21 @@ docs/adr/0019 and 0044.
 
 **The run identifier is the platform's; the orchestrator's is recorded beside it.** It
 keeps the shape `docs/adr/0019` fixed, because `docs/adr/0018` stamps it on rows and the
-lineage chain follows it backwards. Airflow's own run id is a field on the `started`
-event, so the UI and the record name each other without the data layer gaining a second
-identity. See docs/adr/0045.
+lineage chain follows it backwards. Whatever started the run can put its own identifier
+on the `started` event beside it — `--orchestrator` and `--orchestrator-run-id` — so the
+two name each other without the data layer gaining a second identity. See
+docs/adr/0045.
 
-**A run is a sequence of named steps, and the sequence lives outside the DAG.**
-`pipeline/steps.py` declares them — `validate`, `load`, `recompute`, `mart-load`,
-`dbt-build`, `clear-affected`; a backfill is the last four over an explicit period range.
-`pipeline/run.py` is `open_run`, `run_step`, `close_run` and `run_pipeline`, the three
-primitives separate so that one Airflow task can be one step while the record still spans
-the DAG run. `clear-affected` is last for the reason the watermark moves last in
-`docs/adr/0016`: what is cleared first is what goes missing when the run dies. Files under
-`dags/` declare a schedule and a task graph and import nothing below `pipeline`; the suite
-tests the runner directly and the DAG files by parsing them, never by importing Airflow.
-Nothing on the host proves the DAGs parse under Airflow — `docker compose run --rm
-airflow-dag-processor airflow dags list` does, and it is a command rather than a test. See
-docs/adr/0046.
+**A run is a sequence of named steps, and the sequence lives outside whatever starts
+it.** `pipeline/steps.py` declares them — `validate`, `load`, `recompute`, `mart-load`,
+`dbt-build`, `judge`, `clear-affected`; a backfill is the last five over an explicit
+period range. `pipeline/run.py` is `open_run`, `run_step`, `close_run` and
+`run_pipeline`, the three primitives separate so that a caller can drive the steps itself
+while the record still spans all of them. `clear-affected` is last for the reason the
+watermark moves last in `docs/adr/0016`: what is cleared first is what goes missing when
+the run dies. The suite tests the runner directly, which is the whole point of the
+boundary — a scheduler that holds no logic is a scheduler nothing has to be tested
+through. See docs/adr/0046.
 
 **A raw row says which run first landed it and which run last wrote it.**
 `_first_run_id` survives every rewrite — a merge that reopened the partition for some
@@ -394,7 +375,7 @@ digest are not on the row; they are reached from either identifier through the r
 record. See docs/adr/0018 and 0020.
 
 **What ingest expects is stated separately from what the generator emits.**
-`generator/schema.py` is the truth for the one, `ingest/contracts/*.yaml` for the
+`eval/generator/schema.py` is the truth for the one, `ingest/contracts/*.yaml` for the
 other, and nothing under `contracts/` imports the generator. A contract derived from
 its producer cannot catch the producer changing; two independent statements can
 disagree, and a test that compares them is what turns a drift into a decision. The

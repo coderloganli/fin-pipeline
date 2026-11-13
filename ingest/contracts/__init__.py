@@ -65,7 +65,7 @@ DATE_KEYS = ("watermark", "partition_by")
 
 # What a `feeds` entry looks like: the dbt source this table reaches, qualified with the
 # source it is declared under. dbt's graph starts at the Postgres landing tables and the
-# hop from a CSV to one of them happens inside transform/spark/, so it appears in no
+# hop from a CSV to one of them is a plain copy performed by transform/load.py, so it
 # manifest and has to be declared. Required rather than optional: an optional key would
 # let a new contract silently feed nothing, and `feeds: []` already says that out loud
 # for the one table it is true of. See docs/adr/0035.

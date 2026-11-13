@@ -1536,7 +1536,7 @@ def test_the_command_prints_the_run_identifier_first(source, raw_dir, capsys):
 def test_the_vendor_columns_reach_the_raw_layer(tmp_path, raw_dir):
     """Case 30. The loader was not touched by this ticket: the contract declares the
     columns and they land, which is the whole claim."""
-    from generator import Config, generate
+    from eval.generator import Config, generate
 
     source = tmp_path / "source"
     generate(Config(seed=42, periods="2026-01:2026-02", entries_per_period=40, out_dir=source))
@@ -1559,8 +1559,8 @@ def test_the_vendor_columns_reach_the_raw_layer(tmp_path, raw_dir):
 def test_dim_vendor_lands_as_a_whole_table(tmp_path, raw_dir):
     """Case 31. No watermark and no partition column, so it is one file - the same
     path the two dimensions and the rate table take."""
-    from generator import Config, generate
-    from generator import dimensions
+    from eval.generator import Config, generate
+    from eval.generator import dimensions
 
     source = tmp_path / "source"
     generate(Config(seed=42, periods="2026-01:2026-01", entries_per_period=20, out_dir=source))
@@ -1679,3 +1679,29 @@ def test_the_command_takes_a_run_id(source, raw_dir):
     record = runs.RunLog(raw_dir).read()[0]
     assert record.run_id == given
     assert [step.step for step in record.steps] == ["load"]
+
+def test_the_affected_set_is_written_before_the_watermark(tmp_path, monkeypatch):
+    """The ordering this pins: after the watermark has been saved the set already holds
+    the periods the batch touched. Reversing the two writes loses them, and the
+    watermark has moved, so nothing re-reads those rows. The same argument as the
+    watermark moving last - what is written first is what survives a failure."""
+    from ingest import affected
+
+    source = tmp_path / "source"
+    raw_dir = tmp_path / "raw"
+    write_source(source, GL_ENTRY, [
+        entry("E-1", "1", "2026-03-04", "2026-03-05"),
+        entry("E-2", "1", "2026-04-06", "2026-04-07"),
+    ])
+    real = load.Watermarks.save
+
+    def failing(self):
+        real(self)
+        raise RuntimeError("interrupted after the watermark")
+
+    monkeypatch.setattr(load.Watermarks, "save", failing)
+    with pytest.raises(RuntimeError):
+        load.load_source(source, raw_dir, tables=["gl_entry"])
+    monkeypatch.undo()
+
+    assert set(affected.read(raw_dir).periods) == {"2026-03", "2026-04"}

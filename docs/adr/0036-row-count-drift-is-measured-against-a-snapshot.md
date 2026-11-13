@@ -6,7 +6,7 @@ excluding the build being tested, and fails outside ±10%.
 
 ## Context
 
-One of the six gates is row-count drift, and drift is by definition a comparison with
+One of the five gates is row-count drift, and drift is by definition a comparison with
 something earlier. The other five gates read only the tables in front of them. This one
 needs a baseline, and where the baseline is kept decides whether the gate can be
 trusted.

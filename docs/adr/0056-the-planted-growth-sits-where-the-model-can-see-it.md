@@ -11,7 +11,7 @@ requires twice `GROWTH_MONTHS`.
 `lag_12` until then, and the design refuses to impute one. `docs/adr/0054` gates the
 anomaly layer on catching what the generator planted.
 
-Those two do not currently meet. `generator/entries.py` plants the concentrated rise
+Those two do not currently meet. `eval/generator/entries.py` plants the concentrated rise
 over `months[:GROWTH_MONTHS]` — the first four periods of whatever range is generated.
 Every planted growth therefore lands inside the window the model never judges, and the
 effect gate for the concentrated shape cannot be written at all.

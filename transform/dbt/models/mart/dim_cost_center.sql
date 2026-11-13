@@ -1,6 +1,4 @@
--- Passed through from the landing layer. The SCD2 intervals were built by
--- transform/spark/scd2.py and are not recomputed here; this model exists so the mart
--- is a closed set of tables the application can join, and so the interval gate has
--- something in the mart to check.
-
-select * from {{ source('landing', 'dim_cost_center') }}
+-- Cost centres as validity intervals. A cost centre that moves department is what makes
+-- the point-in-time join necessary: a March transaction has to be reported against the
+-- department it belonged to in March, not the one it belongs to now.
+{{ scd2('dim_cost_center_src', ['cc_code'], ['name', 'dept_code']) }}

@@ -27,7 +27,7 @@ Anomalies are decided by a model, not by a fixed threshold. See docs/adr/0052.
 The flags land in a schema of their own, written by a pipeline step that runs after the
 mart has been published — this layer must not be able to stop the mart being published.
 See docs/adr/0050. It trains on the mart rather than the landing layer, so it only ever
-sees figures that passed all six gates. See docs/adr/0051.
+sees figures that passed all five gates. See docs/adr/0051.
 
 `python -m ml.backtest` scores both arms over the mart and writes the comparison to
 `data/ml/backtest.json`; `python -m ml.judge --periods <p> --run-id <id>` judges one

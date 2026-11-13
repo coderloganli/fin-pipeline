@@ -15,10 +15,8 @@ dependencies = [
 
 # Declared, and installed by the task that first needs one. That task is where the
 # version floor and any toolchain requirement get settled. See
-# docs/adr/0003-how-dependencies-are-declared.md. `spark` has been claimed:
-# transform/spark/ needs it, and it needs a JDK - Spark 4.2.0 runs on Java 17/21/25,
-# found through PATH or JAVA_HOME. See docs/adr/0028-spark-runs-in-process.md. `dbt` has
-# been claimed too: transform/dbt/ is the mart, and the floor is the release confirmed
+# docs/adr/0003-how-dependencies-are-declared.md. `dbt` has been claimed:
+# transform/dbt/ is the mart, and the floor is the release confirmed
 # to support Python 3.13 on the Postgres adapter. It needs no toolchain of its own - it
 # talks to the Postgres that compose.yaml already declares. `ml` has been claimed by
 # ml/, which is scikit-learn and needs no toolchain either; it is in the install line
@@ -28,17 +26,16 @@ dependencies = [
 dev = [
     "pytest",
 ]
-spark = ["pyspark>=4.2"]
 dbt = ["dbt-core>=1.10", "dbt-postgres"]
 ml = ["scikit-learn"]
-app = ["streamlit"]
+
 
 [build-system]
 requires = ["setuptools>=68"]
 build-backend = "setuptools.build_meta"
 
 [tool.setuptools]
-packages = ["generator", "ingest", "ingest.contracts", "ml", "pipeline", "transform", "transform.spark"]
+packages = ["eval", "eval.generator", "ingest", "ingest.contracts", "ml", "pipeline", "transform"]
 # transform/dbt/ is a dbt project, not a Python package: it holds SQL and YAML that dbt
 # reads, and nothing imports it. transform/load.py, transform/db.py and
 # transform/lineage.py sit beside it in transform/ and are ordinary modules.

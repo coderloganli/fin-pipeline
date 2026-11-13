@@ -4,7 +4,7 @@ One explicit contract per source table: columns, types, nullability, and semanti
 
 The contract is what makes schema evolution a decision rather than an accident. Adding a column is compatible and passes with a warning. Dropping a column, changing a type, or changing the meaning of a field is incompatible and fails the run.
 
-A failure currently states that the downstream impact is unknown. Naming the models that would break needs a lineage graph, and dbt has not landed — so the gap is reported rather than left silent. See `docs/adr/0012-the-validator-reports-rather-than-raises.md`.
+A failure names the dbt models the change would break, following the lineage graph from the source each contract declares it feeds. See `docs/adr/0035-a-contract-names-the-dbt-source-it-feeds.md`.
 
 ## The shape of a contract
 

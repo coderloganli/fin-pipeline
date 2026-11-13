@@ -1,5 +1,12 @@
 # Airflow runs from an image this repository builds, against the Postgres already there
 
+> **Superseded (2026-10-03).** The Airflow deployment recorded here was removed: the two
+> DAG files, the image this repository built and the four Compose services are gone, and
+> the daily run is scheduled by a cron entry against `python -m pipeline daily`. The
+> record stays because its reasoning still applies if it ever comes back - Airflow's
+> metadata belonged in a second database inside the same Postgres, never inside the
+> blast radius of a mart that is dropped and rebuilt routinely.
+
 summary: Three services — api server, scheduler, dag processor — on `LocalExecutor`,
 built from `apache/airflow:3.3.1-python3.13` with a JRE and this project installed, using
 a second database inside the Postgres `compose.yaml` already declares.

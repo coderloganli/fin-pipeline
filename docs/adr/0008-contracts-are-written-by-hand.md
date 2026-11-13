@@ -9,7 +9,7 @@ CSV carries no schema. `291.01` is the text `"291.01"`, `2026-01-29` is the text
 or may not be empty. Whatever the pipeline is going to check, it has to be written
 down somewhere else first — and that is what these contracts are.
 
-The obvious shortcut is to generate them from `generator/schema.py`, which already
+The obvious shortcut is to generate them from `eval/generator/schema.py`, which already
 declares every column the generator emits. It would be quick, and it would be exactly
 wrong.
 

@@ -1,6 +1,6 @@
 # app
 
-Streamlit self-service application.
+Self-service application. Not written.
 
 It filters, drills down, and displays flagged balances with their explanations, and every insight links back to the source rows behind it. The application queries the mart; it computes nothing itself.
 

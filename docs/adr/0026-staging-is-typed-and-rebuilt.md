@@ -1,5 +1,12 @@
 # Staging is typed, and it is rebuilt rather than accumulated
 
+> **Superseded (2026-10-04).** There is no Parquet staging layer. `transform/load.py`
+> copies the six source tables straight from the raw layer into Postgres and every
+> transformation after that is a dbt model, so the typed intermediate this record
+> describes has no step to live between. Its argument survives where it still applies:
+> typing is the first thing the models do, and the mart is rebuilt rather than
+> accumulated.
+
 ## Context
 
 `docs/adr/0015` lands every raw column as text, because the raw layer exists to answer

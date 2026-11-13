@@ -1,6 +1,6 @@
 # transform/dbt
 
-The mart: a star in Postgres, and the six gates over it.
+The mart: a star in Postgres, and the five gates over it.
 
 dbt owns what benefits from being readable and verifiable in SQL, while PySpark owns
 what has to scale. The two do not overlap, and nothing here recomputes anything

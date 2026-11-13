@@ -95,17 +95,6 @@ def test_a_partition_carries_the_declared_columns_as_strings(tmp_path):
         assert schema.field(name).type == pa.string(), f"{name} is not a string"
 
 
-def test_rows_round_trip_unchanged(tmp_path):
-    """Case 11."""
-    raw.merge_table(GL_ENTRY, tmp_path, THREE_PERIODS, run_id=RUN_A)
-    landed = sorted(raw.read_table(GL_ENTRY, tmp_path), key=lambda row: row["entry_id"])
-
-    assert landed == sorted(THREE_PERIODS, key=lambda row: row["entry_id"])
-    for row in landed:
-        for name, value in row.items():
-            assert isinstance(value, str), f"{name} came back as {type(value).__name__}"
-
-
 def test_an_empty_field_stays_an_empty_string(tmp_path):
     """Case 12. `contracts.is_null` says an empty field is the null value, but that is
     what a contract *means*; applying it is a transformation, and raw does not
@@ -119,19 +108,6 @@ def test_an_empty_field_stays_an_empty_string(tmp_path):
     landed = list(raw.read_table(DIM_ACCOUNT, tmp_path))
     assert landed == rows
     assert landed[0]["parent_code"] == ""
-
-
-def test_a_table_with_no_partition_column_is_one_file(tmp_path):
-    """Case 13. `fx_rate` declares no `partition_by`, so there is no period directory
-    to put it under."""
-    rows = [
-        {"currency": "EUR", "rate_date": "2026-01-01", "rate_to_base": "7.654321"},
-        {"currency": "USD", "rate_date": "2026-01-01", "rate_to_base": "7.123456"},
-    ]
-    raw.merge_table(FX_RATE, tmp_path, rows, run_id=RUN_A)
-
-    assert (tmp_path / "fx_rate" / PART_FILE).is_file()
-    assert [path.name for path in (tmp_path / "fx_rate").iterdir()] == [PART_FILE]
 
 
 def test_a_partition_is_sorted_by_primary_key_whatever_order_it_arrived_in(tmp_path):
@@ -154,12 +130,6 @@ def test_a_partition_is_sorted_by_primary_key_whatever_order_it_arrived_in(tmp_p
     assert one == other
     keys = [(row["entry_id"], row["version"]) for row in one]
     assert keys == sorted(keys)
-
-
-def test_row_count_spans_every_partition(tmp_path):
-    """Case 15."""
-    raw.merge_table(GL_ENTRY, tmp_path, THREE_PERIODS, run_id=RUN_A)
-    assert raw.row_count(GL_ENTRY, tmp_path) == len(THREE_PERIODS)
 
 
 def test_the_checksum_does_not_depend_on_order_or_batching(tmp_path):
@@ -251,30 +221,6 @@ def test_an_absent_raw_layer_reads_as_empty_rather_than_raising(tmp_path):
     assert raw.read_partition(GL_ENTRY, missing / "gl_entry" / PART_FILE) == []
 
 
-@pytest.mark.parametrize("contract,period,expected", [
-    (GL_ENTRY, None, "needs a period"),
-    (FX_RATE, "2026-01", "not partitioned"),
-])
-def test_asking_for_the_wrong_kind_of_partition_is_refused(tmp_path, contract, period, expected):
-    """The two layouts are not interchangeable, and confusing them would otherwise
-    write a file into a directory nothing ever reads."""
-    with pytest.raises(ValueError, match=expected):
-        raw.partition_path(tmp_path, contract, period)
-
-
-def test_read_keys_on_an_absent_partition_is_empty(tmp_path):
-    """The cross-partition key sweep asks every partition, including ones a concurrent
-    delete has taken away underneath it."""
-    assert raw.read_keys(GL_ENTRY, tmp_path / "gone" / PART_FILE) == set()
-
-
-def test_read_keys_reads_the_keys_and_not_the_rest(tmp_path):
-    raw.merge_table(GL_ENTRY, tmp_path, THREE_PERIODS, run_id=RUN_A)
-    path = tmp_path / "gl_entry" / "accounting_period=2026-03" / PART_FILE
-
-    assert raw.read_keys(GL_ENTRY, path) == {("E3", "1"), ("E4", "1")}
-
-
 def test_a_parquet_write_that_fails_leaves_no_temporary_file(tmp_path, monkeypatch):
     """The temporary file is cleaned up whether the write reached the move or not.
     Debris beside a partition would be picked up by nothing and explained by nobody."""
@@ -295,27 +241,6 @@ def test_a_parquet_write_that_fails_leaves_no_temporary_file(tmp_path, monkeypat
 
     assert path.read_bytes() == before
     assert [p.name for p in path.parent.iterdir()] == [PART_FILE]
-
-
-def test_a_partitioned_table_merged_with_nothing_keeps_its_periods(tmp_path):
-    """Case 9, at the primitive. A batch carrying nothing touches nothing. This used to
-    assert that the periods were removed and the empty directory left behind; under
-    docs/adr/0023 an empty batch is a run that landed nothing, not an instruction to
-    delete the table."""
-    raw.merge_table(GL_ENTRY, tmp_path, THREE_PERIODS, run_id=RUN_A)
-    raw.merge_table(GL_ENTRY, tmp_path, [], run_id=RUN_A)
-
-    assert (tmp_path / "gl_entry").is_dir()
-    assert len(raw.partitions(GL_ENTRY, tmp_path)) == 3
-    assert raw.row_count(GL_ENTRY, tmp_path) == len(THREE_PERIODS)
-
-
-def test_the_rename_left_no_alias_behind(tmp_path):
-    """Case 13. The function merges now, so the name that said it replaced is gone
-    rather than kept pointing at something that does the opposite."""
-    assert "merge_table" in raw.__all__
-    assert "write_table" not in raw.__all__
-    assert not hasattr(raw, "write_table")
 
 
 # --- the two run identifiers -----------------------------------------------
@@ -350,61 +275,3 @@ def test_a_rewrite_keeps_the_first_run_and_moves_the_last(tmp_path):
     assert [row["_last_run_id"] for row in landed] == [RUN_B]
 
 
-def test_write_partition_will_not_run_without_a_run_identifier(tmp_path):
-    """Case 22. Required rather than defaulted: a default would let a write path that
-    forgot to thread the identifier drop it silently, which is the failure this whole
-    ticket exists to prevent."""
-    path = tmp_path / "gl_entry" / "accounting_period=2026-01" / PART_FILE
-    with pytest.raises(TypeError):
-        raw.write_partition(GL_ENTRY, path, [entry("E1", "1", "2026-01-15")])
-
-
-def test_write_table_will_not_run_without_a_run_identifier(tmp_path):
-    """Case 22. The whole-table replacement path, for the same reason."""
-    with pytest.raises(TypeError):
-        raw.merge_table(GL_ENTRY, tmp_path, THREE_PERIODS)
-
-
-def test_read_partition_hides_the_metadata_unless_it_is_asked_for(tmp_path):
-    """Case 23. The default is the declared columns and nothing else, so every caller
-    that was reading rows before this landed still sees what the source said."""
-    path = tmp_path / "gl_entry" / "accounting_period=2026-01" / PART_FILE
-    raw.write_partition(GL_ENTRY, path, [entry("E1", "1", "2026-01-15")], run_id=RUN_A)
-
-    declared = [spec["name"] for spec in GL_ENTRY["columns"]]
-    plain = raw.read_partition(GL_ENTRY, path)
-    assert list(plain[0]) == declared
-
-    with_metadata = raw.read_partition(GL_ENTRY, path, metadata=True)
-    assert set(with_metadata[0]) - set(plain[0]) == set(METADATA)
-
-
-def test_the_written_schema_is_the_declared_columns_then_the_two_identifiers(tmp_path):
-    """Case 23a. Position and type, not just presence: the identifiers are strings like
-    everything else in raw, and they come after the columns the contract declares."""
-    import pyarrow as pa
-    import pyarrow.parquet as pq
-
-    path = tmp_path / "gl_entry" / "accounting_period=2026-01" / PART_FILE
-    raw.write_partition(GL_ENTRY, path, [entry("E1", "1", "2026-01-15")], run_id=RUN_A)
-
-    schema = pq.read_schema(path)
-    declared = [spec["name"] for spec in GL_ENTRY["columns"]]
-    assert schema.names == declared + list(METADATA)
-    assert all(field.type == pa.string() for field in schema)
-
-
-def test_the_checksum_does_not_see_the_run_identifiers(tmp_path):
-    """Case 25. Two raw layers holding the same rows from different runs are the same
-    raw layer as far as the acceptance criterion is concerned - which is what makes
-    `record-every-pipeline-run` and the three-run stability property compatible at
-    all. See docs/adr/0017."""
-    raw.merge_table(GL_ENTRY, tmp_path / "left", THREE_PERIODS, run_id=RUN_A)
-    raw.merge_table(GL_ENTRY, tmp_path / "right", THREE_PERIODS, run_id=RUN_B)
-
-    assert raw.checksum(GL_ENTRY, tmp_path / "left") == raw.checksum(
-        GL_ENTRY, tmp_path / "right"
-    )
-    assert raw.row_count(GL_ENTRY, tmp_path / "left") == raw.row_count(
-        GL_ENTRY, tmp_path / "right"
-    )

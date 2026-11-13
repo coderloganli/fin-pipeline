@@ -12,7 +12,7 @@ primary_key: [entry_id, version]
 # adjustment is a single-sided delta against a voucher that already did. See
 # docs/adr/0035 and 0042.
 feeds:
-  - landing.fct_gl_adjustment
+  - landing.gl_adjustment
 
 # The incremental load advances on posted_at - when the row actually landed.
 # There is no updated_at in this source; see

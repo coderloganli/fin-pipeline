@@ -8,9 +8,14 @@ belongs to `ingest/` and `transform/` and this package only decides the order.
 `DAILY` is the whole of a nightly run. `BACKFILL` is the last four of it over an
 explicit period range, for the case `docs/adr/0016` describes: an update that arrived
 after the watermark window closed, or a range somebody has reason to rebuild. It passes
-`force`, because `transform.backfill.run` otherwise returns without doing anything when
-the affected-period set is empty - and the reason to type a range by hand is precisely
-that the set does not name it.
+`force`, which is what tells `judge` to judge the range it was given rather than the
+affected set.
+
+**There is no recompute step.** The dimensions, the facts and the aggregate are dbt
+models built from the landed source tables, so `dbt-build` is where every
+transformation happens. The mart is rebuilt whole each run, because rebuilding a few
+tens of thousands of rows in Postgres costs seconds - the selective recomputation this
+used to need was a property of rewriting Parquet partitions, not of the data.
 
 **`dbt-build` builds into a schema of the run's own and renames it into place.** That is
 why it needs `context.run_id`: the schema is named after the run so the two can be read
@@ -33,8 +38,8 @@ See docs/adr/0046.
 from dataclasses import dataclass
 from typing import Callable
 
-__all__ = ["Step", "MissingRunId", "VALIDATE", "LOAD", "RECOMPUTE", "MART_LOAD",
-           "DBT_BUILD", "JUDGE", "CLEAR_AFFECTED", "DAILY", "BACKFILL", "by_name"]
+__all__ = ["Step", "MissingRunId", "VALIDATE", "LOAD", "MART_LOAD",
+           "DBT_BUILD", "JUDGE", "CLEAR_AFFECTED", "DAILY", "BACKFILL"]
 
 
 @dataclass(frozen=True)
@@ -79,23 +84,11 @@ def _load(context) -> dict:
     return load.step_detail(report)
 
 
-def _recompute(context) -> dict:
-    from pipeline.run import spark_session
-    from transform import backfill
-
-    written = backfill.run(
-        spark_session(context), context.raw_dir, context.staging_dir,
-        periods=context.periods, force=context.force,
-    )
-    return {"periods": sorted(written)}
-
-
 def _mart_load(context) -> dict:
     from transform import load as mart_load
 
     landed = mart_load.load_all(
-        staging_dir=context.staging_dir, raw_dir=context.raw_dir,
-        schema=context.landing_schema,
+        raw_dir=context.raw_dir, schema=context.landing_schema,
     )
     return {"rows": landed}
 
@@ -124,23 +117,22 @@ def _judge(context) -> dict:
     touched.
 
     After `dbt-build`, because the model trains on the published mart rather than on the
-    landing layer - the mart is the last set of figures that passed all six gates, and
+    landing layer - the mart is the last set of figures that passed all five gates, and
     training upstream of them is a way for rejected figures to reach a reader anyway.
     See docs/adr/0051.
 
-    Which periods is worked out here rather than handed over by `recompute`.
-    `docs/adr/0046` keeps step-to-step handoff out of the DAG, so this step reads what it
-    needs for itself.
+    Which periods is worked out here rather than handed over by an earlier step.
+    `docs/adr/0046` keeps step-to-step handoff out of the orchestrator, so this step
+    reads what it needs for itself.
 
     **`force` is what separates the two cases, not whether a range was given.** A daily
-    run carries `--periods` too - it is the reporting range, and `recompute` cannot run
-    without one - so branching on the range would have every nightly run re-judge three
-    years. `force` is set by `python -m pipeline backfill` and by the backfill DAG's
+    run carries `--periods` too - it is the reporting range the mart is built over - so
+    branching on the range would have every nightly run re-judge three years. `force` is set by `python -m pipeline backfill` and by the backfill DAG's
     `context_for`, and it means what it means in `transform.backfill.run`: rebuild the
     range I was given whether or not anything is owed.
 
     So a backfill judges its range, and a daily run judges the affected set widened by
-    the same closure `recompute` used - called rather than restated, because a window
+    the closure the mart's comparison columns imply - called rather than restated, because a window
     rule written down twice is one that stops being backfilled when it widens
     (docs/adr/0040). The closure is capped by the end of the reporting range, because a
     period outside it has no row in the mart to judge.
@@ -148,7 +140,7 @@ def _judge(context) -> dict:
     from ingest import affected
     from ml import judge
     from transform import db
-    from transform.spark import balances
+    from transform import periods as period_math
 
     if not context.run_id:
         raise MissingRunId(
@@ -157,15 +149,15 @@ def _judge(context) -> dict:
             "Steps are run through pipeline.run.run_step, which sets it."
         )
 
-    first, last = balances.parse_periods(context.periods) if context.periods else (None, None)
+    first, last = period_math.parse_periods(context.periods) if context.periods else (None, None)
 
     if context.force:
-        periods = balances.period_range(first, last)
+        periods = period_math.period_range(first, last)
     else:
         owed = affected.read(context.raw_dir)
         if not owed.periods:
             return {"periods": [], "flagged": 0, "intervals_crossed": 0}
-        closure = balances.dirty_closure(
+        closure = period_math.dirty_closure(
             set(owed.periods), last_period=last or max(owed.periods)
         )
         periods = sorted(p for p in closure if first is None or p >= first)
@@ -210,32 +202,12 @@ class MissingRunId(RuntimeError):
 
 VALIDATE = Step(name="validate", run=_validate)
 LOAD = Step(name="load", run=_load)
-RECOMPUTE = Step(name="recompute", run=_recompute)
 MART_LOAD = Step(name="mart-load", run=_mart_load)
 DBT_BUILD = Step(name="dbt-build", run=_dbt_build)
 JUDGE = Step(name="judge", run=_judge)
 CLEAR_AFFECTED = Step(name="clear-affected", run=_clear_affected)
 
-DAILY = [VALIDATE, LOAD, RECOMPUTE, MART_LOAD, DBT_BUILD, JUDGE, CLEAR_AFFECTED]
-BACKFILL = [RECOMPUTE, MART_LOAD, DBT_BUILD, JUDGE, CLEAR_AFFECTED]
+DAILY = [VALIDATE, LOAD, MART_LOAD, DBT_BUILD, JUDGE, CLEAR_AFFECTED]
+BACKFILL = [MART_LOAD, DBT_BUILD, JUDGE, CLEAR_AFFECTED]
 
 PIPELINES = {"daily": DAILY, "backfill": BACKFILL}
-
-
-def by_name(pipeline: str, step: str) -> Step:
-    """One step of one pipeline, by the names a DAG task carries.
-
-    A DAG task holds strings, not objects - it is a declaration in another process. This
-    is how it gets back to the step those strings name, and it refuses an unknown one
-    rather than skipping it: a task naming a step that does not exist has to fail where
-    it is declared, not quietly do nothing.
-    """
-    steps = PIPELINES.get(pipeline)
-    if steps is None:
-        raise KeyError(f"no pipeline {pipeline!r}; there is {sorted(PIPELINES)}")
-    for one in steps:
-        if one.name == step:
-            return one
-    raise KeyError(
-        f"{pipeline} has no step {step!r}; it has {[one.name for one in steps]}"
-    )

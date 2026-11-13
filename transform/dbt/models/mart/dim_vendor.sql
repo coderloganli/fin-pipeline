@@ -1,6 +1,8 @@
--- Passed through from the landing layer. The SCD2 intervals were built by
--- transform/spark/scd2.py and are not recomputed here; this model exists so the mart
--- is a closed set of tables the application can join, and so the interval gate has
--- something in the mart to check.
-
-select * from {{ source('landing', 'dim_vendor') }}
+-- Passed through from the source. A supplier is not effective-dated, so it has no
+-- validity intervals and no surrogate key: it is keyed on the vendor code itself. This
+-- model exists so the mart is a closed set of tables the application can join.
+select
+    vendor_code,
+    name,
+    category
+from {{ source('landing', 'dim_vendor') }}

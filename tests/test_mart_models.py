@@ -19,7 +19,7 @@ from decimal import Decimal
 
 import pytest
 
-from test_mart_load import row_count, table_checksum
+from conftest import row_count, table_checksum
 
 pytestmark = pytest.mark.db
 
@@ -61,87 +61,7 @@ def sums_by(db, schema: str, keys: str) -> dict:
     return {row[:-2]: (row[-2], row[-1]) for row in rows}
 
 
-def staging_sums_by(spark, staging, keys: tuple[str, ...]) -> dict:
-    from transform.spark import facts
-
-    totals: dict = {}
-    for row in facts.read(spark, staging.staging):
-        key = tuple(row[name] for name in keys)
-        debit, credit = totals.get(key, (Decimal(0), Decimal(0)))
-        totals[key] = (debit + row["amount_dr"] * 0 + row["amount_dr_base"],
-                       credit + row["amount_cr_base"])
-    return totals
-
-
 # --- cases 13-15: the fact's figures did not move ---------------------------
-
-def test_fact_agrees_with_staging_by_account(mart, clean_staging, db, spark):
-    """13. Both sides. A comparison that checked debits alone would pass a mart that
-    lost the credit column."""
-    build = mart(clean_staging)
-
-    assert sums_by(db, build.mart, "account_code") == staging_sums_by(
-        spark, clean_staging, ("account_code",)
-    )
-
-
-def test_fact_agrees_with_staging_at_its_own_grain(mart, clean_staging, db, spark):
-    """14. Per account, cost centre and period - not only rolled up to account. Two
-    errors that cancel within an account survive the coarser check."""
-    build = mart(clean_staging)
-    keys = "account_code, cost_center_code, to_char(accounting_date, 'YYYY-MM')"
-    in_mart = sums_by(db, build.mart, keys)
-
-    from transform.spark import facts
-
-    expected: dict = {}
-    for row in facts.read(spark, clean_staging.staging):
-        key = (row["account_code"], row["cost_center_code"],
-               row["accounting_date"].strftime("%Y-%m"))
-        debit, credit = expected.get(key, (Decimal(0), Decimal(0)))
-        expected[key] = (debit + row["amount_dr_base"], credit + row["amount_cr_base"])
-
-    assert in_mart == expected
-
-
-def test_fact_holds_the_same_entries(mart, clean_staging, db, spark):
-    """15. Same row count and the same set of keys: a mart that dropped an entry and
-    gained a duplicate would balance on totals alone."""
-    from transform.spark import facts
-
-    build = mart(clean_staging)
-    staged = {(row["entry_id"], row["version"])
-              for row in facts.read(spark, clean_staging.staging)}
-    landed = set(query(db, f'SELECT entry_id, version FROM "{build.mart}".fct_gl_entry'))
-
-    assert landed == staged
-    assert row_count(db, build.mart, "fct_gl_entry") == len(staged)
-
-
-def test_aggregate_agrees_row_for_row(mart, clean_staging, db, spark):
-    """16. Every measure, with null compared as null. `balance_pct_mom` is null when
-    the prior balance was zero - which docs/adr/0033 says is the case an investigation
-    cares about most - so a comparison that coalesced it would hide the column."""
-    from transform.spark import balances
-
-    build = mart(clean_staging)
-    columns = ", ".join(AGGREGATE_COLUMNS)
-    landed = {
-        row[:3]: row[3:]
-        for row in query(
-            db,
-            f"""SELECT account_code, cost_center_code, accounting_period, {columns}
-                FROM "{build.mart}".agg_monthly_balance""",
-        )
-    }
-    staged = {
-        (row["account_code"], row["cost_center_code"], row["accounting_period"]):
-            tuple(row[name] for name in AGGREGATE_COLUMNS)
-        for row in balances.read(spark, clean_staging.staging)
-    }
-
-    assert landed == staged
-
 
 # --- cases 17-20: what "the same run three times" means ---------------------
 
@@ -166,37 +86,6 @@ def test_three_rebuilds_over_one_snapshot_are_identical(mart, clean_staging, db)
                     table_checksum(db, again.mart, table))
             for table in reported
         } == signature
-
-
-def test_a_full_pipeline_rerun_leaves_the_figures_alone(mart, spark, db, tmp_path_factory):
-    """18. `_last_run_id` moves on every rewritten partition - docs/adr/0018 - and
-    `facts.py` carries it forward, so the provenance columns are excluded exactly as
-    docs/adr/0017 excludes ingestion metadata from the raw checksum. The reported
-    figures do not move, and that is what this asserts."""
-    from conftest import build_staging
-
-    signatures = []
-    for _ in range(3):
-        staging = build_staging(spark, tmp_path_factory.mktemp("rerun"))
-        build = mart(staging)
-        assert build.ok, build.output
-        signatures.append(
-            table_checksum(db, build.mart, "fct_gl_entry", exclude=PROVENANCE)
-        )
-
-        # Excluded from the checksum, not from the assertions. A column left out of the
-        # comparison and then not looked at is a column nothing checks at all.
-        for column in PROVENANCE:
-            values = {
-                value for (value,) in query(
-                    db, f'SELECT DISTINCT {column} FROM "{build.mart}".fct_gl_entry'
-                )
-            }
-            assert values and all(RUN_ID.fullmatch(value) for value in values), (
-                f"{column} holds something that is not a run identifier: {values}"
-            )
-
-    assert len(set(signatures)) == 1
 
 
 def test_the_row_count_snapshot_is_the_stated_exception(mart, clean_staging, db):
@@ -293,65 +182,6 @@ def test_the_aggregate_carries_names_and_no_vendor(mart, clean_staging, db):
     assert "vendor_name" not in columns
 
 
-def test_the_aggregate_names_are_as_of_the_period_close(mart, clean_staging, db, spark):
-    """25. The same as-of date `account_type` already uses. `balances.py` reports a
-    month as of its end - docs/adr/0032 - and a name resolved at a different date would
-    put two answers in one row."""
-    from transform.spark import scd2
-
-    build = mart(clean_staging)
-    versions = query(
-        db,
-        f"""SELECT cc_code, count(*) FROM "{build.mart}".dim_cost_center
-            GROUP BY cc_code HAVING count(*) > 1 LIMIT 1""",
-    )
-    assert versions, "this dataset needs a dimension with two versions to test the as-of"
-
-    mismatched = query(
-        db,
-        f"""
-        SELECT count(*)
-        FROM "{build.mart}".agg_monthly_balance a
-        JOIN "{build.mart}".dim_cost_center d ON d.cc_code = a.cost_center_code
-        WHERE (to_date(a.accounting_period, 'YYYY-MM') + interval '1 month - 1 day')::date
-              BETWEEN d.valid_from AND d.valid_to
-          AND a.cost_center_name IS DISTINCT FROM d.name
-        """,
-    )[0][0]
-
-    assert mismatched == 0
-
-
-def test_widening_the_aggregate_does_not_multiply_it(mart, clean_staging, db, spark):
-    """26. Over a dataset where a dimension has two versions in the reported range.
-    Joining SCD2 dimensions on the natural key alone matches every version valid in any
-    period, which does not raise - it multiplies, and the result still totals to
-    something publishable."""
-    from transform.spark import balances
-
-    build = mart(clean_staging)
-    staged = len(balances.read(spark, clean_staging.staging))
-
-    assert row_count(db, build.mart, "agg_monthly_balance") == staged
-
-
-def test_a_gap_over_a_period_end_is_caught_rather_than_labelled_blank(mart,
-                                                                     clean_staging):
-    """26a. The as-of join is a left join on a date range, so a dimension that leaves a
-    gap over a period end produces a row with no name rather than no row. Left is right
-    - an inner join would drop the figure instead - which is why the missing name has
-    to be a gate rather than something a reader notices."""
-    build = mart(
-        clean_staging,
-        mutate=_start_one_account_late,
-    )
-    assert not build.ok, build.output
-    assert any(
-        "account_name" in name or "cost_center_name" in name
-        for name in build.failed_tests()
-    ), sorted(build.failed_tests())
-
-
 def _start_one_account_late(db, schema: str) -> None:
     """Move one account's earliest version to start mid-year.
 
@@ -399,29 +229,6 @@ def test_no_mart_row_names_the_build_that_wrote_it(mart, clean_staging, db):
     }
 
     assert not {name for _, name in columns} & forbidden
-
-
-def test_the_fact_keeps_the_run_that_landed_the_source(mart, clean_staging, db, spark):
-    """28. `source_last_run_id` names the ingest run, and `python -m ingest.runs` turns
-    that into the window, the digest and the row counts. That is the whole trail."""
-    from transform.spark import facts
-
-    build = mart(clean_staging)
-    staged = {
-        (row["entry_id"], row["version"]):
-            (row["source_first_run_id"], row["source_last_run_id"])
-        for row in facts.read(spark, clean_staging.staging)
-    }
-    landed = {
-        (entry_id, version): (first, last)
-        for entry_id, version, first, last in query(
-            db,
-            f"""SELECT entry_id, version, source_first_run_id, source_last_run_id
-                FROM "{build.mart}".fct_gl_entry""",
-        )
-    }
-
-    assert landed == staged
 
 
 # --- the adjustment fact and the two bases (ADR 0042, 0043) -----------------
@@ -477,3 +284,34 @@ def test_the_aggregate_exposes_both_bases_and_not_the_old_column(mart, clean_sta
                 IS DISTINCT FROM balance_as_reported + restatement_delta""",
     )[0][0]
     assert disagreeing == 0
+
+
+# --- the fact against the ledger it came from -------------------------------
+
+def test_the_fact_neither_multiplies_nor_drops_an_entry(mart, clean_staging, db):
+    """The point-in-time join is `natural key AND date inside the interval`, three times
+    over. With the range alone every entry matches every version valid on its date, which
+    does not raise - it multiplies, and the total still adds up to a number somebody
+    might publish. With a gap in a dimension's intervals it does the opposite and the row
+    drops out of the join with nothing raised.
+
+    Counted against the source table rather than against another computation of the same
+    figures, so it is not circular: the ledger has as many lines as it has, and the
+    amounts in their own currency are not something attribution is allowed to change.
+    """
+    build = mart(clean_staging)
+    assert build.ok, build.output
+
+    with db.cursor() as cursor:
+        cursor.execute(
+            f'SELECT count(*), sum(amount_dr::numeric), sum(amount_cr::numeric) '
+            f'FROM "{build.landing}".gl_entry'
+        )
+        source = cursor.fetchone()
+        cursor.execute(
+            f'SELECT count(*), sum(amount_dr), sum(amount_cr) '
+            f'FROM "{build.mart}".fct_gl_entry'
+        )
+        fact = cursor.fetchone()
+
+    assert fact == source, f"the fact holds {fact} against a ledger of {source}"

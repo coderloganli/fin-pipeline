@@ -1,7 +1,7 @@
 # The anomaly model trains on the mart, not on the landing layer
 
 summary: `ml/` reads `<mart>.agg_monthly_balance` rather than the landing table of the
-same name, so the model only ever sees figures that passed all six gates.
+same name, so the model only ever sees figures that passed all five gates.
 
 ## Context
 
@@ -26,7 +26,7 @@ the one the windowed comparison columns in the same table already derive from, p
 ## Reasoning
 
 The landing table is what was copied across. The mart, since `docs/adr/0048`, is
-something narrower and more useful: the last set of figures that passed all six gates.
+something narrower and more useful: the last set of figures that passed all five gates.
 A build whose vouchers did not balance, or whose row counts collapsed, never becomes the
 mart — its schema is discarded and the previous mart stays where it is.
 

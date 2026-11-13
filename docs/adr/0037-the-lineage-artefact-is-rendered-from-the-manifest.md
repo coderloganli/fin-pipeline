@@ -1,5 +1,12 @@
 # The lineage artefact is rendered from the manifest, not by dbt docs
 
+> **Superseded (2026-10-04).** The artefact is gone. The impact list it was a picture
+> of is still there and still read by `ingest/validate.py`; what went was the hand-
+> written SVG layout and the CI step that uploaded it, because nobody downloaded it.
+> This record was always an implementation note rather than a design claim - it
+> documents a way around dbt-labs/dbt-core#11986 - and it is filed as one in the
+> index.
+
 summary: `transform/lineage.py` reads `manifest.json` and writes one self-contained
 HTML file, because `dbt docs generate --static` does not embed the artefacts it
 documents and dbt Docs v2 no longer produces a single file.

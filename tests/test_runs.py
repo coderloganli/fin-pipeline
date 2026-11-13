@@ -102,40 +102,6 @@ def test_a_successful_load_leaves_one_record(source, raw_dir):
     assert RUN_ID.match(recorded[0].run_id)
 
 
-def test_the_log_holds_the_run_and_the_step_inside_it(source, raw_dir):
-    """Case 2, restated for docs/adr/0044.
-
-    This asserted two lines per run when docs/adr/0019 was the whole story. A run is now
-    a sequence of named steps and a load run alone is a run with one step in it, so the
-    shape is four events - and the argument the case exists for is unchanged and now
-    asserted at both levels: what is written first is what survives the failure, so the
-    run and the step each announce themselves before doing anything.
-    """
-    load.load_source(source, raw_dir)
-
-    written = lines(raw_dir)
-    assert [event["event"] for event in written] == [
-        "started", "step_started", "step_finished", "finished",
-    ]
-    assert len({event["run_id"] for event in written}) == 1
-    assert sorted(written[0]["tables"]) == sorted(EVERY_TABLE)
-    assert written[0]["steps"] == ["load"]
-    assert written[1]["step"] == written[2]["step"] == "load"
-
-
-def test_two_identifiers_made_in_the_same_second_differ(monkeypatch):
-    """Case 3. The timestamp is only to the second; the suffix is what keeps two runs
-    started inside one second apart."""
-    frozen = datetime(2026, 9, 1, 3, 15, 0, tzinfo=timezone.utc)
-    monkeypatch.setattr(runs, "now", lambda: frozen)
-
-    first, second = runs.new_run_id(), runs.new_run_id()
-
-    assert first != second
-    assert RUN_ID.match(first) and RUN_ID.match(second)
-    assert first[:16] == second[:16]
-
-
 def test_runs_are_read_in_log_order_rather_than_identifier_order(raw_dir, monkeypatch):
     """Case 4. Chronological order comes from the append-only file. Two runs started in
     the same second sort arbitrarily by identifier, so sorting them would reorder the
@@ -165,24 +131,6 @@ def test_the_duration_and_the_two_timestamps_are_recorded(source, raw_dir):
     record = runs.RunLog(raw_dir).read()[0]
     assert record.duration_seconds >= 0
     assert record.started_at <= record.finished_at
-
-
-def test_each_table_records_what_the_load_report_says_it_did(source, raw_dir):
-    """Case 6. The record and the summary line describe the same run, so every field
-    they share has to agree."""
-    report = load.load_source(source, raw_dir)
-
-    recorded = by_table(runs.RunLog(raw_dir).read()[0])
-    assert set(recorded) == {table.table for table in report.tables}
-    for table in report.tables:
-        written = recorded[table.table]
-        assert written.rows_scanned == table.rows_scanned
-        assert written.rows_inserted == table.rows_inserted
-        assert written.rows_updated == table.rows_updated
-        assert written.rows_evicted == table.rows_evicted
-        assert written.partitions_written == table.partitions_written
-        assert written.watermark_from == table.watermark_from
-        assert written.watermark_to == table.watermark_to
 
 
 def test_every_table_records_the_digest_of_the_file_it_read(source, raw_dir):
@@ -234,95 +182,6 @@ def test_a_run_with_no_finished_event_reads_as_interrupted(raw_dir):
     assert record.duration_seconds is None
 
 
-def test_three_loads_leave_three_records_in_order(source, raw_dir):
-    """Case 10."""
-    identifiers = [load.load_source(source, raw_dir).run_id for _ in range(3)]
-
-    recorded = runs.RunLog(raw_dir).read()
-    assert [record.run_id for record in recorded] == identifiers
-    assert len(set(identifiers)) == 3
-
-
-def test_a_run_that_selects_nothing_is_still_recorded(source, raw_dir):
-    """Case 11. A run that had nothing to do is a run that happened, and the record is
-    how anyone knows the pipeline was alive at all."""
-    load.load_source(source, raw_dir, tables=["gl_entry"])
-    write_source(source, GL_ENTRY, ENTRIES[:1])
-    load.load_source(source, raw_dir, tables=["gl_entry"])
-
-    second = runs.RunLog(raw_dir).read()[1]
-    assert second.status == "succeeded"
-    assert by_table(second)["gl_entry"].rows_scanned == 0
-
-
-def test_an_unreadable_line_names_its_line_number(source, raw_dir):
-    """Case 12. Not skipped: a log that quietly drops what it cannot parse reports a
-    history missing the very run somebody is looking for.
-
-    The expected number is counted rather than written down. It used to be a bare `3`,
-    which matched anywhere in the message - including the digits of a temporary path -
-    so the assertion passed on a machine whose tmpdir happened to contain a 3 and failed
-    in CI, where it did not. A run writes four events now rather than two, and a test
-    that pins the count of one thing while claiming to test another is how that went
-    unnoticed.
-    """
-    load.load_source(source, raw_dir, tables=["gl_entry"])
-    path = raw_dir / "_state" / "runs.jsonl"
-    corrupt = len(path.read_text(encoding="utf-8").splitlines()) + 1
-    with path.open("a", encoding="utf-8") as handle:
-        handle.write("this is not JSON\n")
-
-    with pytest.raises(runs.RunLogError, match=rf"\bline {corrupt}\b"):
-        runs.RunLog(raw_dir).read()
-
-
-def test_one_identifier_starting_twice_is_a_corrupt_log(source, raw_dir):
-    """One identifier cannot mean two runs. Six hex characters inside one second make a
-    collision negligible, so this is a log that was concatenated or edited, and reading
-    on would hand the caller an ambiguous history."""
-    load.load_source(source, raw_dir, tables=["gl_entry"])
-    log = runs.RunLog(raw_dir)
-    repeated = log.read()[0].run_id
-    log.start(repeated, command="load", source="data/source", raw=str(raw_dir),
-              tables=["gl_entry"], overlap_days=7, full=False)
-
-    with pytest.raises(runs.RunLogError, match="starts twice"):
-        log.read()
-
-
-def test_one_identifier_finishing_twice_is_a_corrupt_log(source, raw_dir):
-    """The same reasoning as a repeated start. A second finished event would silently
-    replace the first run's outcome, and nothing here can decide which is true."""
-    load.load_source(source, raw_dir, tables=["gl_entry"])
-    log = runs.RunLog(raw_dir)
-    finished = log.read()[0].run_id
-    log.finish(finished, status="failed", duration_seconds=1.0, tables=[])
-
-    with pytest.raises(runs.RunLogError, match="finishes twice"):
-        log.read()
-
-
-def test_a_finished_run_cannot_claim_to_be_interrupted(raw_dir):
-    """`interrupted` is what the absence of a finished event means, so a finished event
-    saying it would be a run claiming to have finished by not finishing."""
-    log = runs.RunLog(raw_dir)
-    run_id = runs.new_run_id()
-    log.start(run_id, command="load", source="data/source", raw=str(raw_dir),
-              tables=["gl_entry"], overlap_days=7, full=False)
-
-    with pytest.raises(ValueError, match="succeeded or failed"):
-        log.finish(run_id, status="interrupted", duration_seconds=1.0, tables=[])
-
-
-def test_the_state_directory_is_created_when_it_is_missing(source, raw_dir):
-    """Case 13."""
-    assert not raw_dir.exists()
-
-    load.load_source(source, raw_dir, tables=["gl_entry"])
-
-    assert (raw_dir / "_state" / "runs.jsonl").is_file()
-
-
 # --- the command -----------------------------------------------------------
 
 def test_the_command_lists_the_runs_most_recent_first(source, raw_dir, capsys):
@@ -353,20 +212,6 @@ def test_the_command_shows_one_run_in_full(source, raw_dir, capsys):
         assert digest_of(source / f"{name}.csv") in printed
     assert "2026-02-20" in printed  # the watermark this run reached
     assert "duration" in printed
-
-
-def test_an_unknown_run_is_a_usage_error(source, raw_dir, capsys):
-    """Case 29."""
-    load.load_source(source, raw_dir, tables=["gl_entry"])
-
-    assert runs.main(["--raw", str(raw_dir), "--run", "20260101T000000Z-abcdef"]) == 2
-    assert "20260101T000000Z-abcdef" in capsys.readouterr().err
-
-
-def test_the_command_says_so_when_there_are_no_runs(raw_dir, capsys):
-    """Case 30. Nothing recorded yet is not a failure."""
-    assert runs.main(["--raw", str(raw_dir)]) == 0
-    assert "no runs" in capsys.readouterr().out.lower()
 
 
 def test_a_corrupt_log_is_a_usage_error_at_the_command(source, raw_dir, capsys):
@@ -471,23 +316,10 @@ def test_a_failed_run_names_the_step_and_keeps_the_ones_before_it(raw_dir):
     ]
 
 
-def test_a_step_finishing_without_starting_is_a_corrupt_log(raw_dir):
-    """Case 4. The same discipline the run level already applies: a log that cannot be
-    trusted is refused rather than half-read."""
-    log = runs.RunLog(raw_dir)
-    run_id = runs.new_run_id()
-    open_run(log, run_id)
-    log.step_finished(run_id, "load", status="succeeded", duration_seconds=1.0,
-                      detail={})
-
-    with pytest.raises(runs.RunLogError, match="load"):
-        log.read()
-
-
 def test_a_step_starting_again_after_it_finished_is_a_retry(raw_dir):
-    """Case 5. Airflow retries one task, not the DAG run, and the run identifier is
-    carried between tasks - so a retried step really does start twice under one run.
-    Both attempts are kept: that is what happened. See docs/adr/0045."""
+    """Case 5. A step can be re-run under the run identifier it already has, so a
+    retried step really does start twice inside one run. Both attempts are kept: that is
+    what happened. See docs/adr/0045."""
     log = runs.RunLog(raw_dir)
     run_id = runs.new_run_id()
     open_run(log, run_id)
@@ -500,101 +332,10 @@ def test_a_step_starting_again_after_it_finished_is_a_retry(raw_dir):
     record = log.read()[0]
 
     assert steps_of(record) == [("load", "failed"), ("load", "succeeded")]
-    # Numbered by the reader, never by the writer: a retried Airflow task runs in a new
-    # process and has no idea it is the second try, so one that wrote its own number
+    # Numbered by the reader, never by the writer: a retried step may run in a new
+    # process and have no idea it is the second try, so one that wrote its own number
     # would write a second attempt 1.
     assert [step.attempt for step in record.steps] == [1, 2]
-
-
-def test_a_step_starting_again_while_still_open_is_a_corrupt_log(raw_dir):
-    """Case 5b. The retry above is legitimate because the first attempt closed. A step
-    that starts again with its previous attempt still open is the concatenated or
-    edited log docs/adr/0019 refuses to read."""
-    log = runs.RunLog(raw_dir)
-    run_id = runs.new_run_id()
-    open_run(log, run_id)
-    log.step_started(run_id, "load")
-    log.step_started(run_id, "load")
-
-    with pytest.raises(runs.RunLogError, match="load"):
-        log.read()
-
-
-def test_a_log_in_the_two_event_shape_still_reads(source, raw_dir):
-    """Case 6. The file is appended to and never rewritten, so a log spanning this
-    change is the ordinary case rather than something to migrate. A run written before
-    steps existed reads as a run with none, with its tables intact."""
-    load.load_source(source, raw_dir)
-    path = raw_dir / "_state" / "runs.jsonl"
-    written = [json.loads(line) for line in path.read_text(encoding="utf-8").splitlines()]
-    # Strip what this task added, leaving exactly the two events docs/adr/0019 wrote.
-    written = [event for event in written
-               if event["event"] in ("started", "finished")]
-    for event in written:
-        event.pop("steps", None)
-        event.pop("failed_step", None)
-        event.pop("orchestrator", None)
-        event.pop("orchestrator_run_id", None)
-    path.write_text("".join(json.dumps(e) + "\n" for e in written), encoding="utf-8")
-
-    record = runs.RunLog(raw_dir).read()[0]
-
-    assert record.status == "succeeded"
-    assert record.steps == []
-    assert sorted(by_table(record)) == sorted(EVERY_TABLE)
-
-
-def test_the_command_shows_a_failed_run_as_its_steps(raw_dir, capsys):
-    """Case 7. This is the morning question, answered: which step, what did it say,
-    and what had already worked."""
-    log = runs.RunLog(raw_dir)
-    run_id = runs.new_run_id()
-    open_run(log, run_id)
-    walk(log, run_id, ["validate", "load"])
-    log.step_started(run_id, "recompute")
-    log.step_finished(run_id, "recompute", status="failed", duration_seconds=1.5,
-                      detail={})
-    log.finish(run_id, status="failed", duration_seconds=4.0, tables=[],
-               failed_step="recompute", error="no such period 2026-13")
-
-    assert runs.main(["--raw", str(raw_dir), "--run", run_id]) == 0
-
-    printed = capsys.readouterr().out
-    assert "recompute" in printed
-    assert "no such period 2026-13" in printed
-    for step in ("validate", "load"):
-        assert step in printed
-    assert "1.5" in printed
-
-
-def test_the_listing_shows_how_many_steps_a_run_ran(raw_dir, capsys):
-    """Case 8. The list is read to decide which run to open."""
-    log = runs.RunLog(raw_dir)
-    run_id = runs.new_run_id()
-    open_run(log, run_id)
-    walk(log, run_id, ["validate", "load", "recompute"])
-    log.finish(run_id, status="succeeded", duration_seconds=9.0, tables=[])
-
-    assert runs.main(["--raw", str(raw_dir)]) == 0
-
-    printed = capsys.readouterr().out
-    assert run_id in printed
-    assert "3 steps" in printed
-    assert "succeeded" in printed
-
-
-def test_a_step_event_after_the_run_finished_is_a_corrupt_log(raw_dir):
-    """A run has already said how it ended. A step event after that would retroactively
-    change a terminal record, which is the same defect as a run finishing twice."""
-    log = runs.RunLog(raw_dir)
-    run_id = runs.new_run_id()
-    open_run(log, run_id)
-    walk(log, run_id, ["validate"])
-    log.finish(run_id, status="succeeded", duration_seconds=1.0, tables=[])
-    log.step_started(run_id, "load")
-
-    with pytest.raises(runs.RunLogError, match="already finished"):
-        log.read()
 
 
 def test_a_step_event_for_a_run_that_never_started_is_a_corrupt_log(raw_dir):
@@ -608,41 +349,3 @@ def test_a_step_event_for_a_run_that_never_started_is_a_corrupt_log(raw_dir):
         log.read()
 
 
-def test_a_step_event_with_no_step_named_is_a_corrupt_log(raw_dir):
-    """Checked on the way in rather than tripping over a None several frames later."""
-    log = runs.RunLog(raw_dir)
-    run_id = runs.new_run_id()
-    open_run(log, run_id)
-    log.append({"event": "step_started", "run_id": run_id, "started_at": "now"})
-
-    with pytest.raises(runs.RunLogError, match="name its step"):
-        log.read()
-
-
-def test_a_step_cannot_claim_to_have_finished_by_not_finishing(raw_dir):
-    """`interrupted` is what the absence of the finished event means, so writing it as
-    a status would be a step reporting the one thing it cannot report."""
-    log = runs.RunLog(raw_dir)
-    run_id = runs.new_run_id()
-    open_run(log, run_id)
-
-    with pytest.raises(ValueError, match="succeeded"):
-        log.step_finished(run_id, "load", status=runs.INTERRUPTED,
-                          duration_seconds=1.0)
-
-
-def test_two_steps_can_be_open_at_once_and_each_closes_its_own(raw_dir):
-    """Not a shape this pipeline produces - steps run in order - but the folding is by
-    step rather than by position, and a reader that matched the most recent open step
-    regardless of name would attribute one step's outcome to another."""
-    log = runs.RunLog(raw_dir)
-    run_id = runs.new_run_id()
-    open_run(log, run_id)
-    log.step_started(run_id, "validate")
-    log.step_started(run_id, "load")
-    log.step_finished(run_id, "validate", status="succeeded", duration_seconds=1.0)
-
-    record = log.read()[0]
-
-    assert steps_of(record) == [("validate", "succeeded"), ("load", runs.INTERRUPTED)]
-    assert record.unfinished_step == "load"

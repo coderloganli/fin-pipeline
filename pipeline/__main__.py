@@ -1,8 +1,8 @@
 """`python -m pipeline daily`, and `python -m pipeline backfill --periods FROM:TO`.
 
-The whole pipeline in one process: one Spark session serves every step, which falls out
-of the runner holding it for the process rather than being a second code path. Under a
-DAG the same steps run one per task; see `dags/` and docs/adr/0046.
+The whole pipeline in one process. The order, the stop-on-failure rule and the run
+record live in `pipeline/` rather than in whatever schedules this, which is why
+scheduling it is a cron entry. See docs/adr/0046.
 """
 
 import argparse
@@ -22,7 +22,6 @@ def build_parser() -> argparse.ArgumentParser:
                         help="which sequence of steps to run")
     parser.add_argument("--source", default=str(runner.DEFAULT_SOURCE))
     parser.add_argument("--raw", default=str(runner.DEFAULT_RAW))
-    parser.add_argument("--staging", default=str(runner.DEFAULT_STAGING))
     parser.add_argument("--periods", default=None,
                         help="the reporting range, as YYYY-MM:YYYY-MM. Required for a "
                              "backfill, which exists to rebuild one")
@@ -53,13 +52,11 @@ def main(argv: list[str] | None = None) -> int:
     context = runner.Context(
         source_dir=args.source,
         raw_dir=args.raw,
-        staging_dir=args.staging,
         periods=args.periods,
         # A backfill rebuilds the range it was given whether or not anything is owed.
         force=args.pipeline == "backfill",
         # This is a fresh process this command controls, so a session built here is
         # this run's to stop. Nothing that borrows a process says this.
-        owns_spark=True,
     )
 
     try:
