@@ -1,6 +1,6 @@
 """What a red gate does to the mart, end to end.
 
-`tests/test_mart_gates.py` proves each of the six gates can turn red. This file proves
+`tests/test_mart_gates.py` proves each of the five gates can turn red. This file proves
 that turning one red no longer publishes anything: the run builds into a schema of its
 own and the mart keeps the last figures that passed.
 
@@ -14,7 +14,7 @@ import pytest
 from conftest import AUDIT_SUFFIX, drop_schemas_under, schema_for
 from ingest import runs
 from pipeline import dbt as pipeline_dbt
-from test_mart_load import row_count, table_checksum
+from conftest import row_count, table_checksum
 from transform import promote
 
 # docs/adr/0038: the provenance columns move on a rerun by design, so a comparison of
@@ -91,8 +91,7 @@ def promoting(request, db, clean_staging):
 
     def build(*, mutate=None, args=None, run_id=None, reload=True):
         if reload:
-            mart_load.load_all(staging_dir=clean_staging.staging,
-                               raw_dir=clean_staging.raw, schema=landing)
+            mart_load.load_all(raw_dir=clean_staging.raw, schema=landing)
         if mutate is not None:
             mutate(db, landing)
         return pipeline_dbt.build_and_promote(
@@ -133,7 +132,7 @@ def test_a_red_gate_leaves_the_mart_exactly_as_it_was(promoting, db):
     before = mart_state(db, promoting.mart)
 
     with pytest.raises(pipeline_dbt.DbtFailed):
-        promoting.build(mutate=duplicate_a_row("fct_gl_entry"))
+        promoting.build(mutate=duplicate_a_row("gl_entry"))
 
     assert mart_state(db, promoting.mart) == before
 
@@ -145,7 +144,7 @@ def test_a_red_gate_leaves_its_build_schema_and_names_it(promoting, db):
     promoting.build()
 
     with pytest.raises(pipeline_dbt.DbtFailed) as raised:
-        promoting.build(mutate=duplicate_a_row("fct_gl_entry"))
+        promoting.build(mutate=duplicate_a_row("gl_entry"))
 
     detail = raised.value.step_detail
     assert detail["promoted"] is False
@@ -160,7 +159,7 @@ def test_a_red_gate_leaves_its_failing_rows_readable(promoting, db):
     promoting.build()
 
     with pytest.raises(pipeline_dbt.DbtFailed) as raised:
-        promoting.build(mutate=duplicate_a_row("fct_gl_entry"))
+        promoting.build(mutate=duplicate_a_row("gl_entry"))
 
     audit = raised.value.step_detail["build_schema"] + AUDIT_SUFFIX
     stored = [table for table in tables_in(db, audit) if "fct_gl_entry" in table]
@@ -176,7 +175,7 @@ def test_a_red_gate_does_not_enter_the_drift_baseline(promoting, db):
     before = baseline(db, promoting.mart)
 
     with pytest.raises(pipeline_dbt.DbtFailed):
-        promoting.build(mutate=duplicate_a_row("fct_gl_entry"))
+        promoting.build(mutate=duplicate_a_row("gl_entry"))
 
     assert baseline(db, promoting.mart) == before
 
@@ -209,13 +208,15 @@ def test_a_green_build_after_a_red_one_replaces_the_mart(promoting, db):
     red one contributed nothing to the baseline it will be measured against."""
     promoting.build()
     with pytest.raises(pipeline_dbt.DbtFailed) as raised:
-        promoting.build(mutate=duplicate_a_row("fct_gl_entry"))
+        promoting.build(mutate=duplicate_a_row("gl_entry"))
     red = raised.value.step_detail["build_schema"]
 
     promoting.build()
 
+    # Against the source table, because that is what the fact is built from now: the
+    # landing schema holds the ledger as it arrived and the mart holds it attributed.
     assert row_count(db, promoting.mart, "fct_gl_entry") == row_count(
-        db, promoting.landing, "fct_gl_entry")
+        db, promoting.landing, "gl_entry")
     assert len(invocations(db, promoting.mart)) == 2
     assert red not in promote.build_schemas(db, promoting.mart)
 
@@ -230,7 +231,7 @@ def test_two_reds_in_a_row_both_survive(promoting, db):
     discarded = []
     for _ in range(2):
         with pytest.raises(pipeline_dbt.DbtFailed) as raised:
-            promoting.build(mutate=duplicate_a_row("fct_gl_entry"))
+            promoting.build(mutate=duplicate_a_row("gl_entry"))
         discarded.append(raised.value.step_detail["build_schema"])
 
     assert len(set(discarded)) == 2
@@ -245,7 +246,7 @@ def test_the_green_build_that_follows_sweeps_them_both(promoting, db):
     discarded = []
     for _ in range(2):
         with pytest.raises(pipeline_dbt.DbtFailed) as raised:
-            promoting.build(mutate=duplicate_a_row("fct_gl_entry"))
+            promoting.build(mutate=duplicate_a_row("gl_entry"))
         discarded.append(raised.value.step_detail["build_schema"])
 
     detail = promoting.build()

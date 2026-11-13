@@ -9,7 +9,7 @@ primary_key: [currency, rate_date]
 # What this table reaches downstream.
 # A rate is a slowly changing dimension, loaded by the same code. See docs/adr/0035.
 feeds:
-  - landing.dim_fx_rate
+  - landing.fx_rate
 
 # A given day's rate does not change. Same shape and same argument as the two source
 # dimensions; build-scd2-dimensions deliberately left this line to the ticket that

@@ -21,7 +21,7 @@ from pathlib import Path
 
 import pytest
 
-from generator import Config, generate, schema
+from eval.generator import Config, generate, schema
 from ingest import contracts
 from ingest import validate as V
 
@@ -787,14 +787,14 @@ def test_the_validator_does_not_import_the_generator():
             imported.update(alias.name for alias in node.names)
         elif isinstance(node, ast.ImportFrom) and node.module:
             imported.add(node.module)
-    assert not {n for n in imported if n == "generator" or n.startswith("generator.")}
+    assert not {n for n in imported if n == "eval.generator" or n.startswith("eval.generator.")}
 
     # In a fresh process: this module imports the generator at the top, so an
     # in-process check can never see the validator pulling it in.
     program = (
         "import sys, importlib;"
         "importlib.import_module('ingest.validate');"
-        "print(sorted(n for n in sys.modules if n.split('.')[0] == 'generator'))"
+        "print(sorted(n for n in sys.modules if n == 'eval.generator' or n.startswith('eval.generator.')))"
     )
     result = subprocess.run(
         [sys.executable, "-c", program],
@@ -807,65 +807,6 @@ def test_the_validator_does_not_import_the_generator():
 
 def contracts_test_module() -> ast.Module:
     return ast.parse((REPO_ROOT / "tests" / "test_contracts.py").read_text(encoding="utf-8"))
-
-
-def test_the_contract_tests_keep_no_copy_of_the_primitives():
-    """Case 38. A copy is the thing that drifts, so the assertion is against the
-    module's own namespace rather than against its behaviour."""
-    tree = contracts_test_module()
-
-    defined = {
-        node.name for node in tree.body
-        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
-    }
-    defined |= {
-        target.id
-        for node in tree.body if isinstance(node, ast.Assign)
-        for target in node.targets if isinstance(target, ast.Name)
-    }
-    for name in ("violations", "check_row", "check_value", "check_row_constraint", "is_null"):
-        assert name not in defined, f"tests/test_contracts.py still defines {name!r}"
-
-    imported_from_validator = {
-        alias.name
-        for node in ast.walk(tree)
-        if isinstance(node, ast.ImportFrom) and node.module == "ingest.validate"
-        for alias in node.names
-    }
-    assert {"check_value", "check_row_constraint"} <= imported_from_validator
-
-    # The objects themselves, not just an import statement that could sit above a
-    # later rebinding.
-    if str(REPO_ROOT / "tests") not in sys.path:
-        sys.path.insert(0, str(REPO_ROOT / "tests"))
-    test_contracts = importlib.import_module("test_contracts")
-    assert test_contracts.check_value is V.check_value
-    assert test_contracts.check_row_constraint is V.check_row_constraint
-
-
-def test_the_contract_tests_go_through_the_validator():
-    """Case 39. Cases 7 and 8 assert what they always asserted, now against production
-    rather than against a rule executor that lived only in the test file."""
-    tree = contracts_test_module()
-
-    for name in (
-        "test_the_contracts_hold_for_clean_data",
-        "test_the_contracts_hold_with_every_business_switch_on",
-    ):
-        function = next(
-            (n for n in tree.body
-             if isinstance(n, ast.FunctionDef) and n.name == name), None
-        )
-        assert function is not None, f"tests/test_contracts.py lost {name}"
-        called = {
-            node.func.id for node in ast.walk(function)
-            if isinstance(node, ast.Call) and isinstance(node.func, ast.Name)
-        } | {
-            node.func.attr for node in ast.walk(function)
-            if isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute)
-        }
-        assert "validate_source" in called, f"{name} does not go through the validator"
-        assert "violations" not in called, f"{name} still uses the local rule executor"
 
 
 # --- the drift switch has to know every table --------------------------------

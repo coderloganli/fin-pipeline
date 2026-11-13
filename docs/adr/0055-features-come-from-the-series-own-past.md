@@ -9,7 +9,7 @@ not have, so the generated range moves to 36 periods.
 `ml/README.md` fixed the feature set: lagged balances at one, three and twelve periods,
 month indicators, and a cost-centre size band. Two things about it were not settled.
 
-**The range.** `generator/config.py` defaults to `2026-01:2026-12` and `config.json`'s
+**The range.** `eval/generator/config.py` defaults to `2026-01:2026-12` and `config.json`'s
 `try` command generates six periods. A lag of twelve needs a thirteenth period before it
 has a single usable row, so on twelve periods the feature is empty for every row.
 

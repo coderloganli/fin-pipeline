@@ -5,9 +5,9 @@
 The incremental load needs to know, for each source table, which column tells it how
 far it got last time. The plan and `ingest/README.md` both said "the watermark reads
 the source `updated_at`". No source table has an `updated_at` column:
-`generator/schema.py` does not emit one and none of the five contracts declares one.
+`eval/generator/schema.py` does not emit one and none of the five contracts declares one.
 
-Two ways out. Add the column — to `generator/schema.py` and to the contracts — or
+Two ways out. Add the column — to `eval/generator/schema.py` and to the contracts — or
 pick a column that already exists and say so.
 
 ## Decision

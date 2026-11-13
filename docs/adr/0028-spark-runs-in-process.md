@@ -1,5 +1,14 @@
 # Spark runs in the test process, not in a container
 
+> **Superseded (2026-10-04).** Spark was removed. The three transformations it ran -
+> the SCD2 dimension load, the point-in-time join and the monthly aggregation - are dbt
+> models now, about 300 lines of SQL against Postgres, and the mart they produce is
+> byte-for-byte what Spark produced. The record stays because the reasoning was sound
+> for what it decided: if Spark had to be here, running it in the test process rather
+> than in a container is still the right trade. What it could not weigh is that nothing
+> here needed Spark - a `local[*]` session broadcasting every dimension over tens of
+> thousands of rows is an engine standing in for a `JOIN`.
+
 ## Context
 
 `docs/adr/0004` says services run in containers: the host machine edits code and runs

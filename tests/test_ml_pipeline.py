@@ -20,7 +20,6 @@ from pipeline import run as runner
 from pipeline import steps as step_list
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
-DAGS = REPO_ROOT / "dags"
 
 
 @pytest.fixture
@@ -35,7 +34,6 @@ def context(tmp_path, raw_dir):
     return runner.Context(
         source_dir=tmp_path / "source",
         raw_dir=raw_dir,
-        staging_dir=tmp_path / "staging",
     )
 
 
@@ -82,7 +80,7 @@ def test_a_daily_run_judges_the_affected_periods_and_their_closure(context, raw_
                                                                    judged_periods):
     """Case 33. Not every period: a nightly run that re-judged three years would spend
     the night doing it. The set comes from `ingest.affected`, widened by
-    `transform.spark.balances.dirty_closure` - the same function `recompute` used to
+    `transform.periods.dirty_closure` - the same function the mart's comparison columns
     decide what to rewrite, called rather than restated, which is the point
     docs/adr/0040 makes about a window rule written down twice.
 
@@ -91,8 +89,8 @@ def test_a_daily_run_judges_the_affected_periods_and_their_closure(context, raw_
     name and `transform.backfill.run` reads. Branching on the range instead would make
     every nightly run judge the whole of it.
     """
-    from transform.spark import balances as balances_module
-    from transform.spark.balances import dirty_closure
+    from transform import periods as period_math
+    from transform.periods import dirty_closure
 
     context.periods = "2026-01:2026-12"
     context.force = False
@@ -111,11 +109,11 @@ def test_a_daily_run_judges_the_affected_periods_and_their_closure(context, raw_
         called.append((sorted(periods), last_period))
         return {"2099-01"}
 
-    balances_module.dirty_closure = sentinel
+    period_math.dirty_closure = sentinel
     try:
-        runner.run_step(context, "r-1", step_list.by_name("daily", "judge"))
+        runner.run_step(context, "r-1", step_list.JUDGE)
     finally:
-        balances_module.dirty_closure = dirty_closure
+        period_math.dirty_closure = dirty_closure
 
     assert called == [(["2026-02", "2026-03"], "2026-12")]
     assert judged_periods == [["2099-01"]]
@@ -128,7 +126,7 @@ def test_a_backfill_judges_exactly_the_range_it_was_given(context, judged_period
     context.periods = "2026-02:2026-03"
     context.force = True
 
-    runner.run_step(context, "r-2", step_list.by_name("backfill", "judge"))
+    runner.run_step(context, "r-2", step_list.JUDGE)
 
     assert judged_periods == [["2026-02", "2026-03"]]
 
@@ -148,7 +146,7 @@ def test_a_backfill_replaces_the_flags_of_the_range_it_rebuilt(db, mart, ml_stag
     context.periods, context.force = "2026-05:2026-06", True
 
     try:
-        first = step_list.by_name("backfill", "judge")
+        first = step_list.JUDGE
         detail = runner.run_step(context, "backfill-one", first)
         assert detail["periods"] == ["2026-05", "2026-06"]
         before = flags_in(db, anomaly)
@@ -194,7 +192,7 @@ def test_a_failed_judge_leaves_the_published_mart_where_it_is(db, mart, ml_stagi
     monkeypatch.setattr(judge, "run", explode)
 
     with pytest.raises(RuntimeError):
-        runner.run_step(context, "r-3", step_list.by_name("daily", "judge"))
+        runner.run_step(context, "r-3", step_list.JUDGE)
 
     assert reported_counts(db, built.mart) == before
     assert affected.read(raw_dir).periods == ["2026-06"], (
@@ -232,9 +230,6 @@ def reported_counts(db, schema):
 
 # --- case 36 ----------------------------------------------------------------
 
-def tree_of(name: str):
-    return ast.parse((DAGS / name).read_text(encoding="utf-8"))
-
 
 def task_ids(tree) -> list[str]:
     found = []
@@ -246,8 +241,3 @@ def task_ids(tree) -> list[str]:
     return found
 
 
-@pytest.mark.parametrize("name", ["daily.py", "backfill.py"])
-def test_both_dags_declare_a_judge_task(name):
-    """Case 36. A step that exists in `pipeline/steps.py` and in no DAG is a step that
-    never runs at night, which is the only time it matters."""
-    assert "judge" in task_ids(tree_of(name)), f"{name} declares no judge task"

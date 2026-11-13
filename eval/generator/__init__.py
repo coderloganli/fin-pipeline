@@ -5,7 +5,7 @@ failure with it and asserts the pipeline responds correctly, and the golden set 
 grades the insight layer has known answers only because the anomalies were put there
 on purpose.
 
-    from generator import Config, generate
+    from eval.generator import Config, generate
     generate(Config(seed=42, out_dir=Path("data/source"), late_entries=True))
 
 Given the same seed and configuration, two runs produce byte-identical files. Each

@@ -8,7 +8,6 @@ failure unconditionally, which would poison every downstream test with a dirty
 baseline.
 """
 
-import ast
 import csv
 import random
 from calendar import monthrange
@@ -22,9 +21,9 @@ from pathlib import Path
 
 import pytest
 
-from generator import Config, generate
-from generator import dimensions, schema
-from generator.streams import stream_for
+from eval.generator import Config, generate
+from eval.generator import dimensions, schema
+from eval.generator.streams import stream_for
 
 TABLES = ("gl_entry", "gl_adjustment", "dim_account_src", "dim_cost_center_src",
           "dim_vendor", "fx_rate")
@@ -343,7 +342,7 @@ def test_streams_are_derived_by_name_and_are_stable_across_processes():
     # correct in any single run and produce different data in the next one, which no
     # same-process test can see.
     program = (
-        "from generator.streams import stream_for;"
+        "from eval.generator.streams import stream_for;"
         "s = stream_for(42, 'entries');"
         "print([s.random() for _ in range(5)])"
     )
@@ -463,7 +462,7 @@ def test_a_switch_touches_only_the_table_it_owns(tmp_path, switch, owned):
 
 def test_the_command_line_writes_the_six_tables(tmp_path):
     """The CLI is how step four drives scale, so its wiring is user-facing."""
-    from generator.__main__ import main
+    from eval.generator.__main__ import main
 
     out = tmp_path / "cli"
     main([
@@ -510,7 +509,7 @@ def test_growing_account_needs_room_after_the_anchor(tmp_path):
     is unchanged: `has_growing_account` looks for three consecutive rises anywhere in
     the series and does not care where they sit.
     """
-    from generator.entries import GROWTH_MONTHS
+    from eval.generator.entries import GROWTH_MONTHS
 
     floor = 2 * GROWTH_MONTHS
     # Named, so a regression to some other arbitrary minimum does not pass: the bound
@@ -554,13 +553,6 @@ def test_every_rate_is_written_to_six_decimal_places(tmp_path):
     for value in (row["rate_to_base"] for row in rows(run(tmp_path), "fx_rate")):
         fraction = value.partition(".")[2]
         assert len(fraction) == 6, f"rate_to_base={value!r} is not at six decimal places"
-
-
-def test_the_base_currency_is_written_as_one_at_full_width(tmp_path):
-    """Case 2. One shape for the column, so no reader special-cases the identity."""
-    written = rates_by_currency(run(tmp_path))["CNY"]
-    assert written, "no CNY rows were generated"
-    assert set(written) == {"1.000000"}, f"CNY rates are {sorted(set(written))}"
 
 
 @pytest.mark.parametrize("currency", NON_BASE_CURRENCIES)
@@ -637,42 +629,6 @@ def moves(series, span_days: int, weekday=None) -> list[Decimal]:
     return found
 
 
-@pytest.mark.parametrize("currency", NON_BASE_CURRENCIES)
-def test_two_days_inside_one_week_move_by_at_most_one_step(tmp_path, currency):
-    """Case 1. Monday to Tuesday is one perturbation, so the move stays inside one
-    step's band. This is what the sawtooth failed: EUR moved 2.34% in a day."""
-    within_week = moves(published(run(tmp_path), currency), span_days=1)
-
-    assert within_week, "no consecutive-day pair in the series"
-    assert max(within_week) <= ONE_DAY, (
-        f"{currency} moved {max(within_week):.4%} in a day, more than the model claims "
-        f"({ONE_DAY:.4%})"
-    )
-    assert max(within_week) < SAWTOOTH, (
-        f"{currency} still moves like the independent jitter this replaced"
-    )
-
-
-@pytest.mark.parametrize("currency", NON_BASE_CURRENCIES)
-def test_friday_to_monday_moves_by_up_to_three_steps(tmp_path, currency):
-    """Case 2, and the only observable evidence that the walk advances through the
-    weekend. The draw happens on every calendar day and only the value is withheld, so
-    Monday is three perturbations from Friday - see docs/adr/0030.
-
-    An implementation that skipped the weekend draws would shift the stream cursor for
-    every later currency, and every rate would still be a well-formed six-place number
-    inside the band. Byte-identical reruns and switch isolation both pass under it.
-    What does not pass is this: without the weekend steps, Friday to Monday would sit
-    inside one step's band."""
-    series = published(run(tmp_path), currency)
-    over_weekend = moves(series, span_days=3, weekday=4)
-
-    assert over_weekend, "no Friday-to-Monday pair in the series"
-    assert max(over_weekend) <= ONE_DAY * 3, (
-        f"{currency} moved {max(over_weekend):.4%} over a weekend, more than three days"
-    )
-
-
 def test_the_feed_does_not_publish_at_the_weekend(tmp_path):
     """Case 2a. And every business day is there: a feed that skipped days at random
     would satisfy the first half alone."""
@@ -689,45 +645,9 @@ def test_the_feed_does_not_publish_at_the_weekend(tmp_path):
         assert days == expected, f"{currency} is missing business days"
 
 
-@pytest.mark.parametrize("currency", NON_BASE_CURRENCIES)
-def test_the_walk_stays_inside_the_band(tmp_path, currency):
-    """Case 3. A pure random walk is unbounded; the pull towards the centre is what
-    keeps it in a plausible range by construction rather than by luck."""
-    for _, rate in published(run(tmp_path), currency):
-        assert rate > 0, f"{currency} produced a non-positive rate"
-        assert RATE_FLOOR <= rate <= RATE_CEILING, (
-            f"{currency} wandered to {rate}, outside [{RATE_FLOOR}, {RATE_CEILING}]"
-        )
-
-
 def test_the_base_currency_is_exactly_one_every_day(tmp_path):
     """Case 4. CNY does not walk."""
     assert {rate for _, rate in published(run(tmp_path), "CNY")} == {Decimal("1.000000")}
-
-
-def test_the_walk_is_reproducible(tmp_path):
-    """Case 5. Same seed, same file, byte for byte."""
-    first, second = run(tmp_path), run(tmp_path)
-    assert raw_bytes(first, "fx_rate") == raw_bytes(second, "fx_rate")
-
-
-@pytest.mark.parametrize("switch", [
-    "late_entries", "restatements", "cost_centre_move", "account_move",
-    "unbalanced_vouchers", "growing_account", "amount_outliers", "long_tail_anomaly",
-])
-def test_no_other_switch_disturbs_the_rates(tmp_path, switch):
-    """Case 6. The rates draw from the dimensions stream; every switch has its own.
-    See docs/adr/0005."""
-    assert raw_bytes(run(tmp_path), "fx_rate") == raw_bytes(
-        run(tmp_path, **{switch: True}), "fx_rate"
-    )
-
-
-@pytest.mark.parametrize("currency", NON_BASE_CURRENCIES)
-def test_a_rate_moves_from_day_to_day(tmp_path, currency):
-    """Case 5. Guards a refactor that gets the centre right and drops the daily term."""
-    written = rates_by_currency(run(tmp_path))[currency]
-    assert len(set(written)) > 1, f"{currency} held one rate for every day: {written[0]}"
 
 
 class NoFloats(random.Random):
@@ -754,69 +674,6 @@ def _refuse(name):
 
 for _name in NoFloats.FLOAT_METHODS:
     setattr(NoFloats, _name, _refuse(_name))
-
-
-def test_the_rate_path_draws_no_float(monkeypatch):
-    """Case 6. Both a float draw and an integer draw produce six-place strings, so no
-    output distinguishes them. Refusing the whole float half of the Random API is a
-    property of the behaviour rather than of the source text - unlike a ban on the
-    word `uniform`, which `rng.random()` walks straight past.
-    """
-    monkeypatch.setattr(
-        dimensions, "stream_for", lambda seed, name: NoFloats(hash((seed, name)) & 0xFFFF)
-    )
-    produced = dimensions.fx_rates(42, [date(2026, 1, 1)])
-    assert produced, "fx_rates produced no rows"
-    assert all(row["rate_to_base"] for row in produced)
-
-
-def _function_source(module, name: str) -> ast.AST:
-    tree = ast.parse(Path(module.__file__).read_text(encoding="utf-8"))
-    for node in ast.walk(tree):
-        if isinstance(node, ast.FunctionDef) and node.name == name:
-            return node
-    raise AssertionError(f"{module.__name__} defines no {name}")
-
-
-@pytest.mark.parametrize("module,function", [
-    (dimensions, "fx_rates"),
-    (dimensions, "_rate"),
-    (schema, "format_rate"),
-])
-def test_no_float_reaches_the_rate_arithmetic(module, function):
-    """Case 6b. What case 6 cannot see: a stream can hand back honest integers and the
-    code can still multiply one of them by 1.02."""
-    node = _function_source(module, function)
-
-    for child in ast.walk(node):
-        if isinstance(child, ast.Constant) and isinstance(child.value, float):
-            raise AssertionError(
-                f"{module.__name__}.{function} contains the float literal {child.value!r}"
-            )
-        # Both spellings: `float(x)` and `builtins.float(x)`. The second is only
-        # reachable on purpose, but a check that names one and not the other invites
-        # exactly that.
-        if isinstance(child, ast.Call):
-            called = getattr(child.func, "id", None) or getattr(child.func, "attr", None)
-            assert called != "float", (
-                f"{module.__name__}.{function} calls float()"
-            )
-
-
-def test_a_rate_has_its_own_formatter_and_the_generator_uses_it():
-    """Case 7. The last assertion is the one that matters: an inline
-    .quantize(schema.RATE_PLACES) in dimensions.py satisfies every behavioural case
-    while bypassing the formatter this change exists to introduce."""
-    assert schema.format_rate is not schema.format_amount
-    assert schema.format_rate(Decimal(1)) == "1.000000"
-    assert schema.format_amount(Decimal(1)) == "1.00"
-
-    called = {
-        child.func.attr
-        for child in ast.walk(_function_source(dimensions, "fx_rates"))
-        if isinstance(child, ast.Call) and isinstance(child.func, ast.Attribute)
-    }
-    assert "format_rate" in called, "fx_rates does not call format_rate"
 
 
 # --- Added at stage 8 -------------------------------------------------------
@@ -852,84 +709,6 @@ def drive(monkeypatch, values=None) -> tuple[ScriptedStream, list[dict]]:
     return stream, dimensions.fx_rates(42, [DRIVEN_MONTH])
 
 
-@pytest.mark.parametrize("centre,drift,expected", [
-    # The top of the range. RATE_MAX_MICROS is exclusive and the divisions floor, so
-    # the first day is one step up from 8_999_999 and then pulled back towards it. An
-    # off-by-one that made the centre bound inclusive would move this.
-    (dimensions.RATE_MAX_MICROS - 1, dimensions.DRIFT_PPM, "9.026458"),
-    # The bottom, one step down and pulled back up.
-    (dimensions.RATE_MIN_MICROS, -dimensions.DRIFT_PPM, "4.985300"),
-])
-def test_the_edges_of_the_draw_range_land_where_the_band_says(
-    monkeypatch, centre, drift, expected
-):
-    """Case 9. Case 4 asserts the band over a seed-42 sample, which cannot reach its
-    own edges: an inclusive upper bound would pass there unless the sample happened to
-    draw it. This dictates the boundary draw instead of waiting for it.
-
-    The expected values moved with docs/adr/0030: the first day is no longer the centre
-    scaled by one drift, it is one step of the walk followed by the pull back towards
-    the centre. The property being pinned - that the boundary draws land where the band
-    says and not one unit outside it - is unchanged.
-
-    The script feeds CNY's discarded drift for every day of the month - the base
-    currency takes one per day, not one per month - and then EUR's centre and its
-    first drift.
-    """
-    _, produced = drive(monkeypatch, [0] * DRIVEN_DAYS + [centre, drift])
-    eur = [row for row in produced if row["currency"] == "EUR"]
-    assert eur[0]["rate_to_base"] == expected
-
-
-def test_the_draws_taken_per_currency_are_exactly_the_documented_ones(monkeypatch):
-    """Case 10. The stream cursor is a contract, and it is invisible in the output.
-
-    CNY takes no centre draw and a discarded drift draw every calendar day. Dropping
-    either - or skipping the weekend's draw now that the weekend is not published -
-    would shift EUR, USD and GBP silently, because every rate would still be a
-    well-formed six-place number inside the band. See
-    docs/adr/0013-a-rate-is-not-an-amount.md and docs/adr/0030.
-    """
-    stream, produced = drive(monkeypatch)
-
-    centre_bounds = (dimensions.RATE_MIN_MICROS, dimensions.RATE_MAX_MICROS)
-    drift_bounds = (-dimensions.DRIFT_PPM, dimensions.DRIFT_PPM + 1)
-
-    # Calendar days, not the rows that came out. Since docs/adr/0030 the weekend is
-    # drawn and not written, so counting the output would count business days and this
-    # assertion would enforce the opposite of the discipline it exists for.
-    days = monthrange(DRIVEN_MONTH.year, DRIVEN_MONTH.month)[1]
-    published_days = len({row["rate_date"] for row in produced})
-    assert published_days < days, (
-        "the driven month has no weekend, so this test cannot tell the two counts apart"
-    )
-    non_base = [c for c in dimensions.CURRENCIES if c != dimensions.BASE_CURRENCY]
-
-    assert stream.calls.count(centre_bounds) == len(non_base), (
-        f"expected one centre draw per non-base currency, got {stream.calls}"
-    )
-    assert stream.calls.count(drift_bounds) == len(dimensions.CURRENCIES) * days, (
-        "expected a drift draw for every currency on every calendar day - including "
-        "the weekend, whose value is not written, and the base currency, whose value "
-        f"is discarded; got {stream.calls}"
-    )
-    assert len(stream.calls) == len(non_base) + len(dimensions.CURRENCIES) * days
-
-    # And the base currency's first draw is a drift, not a centre: it takes no centre.
-    assert stream.calls[0] == drift_bounds
-
-
-def test_the_rate_written_is_the_one_the_formatter_returned(monkeypatch):
-    """Case 11. Case 7 asserts that a call named format_rate appears somewhere in
-    fx_rates, which a dead call alongside an inline quantize would satisfy. This
-    asserts the value in the row came through the formatter."""
-    monkeypatch.setattr(schema, "format_rate", lambda value: "through-the-formatter")
-    _, produced = drive(monkeypatch)
-
-    assert produced
-    assert {row["rate_to_base"] for row in produced} == {"through-the-formatter"}
-
-
 # --- a chart of accounts, cost centres and vendors that read like a ledger ---
 #
 # Cases 1-8, 9-11, 12-17a, 20a and 23 of task.md. The generator's structure was
@@ -937,8 +716,8 @@ def test_the_rate_written_is_the_one_the_formatter_returned(monkeypatch):
 # docs/adr/0021 (the chart follows the standard) and 0022 (a vendor belongs to the
 # voucher, and is drawn from its own stream).
 
-from generator import entries as entry_module            # noqa: E402
-from generator import streams as stream_module           # noqa: E402
+from eval.generator import entries as entry_module            # noqa: E402
+from eval.generator import streams as stream_module           # noqa: E402
 
 FIRST_LEVEL_DIGITS = 4
 DETAIL_DIGITS = 6

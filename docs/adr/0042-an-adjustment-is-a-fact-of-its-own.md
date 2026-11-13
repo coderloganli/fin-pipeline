@@ -17,7 +17,7 @@ The obvious answer is that they are journal lines and belong in `fct_gl_entry` w
 type column. That answer does not survive gate 3. `vouchers_are_balanced` groups
 `fct_gl_entry` by `doc_id` and fails any group whose base-currency debits and credits
 differ. The generator writes an adjustment as a standalone row carrying a debit and a
-zero credit, with a `doc_id` of its own — it says so in `generator/entries.py`: "An
+zero credit, with a `doc_id` of its own — it says so in `eval/generator/entries.py`: "An
 adjustment is a standalone row rather than a voucher, so the per-voucher vendor rule
 cannot apply to it."
 

@@ -141,26 +141,30 @@ models:
       - name: cost_center_name
         data_tests: [not_null]
 
+  # Gate 4 is `intervals_are_consistent`, declared on the natural key of each
+  # effective-dated dimension. It is one generic test rather than three copies of the
+  # same SQL: a gate claimed for three tables but fixed in one of them is a claim about
+  # the other two.
   - name: dim_account
     columns:
       - name: surrogate_key
         data_tests: [unique, not_null]
       - name: account_code
-        data_tests: [not_null]
+        data_tests: [not_null, intervals_are_consistent]
 
   - name: dim_cost_center
     columns:
       - name: surrogate_key
         data_tests: [unique, not_null]
       - name: cc_code
-        data_tests: [not_null]
+        data_tests: [not_null, intervals_are_consistent]
 
   - name: dim_fx_rate
     columns:
       - name: surrogate_key
         data_tests: [unique, not_null]
       - name: currency
-        data_tests: [not_null]
+        data_tests: [not_null, intervals_are_consistent]
 
   - name: dim_vendor
     columns:

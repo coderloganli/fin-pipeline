@@ -14,7 +14,8 @@ comparison of attributes.
 
 Ingest records observations. Turning a dimension version into a set of periods needs the
 version's validity interval and the periods that carry entries on that key, and both of
-those belong to `transform/`. See `transform/spark/affected.py`.
+those belong to `transform/`, which has the intervals and the fact to resolve them
+against.
 
     python -m ingest.affected [--raw data/raw] [--clear]
 

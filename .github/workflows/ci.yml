@@ -1,14 +1,11 @@
 name: ci
-
 on:
   push:
     branches: [main]
   pull_request:
-
 jobs:
   test:
     runs-on: ubuntu-latest
-
     services:
       # The suite runs against a real database. A test that skipped when Postgres
       # was missing would report success having verified nothing.
@@ -25,7 +22,6 @@ jobs:
           --health-interval 2s
           --health-timeout 3s
           --health-retries 15
-
     env:
       POSTGRES_HOST: 127.0.0.1
       POSTGRES_PORT: 5432
@@ -36,33 +32,11 @@ jobs:
       # workflow says what it builds into. See docs/adr/0034.
       POSTGRES_LANDING_SCHEMA: landing
       POSTGRES_MART_SCHEMA: mart
-
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
         with:
           # A test asserts this agrees with requires-python in pyproject.toml.
           python-version: '3.13'
-      # Spark runs in the test process rather than in a container, so the JDK is a
-      # toolchain dependency here in the same way the Python interpreter is. Spark
-      # 4.2.0 documents Java 17/21/25; a test pins this to that list.
-      # See docs/adr/0028-spark-runs-in-process.md.
-      - uses: actions/setup-java@v4
-        with:
-          distribution: temurin
-          java-version: '21'
-      - run: pip install -e ".[dev,spark,dbt,ml]"
+      - run: pip install -e ".[dev,dbt,ml]"
       - run: pytest -q
-      # The lineage graph is one of this project's answers to "what would a column
-      # change break", so CI produces it rather than leaving it to a developer's
-      # machine. `docs generate` is what refreshes catalog.json and proves the project
-      # documents; the artefact itself is rendered from the manifest, because
-      # `dbt docs generate --static` does not embed what it documents
-      # (dbt-labs/dbt-core#11986) and dbt Docs v2 has no single-file output.
-      # See docs/adr/0037.
-      - run: dbt docs generate --project-dir transform/dbt --profiles-dir transform/dbt
-      - run: python -m transform.lineage --out transform/dbt/target/lineage.html
-      - uses: actions/upload-artifact@v4
-        with:
-          name: lineage
-          path: transform/dbt/target/lineage.html

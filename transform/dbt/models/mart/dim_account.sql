@@ -1,21 +1,9 @@
--- Passed through from the landing layer, with one correction. The SCD2 intervals were
--- built by transform/spark/scd2.py and are not recomputed here; this model exists so
--- the mart is a closed set of tables the application can join, and so the interval gate
--- has something in the mart to check.
+-- The chart of accounts as validity intervals. See macros/scd2.sql for the shape and
+-- docs/adr/0024, 0025 and 0027 for what it forecloses.
 --
--- `nullif(parent_code, '')` for the reason fct_gl_entry nullifies vendor_code: raw
--- lands every column as text and writes an empty field as an empty string
--- (docs/adr/0015), because raw exists to answer whether the source really said that.
--- A top-level account has no parent, and the mart is the layer where that absence is a
--- null rather than a string nothing will ever match.
-
-select
-    surrogate_key,
-    account_code,
-    name,
-    nullif(parent_code, '') as parent_code,
-    account_type,
-    valid_from,
-    valid_to,
-    is_current
-from {{ source('landing', 'dim_account') }}
+-- `parent_code` is empty for a first-level account, and empty is where raw records
+-- absence. The mart is the layer the application reads, so it is here that the empty
+-- string becomes the null that ingest/contracts already says it means - after the
+-- fingerprint, never before, or the collapse would depend on how absence is spelled.
+{{ scd2('dim_account_src', ['account_code'], ['name', 'parent_code', 'account_type'],
+        nullable=['parent_code']) }}

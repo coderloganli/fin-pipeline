@@ -1,5 +1,9 @@
 """How the tests reach Postgres, and how the mart is built for them.
 
+A fixture generates a ledger, ingests it into a raw layer, and stops there. Everything
+after that is `dbt build` against the source tables `transform/load.py` copies in, so a
+scenario plants its failure between the load and the build.
+
 The connection is made inside a fixture a test asks for, never at import or collection
 time. Tests that do not ask for it keep working while the containers are stopped, which
 is what makes `pytest -m "not db"` useful.
@@ -9,7 +13,11 @@ restated: the loader resolves them too, and two copies would drift. See
 docs/adr/0004-services-run-in-containers.md.
 """
 
+import hashlib
 import os
+import subprocess
+import sys
+from dataclasses import dataclass
 from pathlib import Path
 
 import pytest
@@ -25,76 +33,6 @@ from transform.db import (  # noqa: F401  - re-exported for the tests that impor
 )
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
-
-
-# --- holding a Spark session, and being somewhere that has none -------------
-#
-# Ownership of the session is held rather than inferred - see docs/adr/0049. These two
-# helpers construct the conditions the inference used to get wrong, and both are needed
-# by tests in several modules.
-
-def run_off_thread(call):
-    """Run `call` on a plain thread, join it, and hand back what it did.
-
-    Deliberately `threading.Thread` and not `pyspark.InheritableThread`. The latter
-    exists precisely to copy the JVM thread-locals across, and these tests need them
-    absent: on a plain thread `SparkSession.getActiveSession()` is `None` while the
-    process's session is very much alive, which is the condition ownership must never be
-    inferred from.
-
-    Anything the thread raised is re-raised here, because a failure that stayed in the
-    child would be reported as a passing test.
-    """
-    import threading
-
-    caught, returned = [], []
-
-    def body():
-        try:
-            returned.append(call())
-        except BaseException as failure:  # noqa: BLE001 - re-raised below, unchanged
-            caught.append(failure)
-
-    thread = threading.Thread(target=body)
-    thread.start()
-    thread.join()
-    if caught:
-        raise caught[0]
-    return returned[0]
-
-
-def session_is_stopped(spark) -> bool:
-    """Whether this session has been stopped, without raising when it has.
-
-    A stopped session loses its `_jsc`, so the direct
-    `spark.sparkContext._jsc.sc().isStopped()` raises `AttributeError` instead of
-    answering - which reports the interesting case as an error rather than as the
-    assertion it is.
-    """
-    context = spark.sparkContext._jsc
-    return context is None or context.sc().isStopped()
-
-
-def in_a_fresh_process(body: str) -> str:
-    """Run a snippet in a process that has built no Spark session, and return its stdout.
-
-    The suite's session-scoped fixture makes "this process has no session" unreachable in
-    process, and it is the condition half of the ownership cases are about. The snippet
-    is dedented, so it can be written as an indented triple-quoted string.
-    """
-    import subprocess
-    import sys
-    import textwrap
-
-    finished = subprocess.run(
-        [sys.executable, "-c", textwrap.dedent(body)],
-        capture_output=True, text=True, cwd=REPO_ROOT,
-    )
-    assert finished.returncode == 0, (
-        f"the snippet exited {finished.returncode}\n"
-        f"--- stdout ---\n{finished.stdout}\n--- stderr ---\n{finished.stderr}"
-    )
-    return finished.stdout
 
 
 @pytest.fixture(scope="session")
@@ -122,46 +60,6 @@ def db():
     finally:
         connection.close()
 
-
-@pytest.fixture(scope="session")
-def spark():
-    """A local SparkSession, built once for the whole session.
-
-    Local mode, so this is a library with a toolchain requirement rather than a service
-    to stand up - see docs/adr/0028-spark-runs-in-process.md, which is where the
-    exception to ADR 0004 is argued.
-
-    It fails rather than skips when Spark cannot start, for the reason the database
-    fixture does: a skipped test reports success, and a CI run that verified nothing
-    comes back green.
-
-    It acquires rather than builds, so that it too stops only a session it created. A
-    fixture that unconditionally stopped whatever `build` handed back would be breaking
-    the ownership rule the suite exists to enforce - see docs/adr/0049.
-    """
-    from transform.spark import session as spark_session
-
-    with spark_session.acquire("fin-pipeline-tests") as built:
-        yield built
-
-
-# --- the mart: one pipeline run, many builds --------------------------------
-#
-# Building the Parquet is slow - the generator, ingest and three Spark jobs - and
-# loading it into Postgres is not. So the Parquet is built once per session per
-# generator configuration, and every scenario gets its own landing and mart schema
-# loaded from it. A scenario that has to plant a failure mutates its own schema and
-# nothing else's.
-#
-# The schemas the suite uses are named from POSTGRES_LANDING_SCHEMA and
-# POSTGRES_MART_SCHEMA, which the suite points somewhere of its own: running the tests
-# must not overwrite the schemas a developer has been looking at in the same database.
-# See docs/adr/0034.
-
-import hashlib
-import subprocess
-import sys
-from dataclasses import dataclass
 
 DBT_PROJECT = REPO_ROOT / "transform" / "dbt"
 
@@ -243,24 +141,80 @@ def drop_schemas_under(connection, *prefixes: str) -> None:
     connection.commit()
 
 
+# --- reading a table back -------------------------------------------------
+#
+# Two instruments several modules need. They live here rather than in whichever test
+# file happened to want them first: a checksum computed two ways is two checksums.
+
+def table_checksum(db, schema: str, table: str, exclude=()) -> str:
+    """The row-level checksum docs/adr/0017 defines, over a Postgres table.
+
+    Rendered as length-prefixed text, columns sorted by name, rows sorted, hashed. Not
+    over anything physical: a table is a set of rows, and two tables holding the same
+    rows in different physical order have to check the same.
+    """
+    import hashlib
+
+    from ingest import raw
+
+    with db.cursor() as cursor:
+        cursor.execute(
+            """
+            SELECT column_name FROM information_schema.columns
+            WHERE table_schema = %s AND table_name = %s
+            """,
+            (schema, table),
+        )
+        columns = sorted(name for (name,) in cursor.fetchall() if name not in exclude)
+        quoted = ", ".join(f'"{name}"' for name in columns)
+        cursor.execute(f'SELECT {quoted} FROM "{schema}"."{table}"')
+        rows = cursor.fetchall()
+
+    rendered = sorted(
+        raw.UNIT_SEPARATOR.join(f"{len(str(value))}:{value}" for value in row)
+        for row in rows
+    )
+    digest = hashlib.sha256()
+    for line in rendered:
+        digest.update(line.encode("utf-8"))
+        digest.update(b"\n")
+    return digest.hexdigest()
+
+
+def row_count(db, schema: str, table: str) -> int:
+    with db.cursor() as cursor:
+        cursor.execute(f'SELECT count(*) FROM "{schema}"."{table}"')
+        return cursor.fetchone()[0]
+
+
+def row_count(db, schema: str, table: str) -> int:
+    with db.cursor() as cursor:
+        cursor.execute(f'SELECT count(*) FROM "{schema}"."{table}"')
+        return cursor.fetchone()[0]
+
+
 @dataclass
-class Staging:
-    """One generator configuration, built through to Parquet."""
+class Landed:
+    """One generator configuration, generated and ingested into the raw layer."""
 
     root: Path
     source: Path
     raw: Path
-    staging: Path
+    periods: str
 
 
-def build_staging(spark, root: Path, **config) -> Staging:
-    """Generator, ingest, then the three Spark jobs. Everything under one directory."""
-    from generator import generate
-    from generator.config import Config
+def build_landed(root: Path, **config) -> Landed:
+    """Generator, then ingest. Everything under one directory.
+
+    It stops at the raw layer, because everything after it is a dbt model: the
+    dimensions, the facts and the aggregate are all built by `dbt build` from the source
+    tables `transform/load.py` copies into Postgres.
+    """
+    from eval.generator import generate
+    from eval.generator.config import Config
     from ingest import load as ingest_load
-    from transform.spark import balances, facts, scd2
 
-    source, raw_dir, staging_dir = root / "source", root / "raw", root / "staging"
+    source, raw_dir = root / "source", root / "raw"
     settings_ = {
         "seed": 42,
         "out_dir": source,
@@ -269,20 +223,8 @@ def build_staging(spark, root: Path, **config) -> Staging:
     }
     settings_.update(config)
     generate(Config(**settings_))
-
     ingest_load.load_source(source, raw_dir)
-    for table in sorted(scd2.MODELS):
-        scd2.build(spark, contracts_load(table), raw_dir, staging_dir)
-    # Two facts, not one. An adjustment is a single-sided delta against a voucher that
-    # already balanced, so it is a fact of its own rather than a row of the entry fact -
-    # see docs/adr/0042.
-    for model in sorted(facts.SOURCES):
-        facts.build(spark, raw_dir, staging_dir, model=model)
-    # The range the caller generated, not the suite's default: a fixture that
-    # generated three years and then aggregated one would hand the ml cases a grid with
-    # no history in it, and every assertion about lags would pass vacuously.
-    balances.build(spark, staging_dir, periods=settings_["periods"])
-    return Staging(root=root, source=source, raw=raw_dir, staging=staging_dir)
+    return Landed(root=root, source=source, raw=raw_dir, periods=settings_["periods"])
 
 
 def contracts_load(table: str) -> dict:
@@ -292,7 +234,7 @@ def contracts_load(table: str) -> dict:
 
 
 @pytest.fixture(scope="session")
-def clean_staging(spark, tmp_path_factory) -> Staging:
+def clean_staging(tmp_path_factory) -> Landed:
     """A correct ledger. The baseline every gate passes on.
 
     The two dimension moves are on, and they are not failure modes: docs/architecture.md
@@ -300,17 +242,17 @@ def clean_staging(spark, tmp_path_factory) -> Staging:
     business event, not malformed input. They are what gives the mart a dimension with
     two versions to attribute against, which cases 25 and 26 are about.
     """
-    return build_staging(
-        spark, tmp_path_factory.mktemp("clean"),
+    return build_landed(
+        tmp_path_factory.mktemp("clean"),
         cost_centre_move=True, account_move=True,
     )
 
 
 @pytest.fixture(scope="session")
-def unbalanced_staging(spark, tmp_path_factory) -> Staging:
+def unbalanced_staging(tmp_path_factory) -> Landed:
     """A ledger whose vouchers do not balance. Gate 3's red scenario."""
-    return build_staging(
-        spark, tmp_path_factory.mktemp("unbalanced"),
+    return build_landed(
+        tmp_path_factory.mktemp("unbalanced"),
         unbalanced_vouchers=True, cost_centre_move=True, account_move=True,
     )
 
@@ -321,7 +263,7 @@ class Build:
 
     landing: str
     mart: str
-    staging: Staging
+    landed: Landed
     result: subprocess.CompletedProcess
 
     @property
@@ -433,17 +375,17 @@ PLANTED_PERIOD = "2025-07"
 
 
 @pytest.fixture(scope="session")
-def ml_staging(spark, tmp_path_factory) -> Staging:
+def ml_staging(tmp_path_factory) -> Landed:
     """Three years of a clean ledger, built through to Parquet."""
-    return build_staging(spark, tmp_path_factory.mktemp("ml"), periods=ML_PERIODS)
+    return build_landed(tmp_path_factory.mktemp("ml"), periods=ML_PERIODS)
 
 
 @pytest.fixture(scope="session")
-def planted_staging(spark, tmp_path_factory) -> Staging:
+def planted_staging(tmp_path_factory) -> Landed:
     """Three years with both anomaly shapes planted, for the effect gate of
     docs/adr/0054."""
-    return build_staging(
-        spark, tmp_path_factory.mktemp("planted"), periods=ML_PERIODS,
+    return build_landed(
+        tmp_path_factory.mktemp("planted"), periods=ML_PERIODS,
         growing_account=True, long_tail_anomaly=True,
     )
 
@@ -478,14 +420,12 @@ def mart(request, db):
     landing = schema_for(request.node.nodeid, TEST_LANDING_SCHEMA)
     mart_schema = schema_for(request.node.nodeid, TEST_MART_SCHEMA)
 
-    def build(staging: Staging, mutate=None, dbt_args=None, command="build") -> Build:
-        mart_load.load_all(
-            staging_dir=staging.staging, raw_dir=staging.raw, schema=landing
-        )
+    def build(landed: Landed, mutate=None, dbt_args=None, command="build") -> Build:
+        mart_load.load_all(raw_dir=landed.raw, schema=landing)
         if mutate is not None:
             mutate(db, landing)
         result = run_dbt([command, *(dbt_args or [])], landing, mart_schema)
-        return Build(landing=landing, mart=mart_schema, staging=staging, result=result)
+        return Build(landing=landing, mart=mart_schema, landed=landed, result=result)
 
     yield build
 

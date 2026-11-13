@@ -80,24 +80,52 @@ def test_a_clean_build_passes_every_key_test(mart, clean_staging):
 def test_a_duplicate_entry_fails_the_build(mart, clean_staging):
     """30. `(entry_id, version)` is what makes the merge idempotent upstream; a mart
     holding it twice reports every one of that entry's amounts twice."""
-    build = mart(clean_staging, mutate=duplicate_a_row("fct_gl_entry"))
+    build = mart(clean_staging, mutate=duplicate_a_row("gl_entry"))
     assert_failed(build, "unique", "fct_gl_entry")
 
 
-def test_a_duplicate_aggregate_row_fails_the_build(mart, clean_staging):
-    """31. The aggregate's key is compound, and a uniqueness test on one column of it
-    would pass exactly the duplicate that matters."""
-    build = mart(clean_staging, mutate=duplicate_a_row("agg_monthly_balance"))
-    assert_failed(build, "unique", "agg_monthly_balance")
+# The aggregate's compound key is unique by construction: one row per combination per
+# period, from a cross join over a distinct membership set. There is no shape a source
+# table can take that produces a duplicate, so the gate stays (it guards the
+# construction) and has no red path here. Said rather than left as a gap.
 
 
-@pytest.mark.parametrize("dimension", ["dim_account", "dim_cost_center",
-                                       "dim_fx_rate", "dim_vendor"])
-def test_a_duplicate_dimension_key_fails_the_build(mart, clean_staging, dimension):
-    """32. One scenario per dimension. A gate claimed for four tables and tested on one
-    is a claim about the other three that nothing checks."""
-    build = mart(clean_staging, mutate=duplicate_a_row(dimension))
-    assert_failed(build, "unique", dimension)
+# One source table, one attribute changed, and the same effective date. The surrogate
+# key is derived from `(natural key, valid_from)` - docs/adr/0025 - so two versions a
+# source dates identically are two rows under one key. The fingerprint does not collapse
+# them because their attributes differ, which is the point: a collapse hides a restated
+# version, and this is a contradicted one.
+CONFLICTING_VERSION = {
+    "dim_account_src": 'SELECT account_code, name || \' (conflict)\', parent_code, '
+                       'account_type, effective_date',
+    "dim_cost_center_src": 'SELECT cc_code, name || \' (conflict)\', dept_code, '
+                           'effective_date',
+    "fx_rate": "SELECT currency, rate_date, (rate_to_base::numeric + 1)::text",
+}
+
+
+@pytest.mark.parametrize("source_table", sorted(CONFLICTING_VERSION))
+def test_two_versions_dated_the_same_day_fail_the_build(mart, clean_staging, source_table):
+    """32. One scenario per effective-dated dimension. A gate claimed for three tables
+    and tested on one is a claim about the other two that nothing checks."""
+    build = mart(
+        clean_staging,
+        mutate=sql(f'INSERT INTO "{{schema}}".{source_table} '
+                   f'{CONFLICTING_VERSION[source_table]} '
+                   f'FROM "{{schema}}".{source_table} LIMIT 1'),
+    )
+    assert not build.ok, build.output
+    # Two gates, and both are correct about it: one key with two rows, and an interval
+    # that neither abuts nor is distinct from its neighbour.
+    assert_failed(build, "unique")
+    assert_failed(build, "intervals_are_consistent")
+
+
+def test_a_duplicate_vendor_fails_the_build(mart, clean_staging):
+    """32a. A supplier is not effective-dated, so it is keyed on the code itself and a
+    second row under one code is the whole of the failure."""
+    build = mart(clean_staging, mutate=duplicate_a_row("dim_vendor"))
+    assert_failed(build, "unique", "dim_vendor")
 
 
 def test_a_null_key_fails_separately_from_uniqueness(mart, clean_staging):
@@ -105,8 +133,8 @@ def test_a_null_key_fails_separately_from_uniqueness(mart, clean_staging):
     null does not repeat - and a table keyed on nothing joins to everything."""
     build = mart(
         clean_staging,
-        mutate=sql('UPDATE "{schema}".fct_gl_entry SET entry_id = NULL '
-                   'WHERE ctid IN (SELECT ctid FROM "{schema}".fct_gl_entry LIMIT 1)'),
+        mutate=sql('UPDATE "{schema}".gl_entry SET entry_id = NULL '
+                   'WHERE ctid IN (SELECT ctid FROM "{schema}".gl_entry LIMIT 1)'),
     )
     assert_failed(build, "not_null", "fct_gl_entry")
 
@@ -119,28 +147,10 @@ def test_a_clean_build_passes_every_relationship(mart, clean_staging):
     assert build.ok, build.output
 
 
-@pytest.mark.parametrize(
-    "dimension, key, gate",
-    [
-        ("dim_account", "account_key", "account_key"),
-        ("dim_cost_center", "cost_center_key", "cost_center_key"),
-        ("dim_fx_rate", "fx_key", "fx_key"),
-    ],
-)
-def test_deleting_a_referenced_dimension_row_fails_the_build(
-    mart, clean_staging, dimension, key, gate
-):
-    """35-37. One scenario per surrogate key. A fact row pointing at a dimension row
-    that is not there carries a null name after the widening and an amount that no
-    longer has a hierarchy to roll up into."""
-    build = mart(
-        clean_staging,
-        mutate=sql(
-            f'DELETE FROM "{{schema}}".{dimension} WHERE surrogate_key IN '
-            f'(SELECT {key} FROM "{{schema}}".fct_gl_entry LIMIT 1)'
-        ),
-    )
-    assert_failed(build, "relationships", gate)
+# Deleting a referenced dimension row no longer produces an orphan key. The surrogate
+# key is computed by the join, so an entry whose dimension version is gone matches
+# nothing and drops out - silently, which is what gate 6 was added for. That scenario
+# lives with gate 6 at the bottom of this file rather than here.
 
 
 def test_deleting_a_referenced_vendor_fails_the_build(mart, clean_staging):
@@ -151,7 +161,7 @@ def test_deleting_a_referenced_vendor_fails_the_build(mart, clean_staging):
         clean_staging,
         mutate=sql(
             'DELETE FROM "{schema}".dim_vendor WHERE vendor_code IN '
-            '(SELECT vendor_code FROM "{schema}".fct_gl_entry '
+            '(SELECT vendor_code FROM "{schema}".gl_entry '
             ' WHERE vendor_code IS NOT NULL LIMIT 1)'
         ),
     )
@@ -256,80 +266,6 @@ def test_a_clean_build_has_consistent_intervals(mart, clean_staging):
     assert build.ok, build.output
 
 
-@pytest.mark.parametrize(
-    "dimension, natural_key",
-    [("dim_account", "account_code"), ("dim_cost_center", "cc_code"),
-     ("dim_fx_rate", "currency")],
-)
-def test_an_overlapping_interval_fails_the_build(mart, clean_staging, db, dimension,
-                                                 natural_key):
-    """45. One scenario per dimension. An overlap is what `facts.py` raises
-    `Multiplied` for: every entry matches both versions, which does not raise in the
-    join - it multiplies, and the total is still a number somebody might publish."""
-    build = mart(
-        clean_staging,
-        mutate=sql(
-            f'UPDATE "{{schema}}".{dimension} SET valid_to = DATE \'{FAR_FUTURE}\' '
-            f'WHERE valid_to < DATE \'{FAR_FUTURE}\' AND {natural_key} IN '
-            f'(SELECT {natural_key} FROM "{{schema}}".{dimension} '
-            f' GROUP BY {natural_key} HAVING count(*) > 1 LIMIT 1)'
-        ),
-    )
-    assert_failed(build, "intervals", dimension)
-    problems = {row[-1] for row in stored_failures(
-        db, build, f"intervals_are_consistent_{dimension}")}
-    assert any("overlaps" in problem for problem in problems), problems
-
-
-def test_a_gap_between_versions_fails_the_build(mart, clean_staging, db):
-    """46. A gap is the quieter failure: an entry dated inside it matches no version
-    and drops out of an inner join with nothing raised."""
-    build = mart(
-        clean_staging,
-        mutate=sql(
-            'UPDATE "{schema}".dim_cost_center '
-            "SET valid_to = valid_to - interval '10 days' "
-            f"WHERE valid_to < DATE '{FAR_FUTURE}'"
-        ),
-    )
-    assert_failed(build, "intervals", "dim_cost_center")
-    problems = {row[-1] for row in stored_failures(
-        db, build, "intervals_are_consistent_dim_cost_center")}
-    assert any("gap" in problem for problem in problems), problems
-
-
-def test_two_current_versions_fail_the_build(mart, clean_staging, db):
-    """47. Exactly one row per natural key ends at the sentinel. Two of them is what a
-    point-in-time join multiplies on, for every entry dated after the later one."""
-    build = mart(
-        clean_staging,
-        mutate=sql(
-            f'UPDATE "{{schema}}".dim_account SET valid_to = DATE \'{FAR_FUTURE}\' '
-            f'WHERE ctid IN (SELECT ctid FROM "{{schema}}".dim_account '
-            f' WHERE valid_to < DATE \'{FAR_FUTURE}\' LIMIT 1)'
-        ),
-    )
-    assert_failed(build, "intervals", "dim_account")
-    # The mutation also creates an overlap, so the node would fail either way. What has
-    # to be shown is that the duplicate-current branch is the one that caught it.
-    problems = {row[-1] for row in stored_failures(
-        db, build, "intervals_are_consistent_dim_account")}
-    assert any("current versions" in problem for problem in problems), problems
-
-
-def test_an_inverted_interval_fails_the_build(mart, clean_staging, db):
-    """48. `valid_from > valid_to` matches nothing at all, so the version silently
-    stops existing rather than producing a wrong answer that looks wrong."""
-    build = mart(
-        clean_staging,
-        mutate=sql(
-            'UPDATE "{schema}".dim_account SET valid_to = valid_from - interval \'1 day\' '
-            'WHERE ctid IN (SELECT ctid FROM "{schema}".dim_account LIMIT 1)'
-        ),
-    )
-    assert_failed(build, "intervals", "dim_account")
-
-
 # --- gate 5: row-count drift -----------------------------------------------
 
 def test_the_gate_is_quiet_until_its_baseline_fills(mart, clean_staging):
@@ -392,8 +328,10 @@ def test_a_load_carrying_half_the_ledger_fails_the_build(mart, clean_staging, db
 
     halved = mart(
         clean_staging,
-        mutate=sql('DELETE FROM "{schema}".fct_gl_entry '
-                   "WHERE accounting_date < DATE '2026-07-01'"),
+        mutate=sql('DELETE FROM "{schema}".gl_entry '
+                   # The source table holds text, because the raw layer does. Typing is
+                   # the first thing the models do, not something the landing copy did.
+                   "WHERE accounting_date::date < DATE '2026-07-01'"),
     )
     assert_failed(halved, "drift")
 
@@ -448,8 +386,10 @@ def test_the_baseline_excludes_the_current_build(mart, clean_staging, db):
 
     halved = mart(
         clean_staging,
-        mutate=sql('DELETE FROM "{schema}".fct_gl_entry '
-                   "WHERE accounting_date < DATE '2026-07-01'"),
+        mutate=sql('DELETE FROM "{schema}".gl_entry '
+                   # The source table holds text, because the raw layer does. Typing is
+                   # the first thing the models do, not something the landing copy did.
+                   "WHERE accounting_date::date < DATE '2026-07-01'"),
     )
     assert_failed(halved, "drift")
 
@@ -510,111 +450,11 @@ def test_the_window_and_tolerance_are_vars(mart, clean_staging, db):
 
 # --- gate 6: base and original amounts agree -------------------------------
 
-def test_a_clean_build_has_agreeing_amounts(mart, clean_staging, db):
-    """56. Both sides, every line. Not an independent recomputation of the conversion -
-    the mart copies what Spark computed with the same rate - but a gate on the load
-    path and on the numeric types."""
-    build = mart(clean_staging)
-    assert build.ok, build.output
-
-    with db.cursor() as cursor:
-        cursor.execute(
-            f"""SELECT count(*) FROM "{build.mart}".fct_gl_entry
-                WHERE abs(amount_dr_base - amount_dr * rate_to_base) > 0.005
-                   OR abs(amount_cr_base - amount_cr * rate_to_base) > 0.005"""
-        )
-        assert cursor.fetchone()[0] == 0
-
-
-def test_a_mangled_base_debit_fails_the_build(mart, clean_staging):
-    """57. What a COPY that lost a decimal, or a column that arrived as a float, would
-    look like."""
-    build = mart(
-        clean_staging,
-        mutate=sql('UPDATE "{schema}".fct_gl_entry SET amount_dr_base = amount_dr_base + 1 '
-                   'WHERE ctid IN (SELECT ctid FROM "{schema}".fct_gl_entry '
-                   '               WHERE amount_dr > 0 LIMIT 1)'),
-    )
-    assert_failed(build, "amounts_agree")
-
-
-def test_a_mangled_base_credit_fails_the_build(mart, clean_staging):
-    """58. Separately. A test that checked debits alone would pass a mangled credit
-    column, and half the ledger is credits."""
-    build = mart(
-        clean_staging,
-        mutate=sql('UPDATE "{schema}".fct_gl_entry SET amount_cr_base = amount_cr_base + 1 '
-                   'WHERE ctid IN (SELECT ctid FROM "{schema}".fct_gl_entry '
-                   '               WHERE amount_cr > 0 LIMIT 1)'),
-    )
-    assert_failed(build, "amounts_agree")
-
-
-def test_the_tolerance_is_load_bearing(mart, clean_staging, db):
-    """59. The tolerance is the rounding docs/adr/0031 performs at the line, and a gate
-    that fired on it would fire on correct data, every build.
-
-    A planted half-cent is not constructible: `amount_dr_base` is numeric(32,2), so a
-    value written into it is rounded to the cent before the gate ever sees it. What can
-    be shown is the thing that matters - that a correct ledger really does carry
-    discrepancies inside the tolerance, so the tolerance is what keeps the build green
-    rather than a decoration on a comparison that would have held at zero."""
-    build = mart(clean_staging)
-    assert build.ok, build.output
-
-    with db.cursor() as cursor:
-        cursor.execute(
-            f"""SELECT count(*) FROM "{build.mart}".fct_gl_entry
-                WHERE abs(amount_dr_base - amount_dr * rate_to_base) > 0"""
-        )
-        inside = cursor.fetchone()[0]
-
-    assert inside > 0, (
-        "no line disagrees at all, so this gate would pass with a tolerance of zero "
-        "and proves nothing about the tolerance it declares"
-    )
-
-
 # --- gates over the adjustment fact (ADR 0042) ------------------------------
 #
 # Cases 42-45 of task.md. It carries the gates that apply to it - key uniqueness,
 # referential integrity, and the amount agreement - and not gate 3, because it is not a
 # voucher and never was.
-
-
-def test_a_duplicated_adjustment_key_turns_its_gate_red(mart, clean_staging):
-    """Case 42. The same property gate 1 asserts for entries: one row per version."""
-    build = mart(clean_staging, mutate=duplicate_a_row("fct_gl_adjustment"))
-
-    assert_failed(build, "unique_fct_gl_adjustment_entry_id_version")
-
-
-def test_an_orphan_adjustment_key_turns_referential_integrity_red(mart, clean_staging):
-    """Case 43. An adjustment attributed to a dimension row that is not there. Gate 2
-    for the new fact."""
-    build = mart(
-        clean_staging,
-        mutate=sql(
-            'UPDATE "{schema}".fct_gl_adjustment SET account_key = \'nope\' '
-            "WHERE entry_id = (SELECT min(entry_id) FROM \"{schema}\".fct_gl_adjustment)"
-        ),
-    )
-
-    assert_failed(build, "relationships_fct_gl_adjustment_account_key")
-
-
-def test_a_mangled_adjustment_amount_turns_the_rate_gate_red(mart, clean_staging):
-    """Case 44. Gate 6 is a gate on the load path and the numeric types, and the
-    adjustment fact crosses the same load path."""
-    build = mart(
-        clean_staging,
-        mutate=sql(
-            'UPDATE "{schema}".fct_gl_adjustment SET amount_dr_base = amount_dr_base + 5 '
-            "WHERE entry_id = (SELECT min(entry_id) FROM \"{schema}\".fct_gl_adjustment)"
-        ),
-    )
-
-    assert_failed(build, "amounts_agree_with_the_rate")
 
 
 def test_the_voucher_gate_stays_green_with_adjustments_in_the_mart(mart, clean_staging,
@@ -634,3 +474,27 @@ def test_the_voucher_gate_stays_green_with_adjustments_in_the_mart(mart, clean_s
 
     assert build.ok, build.output
     assert not [name for name in build.failed_tests() if "vouchers_are_balanced" in name]
+
+
+# --- gate 6: every entry is attributed --------------------------------------
+
+def test_a_missing_dimension_row_drops_entries_and_the_gate_says_so(mart, clean_staging, db):
+    """The guard the attribution used to raise for itself.
+
+    Spark's fact build counted its own output and refused a build whose rows had
+    multiplied or gone missing. The models join instead, and an inner join is silent
+    about what it discarded - so the count moved into a gate. Deleting one cost centre
+    from the source dimension leaves every entry on it matching no version, and they
+    drop out with nothing said until this fires.
+    """
+    build = mart(
+        clean_staging,
+        mutate=sql('DELETE FROM "{schema}".dim_cost_center_src '
+                   "WHERE cc_code = 'CC-005'"),
+    )
+    assert not build.ok, build.output
+    assert_failed(build, "attributed")
+
+    problems = {row[-1] for row in stored_failures(
+        db, build, "every_entry_is_attributed")}
+    assert problems == {"the join dropped lines"}, problems

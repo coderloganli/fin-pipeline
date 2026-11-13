@@ -18,10 +18,10 @@ from conftest import (TEST_PERIODS, TEST_LANDING_SCHEMA, TEST_MART_SCHEMA,
 from ingest import affected, contracts, raw, runs
 from pipeline import run as runner
 from pipeline import steps as step_list
-from test_mart_load import row_count, table_checksum
+from conftest import row_count, table_checksum
 from test_mart_promotion import RESERVE as BUILD_RESERVE, baseline
 from transform import promote
-from transform.spark import balances
+from transform import periods as period_math
 
 pytestmark = pytest.mark.db
 
@@ -36,10 +36,10 @@ PROVENANCE = ("source_first_run_id", "source_last_run_id")
 
 
 @pytest.fixture
-def daily(request, db, spark, tmp_path_factory):
+def daily(request, db, tmp_path_factory):
     """A context pointed at a generated source and at schemas of this test's own."""
-    from generator import generate
-    from generator.config import Config
+    from eval.generator import generate
+    from eval.generator.config import Config
 
     root = tmp_path_factory.mktemp("daily")
     source = root / "source"
@@ -54,11 +54,9 @@ def daily(request, db, spark, tmp_path_factory):
     context = runner.Context(
         source_dir=source,
         raw_dir=root / "raw",
-        staging_dir=root / "staging",
         periods=TEST_PERIODS,
         landing_schema=landing,
         mart_schema=mart,
-        spark=spark,
     )
 
     yield context
@@ -77,14 +75,6 @@ def mart_state(db, schema):
 def detail_of(record, step):
     return next(one.detail for one in record.steps if one.step == step)
 
-
-def staging_mtimes(staging_dir, model):
-    found = {}
-    for directory in sorted((staging_dir / model).glob("accounting_period=*")):
-        found[directory.name.split("=", 1)[1]] = max(
-            path.stat().st_mtime_ns for path in directory.iterdir() if path.is_file()
-        )
-    return found
 
 
 # --- the acceptance criteria -----------------------------------------------
@@ -106,107 +96,98 @@ def test_the_same_run_three_times_changes_nothing(db, daily):
 
         assert record.run_id == run_id
         assert record.status == "succeeded"
-        assert detail_of(record, "recompute")["periods"] == []
         assert mart_state(db, daily.mart_schema) == after_first
 
 
-def test_a_backdated_adjustment_rewrites_only_what_it_affects(db, daily):
-    """Case 30. The backlog entry's second criterion.
+def test_a_backdated_adjustment_reaches_only_the_month_it_affects(db, daily):
+    """A correction booked into a closed period has to change that period's balance and
+    leave every other period's alone.
 
-    Two different sets, asserted separately, because conflating them is how this test
-    would silently check the wrong thing. `transform.backfill.run` returns the dirty set
-    *before* the rolling-window closure and that is what `recompute` records, so the
-    facts see only the entry's own period. `balances.build` applies `dirty_closure`
-    itself when it chooses partitions, so the aggregate legitimately rewrites more.
-    See docs/adr/0040 and 0041.
+    Asserted on the figures rather than on which files were rewritten. The mart is
+    rebuilt whole each run now, so "what was rewritten" says nothing; what the ledger
+    means is still exactly as narrow as it was. The closure matters to the comparison
+    columns, not to the balance itself: the corrected month moves, and so do the months
+    whose month-on-month, rolling and year-on-year figures read through it.
     """
     runner.run_pipeline(daily, command="daily", steps=step_list.DAILY)
 
-    # An account and cost centre the ledger already posts to: a pairing seen for the
-    # first time changes the dense grid's membership and correctly rewrites every
-    # period - docs/adr/0041 - which would make this assert the wrong thing.
-    from transform.spark import facts as fact_build
-    existing = next(row for row in fact_build.read(daily.spark, daily.staging_dir)
-                    if row["accounting_period"] < "2026-06")
+    # An account and cost centre the ledger already posts to, so the correction lands on
+    # a combination that already has a row in every period.
+    with db.cursor() as cursor:
+        cursor.execute(
+            f'SELECT account_code, cost_center_code, entry_id FROM '
+            f'"{daily.mart_schema}".fct_gl_entry '
+            f"WHERE accounting_period < '2026-06' LIMIT 1"
+        )
+        account, centre, entry_id = cursor.fetchone()
+
+    def balances_by_period():
+        with db.cursor() as cursor:
+            cursor.execute(
+                f'SELECT accounting_period, balance_as_reported FROM '
+                f'"{daily.mart_schema}".agg_monthly_balance '
+                f"WHERE account_code = %s AND cost_center_code = %s",
+                (account, centre),
+            )
+            return dict(cursor.fetchall())
+
+    before = balances_by_period()
+
     late = {
         "entry_id": "A-LATE-000001", "version": "1",
-        "adjusts_entry_id": existing["entry_id"], "adjustment_type": "correction",
+        "adjusts_entry_id": entry_id, "adjustment_type": "correction",
         "accounting_date": "2026-06-15", "posted_at": "2026-12-20",
-        "account_code": existing["account_code"],
-        "cost_center_code": existing["cost_center_code"],
+        "account_code": account, "cost_center_code": centre,
         "currency": "CNY", "amount_dr": "1000.00", "amount_cr": "0.00",
         "doc_id": "D-LATE-000001", "vendor_code": "", "description": "Late correction",
     }
     append_source_row(daily.source_dir, GL_ADJUSTMENT, late)
 
-    before_facts = staging_mtimes(daily.staging_dir, "fct_gl_adjustment")
-    before_entries = staging_mtimes(daily.staging_dir, "fct_gl_entry")
-    before_balances = staging_mtimes(daily.staging_dir, "agg_monthly_balance")
-
     runner.run_pipeline(daily, command="daily", steps=step_list.DAILY)
     record = runs.RunLog(daily.raw_dir).read()[-1]
+    assert record.status == "succeeded"
 
-    # The fact periods: the adjustment's own accounting period, and nothing else.
-    assert set(detail_of(record, "recompute")["periods"]) == {"2026-06"}
+    after = balances_by_period()
+    assert after["2026-06"] != before["2026-06"], "the corrected month did not move"
+    moved = {period for period in before if after[period] != before[period]}
+    assert moved == {"2026-06"}, f"other periods moved too: {sorted(moved - {'2026-06'})}"
 
-    for model, before in (("fct_gl_adjustment", before_facts),
-                          ("fct_gl_entry", before_entries)):
-        after = staging_mtimes(daily.staging_dir, model)
-        for period, when in before.items():
-            if period != "2026-06":
-                assert after[period] == when, f"{model} {period} was rewritten"
-    # And the affected one actually was written. Without this the assertions above are
-    # satisfied by a run that did nothing at all, which is the failure this test would
-    # otherwise be blind to. It is a creation rather than a rewrite when the generated
-    # ledger carried no adjustment in that period, so both count.
-    after_adjustments = staging_mtimes(daily.staging_dir, "fct_gl_adjustment")
-    assert "2026-06" in after_adjustments, "the affected period was not written"
-    assert after_adjustments["2026-06"] != before_facts.get("2026-06"), (
-        "the affected period was not rebuilt")
-
-    # The balance partitions: that period and the ones whose windows read through it,
-    # computed from the rule rather than hard-coded.
-    closure = balances.dirty_closure({"2026-06"}, last_period="2026-12")
-    assert len(closure) > 1, "the closure should reach past the dirty period itself"
-    after_balances = staging_mtimes(daily.staging_dir, "agg_monthly_balance")
-    for period, when in before_balances.items():
-        if period not in closure:
-            assert after_balances[period] == when, (
-                f"agg_monthly_balance {period} is outside the closure and was rewritten")
-    assert after_balances["2026-06"] != before_balances["2026-06"]
+    # And the affected-period set named it, which is what `judge` reads to decide what
+    # to re-judge.
+    assert "2026-06" in detail_of(record, "clear-affected")["periods"]
 
 
 def test_a_run_that_died_says_which_step_it_died_in(db, daily, monkeypatch, capsys):
     """Case 31. The criterion this task was opened for.
 
-    Nothing is asserted about the mart. That assertion would be true - `recompute` runs
-    before `mart-load`, so nothing had written to it yet - but it would be true because
+    Nothing is asserted about the mart. That assertion would be true - `mart-load` runs
+    before `dbt-build`, so nothing had written to it yet - but it would be true because
     of the ordering rather than because failure is handled well, and a reader would take
-    it for a general property. There is no general property to take: docs/adr/0034 says
-    a failed `dbt build` leaves the rows it wrote in the mart until the next successful
-    build, which is what `swap-the-mart-into-place` exists for.
+    it for a general property. There is no general property to take: a failed `dbt build`
+    leaves the rows it wrote in its own build schema until the next successful build,
+    which is what promotion by rename exists for.
     """
-    from transform import backfill
+    from transform import load as mart_load
 
     def explode(*args, **kwargs):
-        raise RuntimeError("no such period 2026-13")
+        raise RuntimeError("no such table gl_entry_13")
 
-    monkeypatch.setattr(backfill, "run", explode)
+    monkeypatch.setattr(mart_load, "load_all", explode)
 
     with pytest.raises(RuntimeError):
         runner.run_pipeline(daily, command="daily", steps=step_list.DAILY)
 
     record = runs.RunLog(daily.raw_dir).read()[-1]
     assert record.status == "failed"
-    assert record.failed_step == "recompute"
-    assert "no such period 2026-13" in record.error
+    assert record.failed_step == "mart-load"
+    assert "no such table gl_entry_13" in record.error
     assert [step.status for step in record.steps
             if step.step in ("validate", "load")] == ["succeeded", "succeeded"]
     assert detail_of(record, "load")["tables"], "the load recorded nothing it did"
 
     assert runs.main(["--raw", str(daily.raw_dir), "--run", record.run_id]) == 0
     printed = capsys.readouterr().out
-    assert "recompute" in printed and "no such period 2026-13" in printed
+    assert "mart-load" in printed and "no such table gl_entry_13" in printed
 
 
 def test_a_failed_dbt_build_leaves_the_periods_owed(db, daily, monkeypatch):
@@ -227,10 +208,14 @@ def test_a_failed_dbt_build_leaves_the_periods_owed(db, daily, monkeypatch):
     owed = affected.read(daily.raw_dir)
     assert not owed.is_empty(), "the affected-period set was cleared before the mart"
 
+    # The next run over the same source has to see the debt and clear it, which is what
+    # `clear-affected` records. Before promotion by rename this was the step whose
+    # failure would have lost the work.
     monkeypatch.undo()
     runner.run_pipeline(daily, command="daily", steps=step_list.DAILY)
-    rebuilt = detail_of(runs.RunLog(daily.raw_dir).read()[-1], "recompute")["periods"]
-    assert set(rebuilt) >= set(owed.periods)
+    cleared = detail_of(runs.RunLog(daily.raw_dir).read()[-1], "clear-affected")["periods"]
+    assert set(cleared) >= set(owed.periods)
+    assert affected.read(daily.raw_dir).is_empty()
 
 
 def test_a_killed_run_is_reported_as_interrupted(daily):

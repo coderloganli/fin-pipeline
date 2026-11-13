@@ -1,5 +1,10 @@
 # Spark session ownership is held, not inferred
 
+> **Superseded (2026-10-04).** No session, no ownership. Spark was removed; the
+> transformations are SQL that dbt runs against a connection. The reasoning is worth
+> keeping for what it is about rather than for what it configured: ownership of a
+> resource is declared, never inferred from having asked for it.
+
 ## Context
 
 `transform/spark/session.py` builds the local SparkSession, and four commands can each be

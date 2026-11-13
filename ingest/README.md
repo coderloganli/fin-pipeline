@@ -12,9 +12,9 @@ Lands source extracts into the raw layer and keeps the load replayable.
   2 for a usage error. `--table` scopes the run to named tables and `--max-findings`
   sets how many findings each table collects before the rest are only counted.
 
-  A failure states that the downstream impact is unknown. Naming the models that would
-  break needs a lineage graph, and dbt has not landed — so the gap is reported rather
-  than left silent. See `docs/adr/0012-the-validator-reports-rather-than-raises.md`.
+  A failure names the dbt models the change would break, read off the lineage graph
+  from the source each contract declares it feeds. See
+  `docs/adr/0035-a-contract-names-the-dbt-source-it-feeds.md`.
 - **Watermarked incremental load.** Each contract names the column its table advances
   on. `gl_entry` and `gl_adjustment` advance on `posted_at` — the source has no
   `updated_at`, and `posted_at` is already the column that says when a row landed. A

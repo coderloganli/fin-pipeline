@@ -250,7 +250,7 @@ class RunLog:
     def step_started(self, run_id: str, step: str) -> None:
         """A step is about to run.
 
-        No attempt number is written. The writer cannot know it - an Airflow task
+        No attempt number is written. The writer cannot know it - a retried step
         retried in a new process has no idea it is the second try, and one that guessed
         would write a second attempt 1. `read` counts the attempts it has already folded
         for that step, which is a number the log actually establishes.

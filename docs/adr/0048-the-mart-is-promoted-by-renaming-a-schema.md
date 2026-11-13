@@ -11,7 +11,7 @@ tests over them, so a gate that goes red does so after the table it guards has b
 written. `dbt build` stops there and exits non-zero, but the mart schema is holding the
 figures that failed the gate until the next successful build replaces them.
 
-The six gates are not the problem. They catch what they were built to catch, and
+The five gates are not the problem. They catch what they were built to catch, and
 `tests/test_mart_gates.py` proves each of them can turn red. What is missing is that
 catching a failure and publishing it are not, today, mutually exclusive.
 

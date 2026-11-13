@@ -1,5 +1,12 @@
 # The orchestration logic is a Python package; the DAG is a declaration
 
+> **Partly superseded (2026-10-03).** The DAG files this record contrasts itself with were
+> removed. What it decided still holds and is still what the code does: the order, the
+> stop-on-failure rule, the run record and the clearing of the affected-period set live in
+> `pipeline/`, which `pytest -q` exercises directly - so the scheduler became a cron entry
+> and not one step changed. `finalise`, which existed only for a DAG's ALL_DONE close
+> task, went with them.
+
 summary: Sequencing, stop-on-failure, the run record and the clearing of the
 affected-period set live in `pipeline/`, which `pytest -q` exercises directly; the files
 under `dags/` declare the schedule and the task graph and import nothing below

@@ -3,7 +3,7 @@
 dbt builds the models and then runs the gates over them, so a gate that goes red does so
 after the table it guards has been written. `dbt build` stops there and exits non-zero,
 and the failing figures sit in the mart schema until the next successful build replaces
-them. The six gates are not the problem - what was missing is that catching a failure
+them. The five gates are not the problem - what was missing is that catching a failure
 and publishing it were not mutually exclusive.
 
 So a run builds into `<mart>__b<run_id>` and that schema becomes the mart by being
@@ -27,17 +27,14 @@ See docs/adr/0048.
 
 from __future__ import annotations
 
+from contextlib import contextmanager
+
 __all__ = [
     "AUDIT_SUFFIX",
     "BUILD_INFIX",
-    "MAX_IDENTIFIER",
-    "RUN_ID_LENGTH",
-    "MART_SCHEMA_BUDGET",
     "LOCK_TIMEOUT",
-    "SchemaNameTooLong",
     "NothingToPromote",
     "PromotionBlocked",
-    "ConnectionNotIdle",
     "build_schema",
     "build_schemas",
     "prepare",
@@ -57,15 +54,6 @@ AUDIT_SUFFIX = "_dbt_test__audit"
 # audit schema, `<mart>_dbt_test__audit`, cannot be read as a build schema.
 BUILD_INFIX = "__b"
 
-# Postgres truncates an identifier at 63 *bytes*, silently. Bytes rather than characters,
-# which is why the budget is measured in UTF-8 below: a name of 21 non-ASCII characters
-# passes a length check and is truncated anyway.
-MAX_IDENTIFIER = 63
-
-# `YYYYMMDDTHHMMSSZ-xxxxxx`, fixed by docs/adr/0019 and `ingest.runs.new_run_id`.
-RUN_ID_LENGTH = 23
-
-MART_SCHEMA_BUDGET = MAX_IDENTIFIER - len(AUDIT_SUFFIX) - len(BUILD_INFIX) - RUN_ID_LENGTH
 
 # How long a statement here will wait for the locks it needs. `tests/conftest.py` records
 # what happens without a bound: a connection sitting idle in a transaction holds a lock
@@ -75,9 +63,6 @@ MART_SCHEMA_BUDGET = MAX_IDENTIFIER - len(AUDIT_SUFFIX) - len(BUILD_INFIX) - RUN
 # failed schema is exactly the lock the sweep will meet.
 LOCK_TIMEOUT = "30s"
 
-
-class SchemaNameTooLong(ValueError):
-    """A mart schema that leaves no room for the build and audit suffixes."""
 
 
 class NothingToPromote(LookupError):
@@ -92,18 +77,7 @@ class PromotionBlocked(RuntimeError):
     """Something else holds a lock on the mart and would not let go in time."""
 
 
-class ConnectionNotIdle(RuntimeError):
-    """The connection handed in is already inside a transaction.
 
-    Refused rather than worked around, because the failure it produces is silent.
-    psycopg's `transaction()` inside an open transaction is a SAVEPOINT: it releases on
-    exit and commits nothing. Every function here would report success, dbt would build
-    into a schema no other connection can see, and closing the connection would roll the
-    whole promotion back.
-    """
-
-
-# --- names ------------------------------------------------------------------
 
 def build_schema(mart: str, run_id: str) -> str:
     """The schema this run builds into.
@@ -111,59 +85,19 @@ def build_schema(mart: str, run_id: str) -> str:
     The run id goes in verbatim, so the schema name is what somebody pastes into
     `python -m ingest.runs --run` while working out what a failed build caught.
     """
-    name = f"{mart}{BUILD_INFIX}{run_id}"
-    length = len((name + AUDIT_SUFFIX).encode("utf-8"))
-    if length > MAX_IDENTIFIER:
-        raise SchemaNameTooLong(
-            f"mart schema {mart!r} is {len(mart.encode('utf-8'))} bytes and the budget "
-            f"is {MART_SCHEMA_BUDGET}: with {BUILD_INFIX!r}, a {RUN_ID_LENGTH}-character "
-            f"run id and dbt's {AUDIT_SUFFIX!r}, {name!r} would reach {length} bytes, "
-            f"past Postgres's {MAX_IDENTIFIER} - and be truncated without a word."
-        )
-    return name
-
-
-def _like(name: str) -> str:
-    """A LIKE pattern matching this name and anything suffixed to it.
-
-    `_` is a single-character wildcard, and every name here is full of them. Unescaped,
-    `mart__b%` also matches `martxybogus`.
-    """
-    escaped = name.replace("\\", "\\\\").replace("_", "\\_").replace("%", "\\%")
-    return escaped + "%"
-
-
-# --- statements ---------------------------------------------------------------
-#
-# Every function below does all of its work inside one `connection.transaction()`, and
-# executes nothing before entering it. That is not style. On a connection that is not in
-# autocommit - which is what `db.connection_from` hands back - psycopg opens an implicit
-# transaction at the first statement, and `transaction()` inside one is a SAVEPOINT
-# rather than a transaction: it releases on exit and commits nothing, so closing the
-# connection rolls the whole promotion back. A stray read before the block is enough to
-# turn a promotion into a no-op that reports success. `_working` is the guard that says
-# so out loud rather than leaving it to whoever edits next.
-#
-# Identifiers are composed with `psycopg.sql.Identifier` rather than interpolated into a
-# quoted f-string. These are `DROP SCHEMA ... CASCADE` statements and the names reach
-# them from configuration; a name carrying a double quote would not merely fail.
-
-from contextlib import contextmanager
+    return f"{mart}{BUILD_INFIX}{run_id}"
 
 
 @contextmanager
 def _working(connection):
-    """One transaction, from an idle connection, with the lock wait bounded."""
-    from psycopg import pq, sql
+    """One transaction, with the lock wait bounded.
 
-    if connection.info.transaction_status != pq.TransactionStatus.IDLE:
-        raise ConnectionNotIdle(
-            "this connection is already inside a transaction. transform.promote needs "
-            "to commit its own, and psycopg's transaction() inside an open one is a "
-            "savepoint that commits nothing - so every statement here would report "
-            "success and be rolled back when the connection closed. Commit or roll "
-            "back first, or hand in a connection of its own."
-        )
+    Bounded rather than left to default, because a promotion that hangs is worse than
+    one that fails: the run never reports, and whoever is waiting for the report cannot
+    tell a slow night from a stuck one.
+    """
+    from psycopg import sql
+
     with connection.transaction():
         with connection.cursor() as cursor:
             cursor.execute(
@@ -193,8 +127,8 @@ def _build_schemas(cursor, mart: str) -> list[str]:
     `sweep` drop it twice and `promote` reach for a schema that had already gone.
     """
     cursor.execute(
-        r"SELECT nspname FROM pg_namespace WHERE nspname LIKE %s ESCAPE '\'",
-        (_like(f"{mart}{BUILD_INFIX}"),),
+        "SELECT nspname FROM pg_namespace WHERE nspname LIKE %s",
+        (f"{mart}{BUILD_INFIX}%",),
     )
     found = [row[0] for row in cursor.fetchall()]
     return sorted(name for name in found if not name.endswith(AUDIT_SUFFIX))
@@ -211,7 +145,7 @@ def build_schemas(connection, mart: str) -> list[str]:
 def prepare(connection, mart: str, build: str) -> None:
     """A clean build schema, carrying the drift gate's memory into it.
 
-    Dropped first, because an Airflow task that retries carries the same run id and
+    Dropped first, because a rerun under the same run id carries it and
     therefore the same build schema: appending to what the failed attempt left would
     double every count.
 

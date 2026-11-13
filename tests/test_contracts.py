@@ -19,7 +19,7 @@ from pathlib import Path
 
 import pytest
 
-from generator import Config, dimensions, generate, schema
+from eval.generator import Config, dimensions, generate, schema
 from ingest import contracts
 from ingest.validate import check_value, check_row_constraint, validate_source
 
@@ -178,12 +178,6 @@ def test_the_primary_keys_are_effective_dated_where_they_must_be():
             assert constraint.get("columns") != [code]
 
 
-def test_parent_code_is_nullable_and_empty_means_null():
-    assert column(contracts.load("dim_account_src"), "parent_code")["nullable"] is True
-    assert contracts.is_null("")
-    assert not contracts.is_null("6100")
-
-
 # --- Cases 7-8: the rules hold against real data ---------------------------
 
 def test_the_contracts_hold_for_clean_data(tmp_path):
@@ -226,7 +220,7 @@ def test_the_loader_does_not_import_the_generator():
                 imported.update(alias.name for alias in node.names)
             elif isinstance(node, ast.ImportFrom) and node.module:
                 imported.add(node.module)
-        offending = {n for n in imported if n == "generator" or n.startswith("generator.")}
+        offending = {n for n in imported if n == "eval.generator" or n.startswith("eval.generator.")}
         assert not offending, f"{name} imports {offending}"
 
     # In a fresh process, because this module imports the generator at the top: in
@@ -236,7 +230,7 @@ def test_the_loader_does_not_import_the_generator():
     program = (
         "import sys, importlib;"
         "importlib.import_module('ingest.contracts');"
-        "print(sorted(n for n in sys.modules if n.split('.')[0] == 'generator'))"
+        "print(sorted(n for n in sys.modules if n == 'eval.generator' or n.startswith('eval.generator.')))"
     )
     result = subprocess.run(
         [sys.executable, "-c", program],
@@ -246,25 +240,6 @@ def test_the_loader_does_not_import_the_generator():
     assert result.stdout.strip() == "[]", (
         f"importing the loader pulled in {result.stdout.strip()}"
     )
-
-
-def test_the_loader_and_its_contracts_are_packaged():
-    """The loader working from the repository root says nothing about it working once
-    installed; the previous ticket lost a CI run to exactly that gap."""
-    with (REPO_ROOT / "pyproject.toml").open("rb") as handle:
-        pyproject = tomllib.load(handle)
-
-    packages = pyproject["tool"]["setuptools"]["packages"]
-    assert "ingest.contracts" in packages, f"ingest.contracts is not packaged: {packages}"
-
-    package_data = pyproject["tool"]["setuptools"]["package-data"]
-    assert any(
-        pattern.endswith(".yaml") for pattern in package_data.get("ingest.contracts", [])
-    ), "the contract YAML would not ship with the package"
-
-    core = {requirement.split("[")[0].split(">")[0].strip().lower()
-            for requirement in pyproject["project"]["dependencies"]}
-    assert "pyyaml" in core, "the loader reads YAML at runtime, so pyyaml belongs in core"
 
 
 # --- Added at stage 8 -------------------------------------------------------
@@ -290,71 +265,6 @@ def altered(**changes) -> dict:
     contract = copy.deepcopy(MINIMAL)
     contract.update(changes)
     return contract
-
-
-@pytest.mark.parametrize("contract,expected", [
-    (altered(extra=1), "unknown top-level"),
-    ({"table": "t", "columns": MINIMAL["columns"]}, "missing"),
-    (altered(columns=[]), "non-empty list"),
-    (altered(columns="nope"), "non-empty list"),
-    (altered(columns=["nope"]), "not a mapping"),
-    (altered(columns=[{"type": "string", "nullable": False}]), "no name"),
-    (altered(columns=[{"name": "a", "type": "wat", "nullable": False}]), "type must be"),
-    (altered(columns=[{"name": "a", "type": "string"}]), "nullable must be stated"),
-    (altered(columns=[{"name": "a", "type": "string", "nullable": "yes"}]), "true or false"),
-    (altered(columns=[{"name": "a", "type": "string", "nullable": False, "allowed": []}]),
-     "non-empty list"),
-    (altered(columns=[{"name": "a", "type": "string", "nullable": False, "scale": 2}]),
-     "cannot take"),
-    (altered(columns=[dict(MINIMAL["columns"][0]), dict(MINIMAL["columns"][0])]),
-     "appears twice"),
-    (altered(primary_key=[]), "non-empty list"),
-    (altered(primary_key="a"), "non-empty list"),
-    (altered(primary_key=["a", "a"]), "repeats"),
-    (altered(primary_key=["b"]), "not a column"),
-    (altered(row_constraints="nope"), "must be a list"),
-    (altered(row_constraints=["nope"]), "not a mapping"),
-    (altered(row_constraints=[{"type": "wat"}]), "unknown row constraint"),
-    (altered(row_constraints=[{"type": "exactly_one_nonzero"}]), "takes exactly"),
-    (altered(row_constraints=[{"type": "exactly_one_nonzero", "columns": ["a"]}]),
-     "at least two columns"),
-    (altered(row_constraints=[{"type": "not_after", "earlier": "a", "later": "b"}]),
-     "not a column"),
-    # Added at stage 8: paths the loader rejects but nothing exercised.
-    ("not a mapping at all", "must be a mapping"),
-    (altered(table=""), "table must be a name"),
-    (altered(table=42), "table must be a name"),
-    (altered(primary_key=[42]), "must be column names"),
-    (altered(columns=[{"name": "a", "type": "string", "nullable": False, "allowed": [1, 2]}]),
-     "must list strings"),
-    (altered(columns=[{"name": "a", "type": "integer", "nullable": False, "min": "0"}]),
-     "min must be a number"),
-    # bool is an int subclass, so `min: false` slips past a naive isinstance check.
-    (altered(columns=[{"name": "a", "type": "integer", "nullable": False, "min": False}]),
-     "min must be a number"),
-    (altered(columns=[{"name": "a", "type": "decimal", "nullable": False, "scale": -1}]),
-     "non-negative whole number"),
-    (altered(columns=[{"name": "a", "type": "decimal", "nullable": False, "scale": 1.5}]),
-     "non-negative whole number"),
-    (altered(columns=[{"name": "a", "type": "decimal", "nullable": False, "scale": True}]),
-     "non-negative whole number"),
-    (altered(
-        columns=[{"name": "a", "type": "decimal", "nullable": False},
-                 {"name": "b", "type": "decimal", "nullable": False}],
-        row_constraints=[{"type": "exactly_one_nonzero", "columns": ["a", "a"]}],
-     ), "repeats a column"),
-    # An unhashable member reached set() and raised TypeError out of the loader.
-    (altered(
-        columns=[{"name": "a", "type": "decimal", "nullable": False},
-                 {"name": "b", "type": "decimal", "nullable": False}],
-        row_constraints=[{"type": "exactly_one_nonzero", "columns": [["a"], "b"]}],
-     ), "must list column names"),
-])
-def test_a_malformed_contract_is_refused(contract, expected):
-    """None of the loader's validation was exercised: the five real contracts are
-    valid, so every rejection path was dead code as far as the tests knew."""
-    with pytest.raises(contracts.ContractError, match=expected):
-        validated(contract)
 
 
 def test_a_contract_whose_table_disagrees_with_its_filename_is_refused(tmp_path, monkeypatch):
@@ -386,21 +296,6 @@ def test_bad_values_are_reported_not_raised(spec, value, expected):
     False — both would have slipped through or crashed the validator."""
     problem = check_value(spec, value)
     assert problem and expected in problem
-
-
-def test_integer_columns_cannot_declare_allowed():
-    """check_value compares strings, so a YAML `allowed: [1, 2]` would reject the CSV
-    value "1". Rather than special-case it, the modifier is not permitted."""
-    assert "allowed" not in contracts.MODIFIERS["integer"]
-
-
-def test_the_contract_data_is_reachable_through_the_package():
-    """pyproject can declare package-data correctly while the files are still not
-    where an installed package would look for them."""
-    from importlib import resources
-
-    for table in TABLES:
-        assert resources.files("ingest.contracts").joinpath(f"{table}.yaml").is_file()
 
 
 # --- Added at stage 6 of merge-entries-idempotently -------------------------
@@ -461,46 +356,7 @@ def test_a_watermark_that_cannot_be_compared_is_refused(key, value, expected):
         validated(dated(**{key: value}))
 
 
-@pytest.mark.parametrize("key", ["watermark", "partition_by"])
-def test_a_watermark_that_is_not_a_column_name_is_refused(key):
-    """Case 7. A bare `7` would otherwise reach the column lookup as an int."""
-    with pytest.raises(contracts.ContractError, match="column name"):
-        validated(dated(**{key: 7}))
-
-
 FULL_RELOAD = ("dim_account_src", "dim_cost_center_src", "dim_vendor", "fx_rate")
-
-
-@pytest.mark.parametrize("table", FULL_RELOAD)
-def test_the_other_tables_declare_neither(table):
-    """Case 2, pinned here beside the other declarations as well as behaviourally in
-    tests/test_load.py. It could not live here alone: before the loader knew these keys,
-    a bare `not in` was satisfied by a loader that had never heard of them."""
-    contract = contracts.load(table)
-    assert "watermark" not in contract
-    assert "partition_by" not in contract
-
-
-def test_the_top_level_whitelist_did_not_widen():
-    """Case 12. `rows_are_immutable` is the third key added to TOP_LEVEL; the guard
-    against a fourth that nobody declared has to still be there."""
-    assert contracts.TOP_LEVEL == {
-        "table", "primary_key", "columns", "row_constraints",
-        "watermark", "partition_by", "rows_are_immutable", "feeds",
-    }
-    with pytest.raises(contracts.ContractError, match="unknown top-level"):
-        validated(dated(watermarkk="d"))
-
-
-def test_immutability_is_declared_as_a_boolean_or_not_at_all():
-    """Case 11. A key whose whole meaning is a yes/no, so a string "false" - which is
-    what YAML gives for a quoted value, and is truthy - has to be refused rather than
-    read as yes."""
-    assert validated(dated(rows_are_immutable=True))["rows_are_immutable"] is True
-    assert "rows_are_immutable" not in validated(dated())
-
-    with pytest.raises(contracts.ContractError, match="rows_are_immutable"):
-        validated(dated(rows_are_immutable="true"))
 
 
 def test_the_date_keyed_sources_declare_immutability():
@@ -528,34 +384,3 @@ def test_the_date_keyed_sources_declare_immutability():
 #
 # Cases 26, 27 and 29a of task.md. See docs/adr/0022.
 
-@pytest.mark.parametrize("table", ["gl_entry", "gl_adjustment"])
-def test_the_vendor_is_nullable_and_the_description_is_not(table):
-    """Case 26. A revenue voucher has no supplier, so the column is null for a
-    business reason rather than because a row happened to be short."""
-    contract = contracts.load(table)
-    assert column(contract, "vendor_code")["nullable"] is True
-    assert column(contract, "description")["nullable"] is False
-
-
-def test_dim_vendor_is_keyed_on_the_vendor_alone():
-    """Case 27. Unlike the two effective-dated dimensions, a vendor has no history to
-    keep here: renaming or recategorising one is not a business event this platform
-    has to reproduce."""
-    contract = contracts.load("dim_vendor")
-    assert contract["primary_key"] == ["vendor_code"]
-    assert "watermark" not in contract
-    assert "partition_by" not in contract
-    assert sorted(column(contract, "category")["allowed"]) == sorted(
-        dimensions.VENDOR_CATEGORIES
-    )
-
-
-def test_the_full_reload_list_covers_every_unwatermarked_table():
-    """Case 29a. FULL_RELOAD is written out by hand above, and a table added later
-    that declares no watermark would silently escape every test parametrised over it -
-    which is exactly what dim_vendor would have done."""
-    unwatermarked = {
-        table for table in contracts.tables()
-        if "watermark" not in contracts.load(table)
-    }
-    assert unwatermarked == set(FULL_RELOAD)

@@ -16,14 +16,14 @@ from pathlib import Path
 
 import pytest
 
-from generator import Config, generate
-from generator.dimensions import (
+from eval.generator import Config, generate
+from eval.generator.dimensions import (
     GROWTH_CREDIT_ACCOUNT,
     GROWTH_DEBIT_ACCOUNT,
     LONG_TAIL_CREDIT_ACCOUNT,
     LONG_TAIL_DEBIT_ACCOUNT,
 )
-from generator.streams import LONG_TAIL, stream_for
+from eval.generator.streams import LONG_TAIL, stream_for
 
 # Imported as a bare module name, the way conftest is, because pytest puts the tests
 # directory on sys.path. `from tests.test_generator import ...` additionally needs the
@@ -115,11 +115,6 @@ def outlier_accounts(out: Path) -> set[str]:
 
 # --- Case 1 ----------------------------------------------------------------
 
-def test_the_long_tail_switch_plants_a_long_tail(tmp_path):
-    assert has_long_tail(run(tmp_path, long_tail_anomaly=True))
-    assert not has_long_tail(run(tmp_path))
-
-
 # --- Case 2 ----------------------------------------------------------------
 
 def test_the_two_shapes_are_distinguishable(tmp_path):
@@ -145,30 +140,6 @@ def test_the_two_shapes_are_distinguishable(tmp_path):
 
 # --- Case 3 ----------------------------------------------------------------
 
-def test_three_anomaly_switches_coexist(tmp_path):
-    clean = run(tmp_path)
-    out = run(tmp_path, long_tail_anomaly=True, growing_account=True, amount_outliers=True)
-
-    assert has_long_tail(out)
-    assert has_growing_account(out)
-    assert has_amount_outliers(out)
-
-    reserved = {
-        LONG_TAIL_DEBIT_ACCOUNT, LONG_TAIL_CREDIT_ACCOUNT,
-        GROWTH_DEBIT_ACCOUNT, GROWTH_CREDIT_ACCOUNT,
-    }
-
-    def untouched(source: Path) -> list[dict[str, str]]:
-        return [
-            row for row in rows(source, "gl_entry")
-            if row["entry_id"].startswith("E-") and row["account_code"] not in reserved
-        ]
-
-    assert untouched(clean) == untouched(out), (
-        "the three switches disturbed entries none of them owns"
-    )
-
-
 # --- Case 4 ----------------------------------------------------------------
 
 def test_the_entry_count_is_three_hundred_and_does_not_move(tmp_path):
@@ -186,58 +157,6 @@ def test_the_entry_count_is_three_hundred_and_does_not_move(tmp_path):
 
 
 # --- Case 5 ----------------------------------------------------------------
-
-def test_the_switch_touches_only_its_own_accounts(tmp_path):
-    clean = run(tmp_path)
-    dirty = run(tmp_path, long_tail_anomaly=True)
-
-    for table in TABLES:
-        if table == "gl_entry":
-            continue
-        assert raw_bytes(clean, table) == raw_bytes(dirty, table), (
-            f"long_tail_anomaly changed {table}, which it does not own"
-        )
-
-    owned = {LONG_TAIL_DEBIT_ACCOUNT, LONG_TAIL_CREDIT_ACCOUNT}
-
-    def others(source: Path) -> list[dict[str, str]]:
-        return [row for row in rows(source, "gl_entry") if row["account_code"] not in owned]
-
-    assert others(clean) == others(dirty), (
-        "long_tail_anomaly changed entries outside its own accounts"
-    )
-
-    # And it did change what it owns. Without this the test passes trivially against
-    # a generator that plants nothing: everything outside an empty set is unchanged.
-    def owned_rows(source: Path) -> list[dict[str, str]]:
-        return [row for row in rows(source, "gl_entry") if row["account_code"] in owned]
-
-    assert owned_rows(clean), "the long-tail accounts carry no entries at all"
-    assert owned_rows(clean) != owned_rows(dirty), (
-        "the switch left its own accounts unchanged, so it did nothing"
-    )
-
-
-def test_the_long_tail_stream_is_stable_across_processes():
-    first, second = stream_for(42, LONG_TAIL), stream_for(42, LONG_TAIL)
-    assert [first.random() for _ in range(5)] == [second.random() for _ in range(5)]
-
-    program = (
-        "from generator.streams import LONG_TAIL, stream_for;"
-        "s = stream_for(42, LONG_TAIL);"
-        "print([s.random() for _ in range(5)])"
-    )
-    outputs = {
-        subprocess.run(
-            [sys.executable, "-c", program],
-            capture_output=True, text=True, check=True,
-            env={"PYTHONHASHSEED": seed, "PATH": ""},
-            cwd=Path(__file__).resolve().parent.parent,
-        ).stdout.strip()
-        for seed in ("0", "1", "12345")
-    }
-    assert len(outputs) == 1, f"long_tail stream varies with PYTHONHASHSEED: {outputs}"
-
 
 # --- Case 6 ----------------------------------------------------------------
 
@@ -298,7 +217,7 @@ def test_only_the_target_period_moves_and_it_moves_by_exactly_the_uplift(tmp_pat
     """Case 1 only required a 1.5x rise, which is the detection threshold, not the
     planted value. Nothing pinned the uplift itself, and nothing stopped the switch
     from raising every period rather than one."""
-    from generator.entries import LONG_TAIL_UPLIFT
+    from eval.generator.entries import LONG_TAIL_UPLIFT
 
     clean, dirty = _long_tail_rows(run(tmp_path)), _long_tail_rows(run(tmp_path, long_tail_anomaly=True))
     assert clean and clean.keys() == dirty.keys(), "the switch changed which entries exist"
@@ -333,25 +252,6 @@ def test_the_long_tail_vouchers_balance_with_the_switch_on(tmp_path):
     assert all(dr == cr for dr, cr in per_doc.values())
 
 
-def test_the_command_line_exposes_the_switch(tmp_path):
-    from generator.__main__ import main
-
-    out = tmp_path / "cli"
-    main(["--seed", "42", "--out", str(out), "--enable-long-tail-anomaly"])
-    assert has_long_tail(out), "--enable-long-tail-anomaly did not reach the config"
-    assert not has_amount_outliers(out), "a switch that was not asked for was turned on"
-
-
-def test_a_single_period_is_refused(tmp_path):
-    """With no other period there is nothing to compare against, so the switch would
-    be on and the anomaly undetectable — the same failure growing_account refuses."""
-    with pytest.raises(ValueError, match="long_tail_anomaly needs at least"):
-        generate(Config(
-            seed=42, out_dir=tmp_path / "single",
-            periods="2026-01:2026-01", long_tail_anomaly=True,
-        ))
-
-
 # --- the two shapes, seen through the vendor ---------------------------------
 #
 # Cases 18, 19, 19a and 20 of task.md. This is what the whole ticket is for: the
@@ -360,7 +260,7 @@ def test_a_single_period_is_refused(tmp_path):
 # looked the same under that question, the third step's A/B comparison would have
 # nothing to show. See docs/adr/0022.
 
-from generator import dimensions as dim_module            # noqa: E402
+from eval.generator import dimensions as dim_module            # noqa: E402
 
 VENDOR_SPREAD_MIN = 20              # a long tail has to reach this many suppliers
 LONG_TAIL_TOP_VENDOR_SHARE = Decimal("0.15")

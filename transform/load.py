@@ -1,21 +1,20 @@
-"""Landing the staging layer in Postgres, so dbt has something to declare as a source.
+"""Landing the raw layer in Postgres, so dbt has something to declare as a source.
 
-`transform/spark/` writes Parquet and `docs/adr/0026` settles that this is what staging
-is. dbt-postgres can only model tables that are already in Postgres, so something has to
-move them across, and this is it: pyarrow reads, psycopg copies, and Spark never opens a
-database connection.
+The raw layer is Parquet on disk and dbt-postgres can only model tables that are already
+in Postgres, so something has to move them across, and this is it: pyarrow reads and
+psycopg copies, in binary, one table per model.
 
-The schema is called `landing`, not `staging`. `docs/adr/0026` already owns the name
-staging for the Parquet layer, and one name for two things is the failure this
-repository argues against everywhere else. `landing` holds no answer that
-`data/staging/` does not already hold.
+It lands the source tables as they arrived - text, exactly the columns each contract
+declares - and nothing else. Every transformation after this is a dbt model, which is
+what puts the whole graph in one manifest: the hop this module performs is the only edge
+that is not a `ref()`.
 
 Drop, create and copy run inside one transaction. Postgres makes DDL transactional, so
 a load that dies halfway leaves the previous table exactly as it was rather than a
 half-filled one - which matters because the alternative is a mart quietly built on a
 fraction of the ledger.
 
-    python -m transform.load --staging data/staging --raw data/raw
+    python -m transform.load --raw data/raw
 
 See docs/adr/0034.
 """
@@ -25,7 +24,7 @@ from pathlib import Path
 
 from transform import db
 
-__all__ = ["MODELS", "UnmappedType", "EmptyStagingModel", "postgres_schema",
+__all__ = ["MODELS", "UnmappedType", "EmptyPartitionedTable", "postgres_schema",
            "copy_rows", "load_model",
            "load_all", "main"]
 
@@ -39,30 +38,37 @@ class UnmappedType(TypeError):
     """
 
 
-# Where each model is read from, and which columns are landed.
+# The six source tables, landed as they arrived. dbt builds the dimensions, the facts
+# and the aggregate from these, so its graph starts where the data starts and the hop
+# from CSV to Postgres is the only thing that happens before dbt sees anything. That is
+# what makes the impact list complete: every edge from a source column to a model is in
+# the manifest rather than hand-declared.
 #
-# `dim_vendor` is the exception in both directions. It is not effective-dated, so
-# `transform/spark/scd2.py` does not build it and there is no staging form to read; and
-# raw rows carry `_first_run_id` and `_last_run_id`, which are not landed, because
-# ingestion metadata is reached through the run record. See docs/adr/0020 and 0034.
-STAGING_MODELS = (
-    "fct_gl_entry",
-    "fct_gl_adjustment",
-    "agg_monthly_balance",
-    "dim_account",
-    "dim_cost_center",
-    "dim_fx_rate",
-)
-RAW_MODELS = {"dim_vendor": "dim_vendor"}
-MODELS = STAGING_MODELS + tuple(RAW_MODELS)
+# Raw holds text, so these tables hold text. Typing is the first thing the models do,
+# which keeps the question "did the source really say that" answerable in Postgres and
+# not only in Parquet.
+RAW_MODELS = {
+    "gl_entry": "gl_entry",
+    "gl_adjustment": "gl_adjustment",
+    "dim_account_src": "dim_account_src",
+    "dim_cost_center_src": "dim_cost_center_src",
+    "dim_vendor": "dim_vendor",
+    "fx_rate": "fx_rate",
+}
+MODELS = tuple(RAW_MODELS)
 
-# The staging models partitioned by accounting period. The column lives in the
-# directory name rather than in the Parquet files, so pyarrow has to be told what type
-# to give it back: left to infer, it produces a dictionary type, which `postgres_schema`
-# refuses rather than guessing at - correctly, but the load would stop on a correct
-# layer. See docs/adr/0026 and 0041.
-PARTITIONED_MODELS = ("fct_gl_entry", "fct_gl_adjustment", "agg_monthly_balance")
+# The two entry tables are partitioned by accounting period in the raw layer, as Hive
+# directories. The column lives in the directory name rather than in the Parquet files,
+# so pyarrow has to be told what type to give it back: left to infer, it produces a
+# dictionary type, which `postgres_schema` refuses rather than guessing at - correctly,
+# but the load would stop on a correct layer.
+PARTITIONED_MODELS = ("gl_entry", "gl_adjustment")
 PARTITION_COLUMN = "accounting_period"
+
+# The two identifiers ingest stamps on a raw row: the run that first landed the key and
+# the run that last wrote the file. Landed for the entry tables only, because a mart row
+# names the run that landed its source (docs/adr/0038) and a dimension version does not.
+PROVENANCE = ("_first_run_id", "_last_run_id")
 
 # How many rows to hand the copy at a time. Large enough that the round trips do not
 # dominate, small enough that a fact table does not have to be resident to be written.
@@ -120,33 +126,34 @@ def copy_types(schema) -> list[str]:
     return names
 
 
-def parquet_dir(staging_dir, raw_dir, model: str) -> Path:
-    if model in RAW_MODELS:
-        from ingest import raw as raw_layer
+def parquet_dir(raw_dir, model: str) -> Path:
+    from ingest import raw as raw_layer
 
-        return raw_layer.table_dir(raw_dir, RAW_MODELS[model])
-    return Path(staging_dir) / model
+    return raw_layer.table_dir(raw_dir, RAW_MODELS[model])
 
 
-def columns_for(model: str) -> list[str] | None:
-    """Which columns to land. None means all of them.
+def columns_for(model: str) -> list[str]:
+    """Which columns to land, in the order the table gets them.
 
-    A staging model is landed whole: `transform/spark/` has already decided what
-    belongs in it. A raw-sourced model is projected to what its contract declares.
+    What the contract declares, and nothing else for a dimension. An entry table also
+    gets the two run identifiers and the accounting period it was partitioned by - the
+    period because the models key on it rather than re-deriving it from the date, and
+    the identifiers because a mart row has to be able to name the run that landed it.
     """
-    if model not in RAW_MODELS:
-        return None
     from ingest import contracts, raw as raw_layer
 
-    return raw_layer.columns_of(contracts.load(RAW_MODELS[model]))
+    declared = list(raw_layer.columns_of(contracts.load(RAW_MODELS[model])))
+    if model in PARTITIONED_MODELS:
+        return declared + list(PROVENANCE) + [PARTITION_COLUMN]
+    return declared
 
 
-class EmptyStagingModel(FileNotFoundError):
-    """A partitioned staging model holds no partitions at all.
+class EmptyPartitionedTable(FileNotFoundError):
+    """A partitioned source table holds no partitions at all.
 
     Not an empty table: with no Parquet file anywhere under it there is no schema to
-    read, so there is nothing to create the landing table from. It means the staging
-    build has not run, or ran over a raw layer with no rows in it. Saying so is better
+    read, so there is nothing to create the landing table from. It means the load has
+    not run, or ran over a source with no rows in it. Saying so is better
     than a message about Parquet schema inference, and stopping is better than
     inventing a shape - see docs/product.md, breaking is better than drifting.
     """
@@ -158,7 +165,7 @@ def read_table(directory: Path, columns: list[str] | None, *, partitioned: bool 
     A partitioned model is read as a dataset with the partition field declared as a
     plain string. Hive discovery would otherwise hand back a dictionary-encoded column,
     and `postgres_schema` matches types exactly and stops on anything it has not seen -
-    so a correct staging layer would fail to load, with a message about a type rather
+    so a correct raw layer would fail to load, with a message about a type rather
     than about partitioning.
 
     Whether to read it that way comes from the model, not from what happens to be on
@@ -175,9 +182,9 @@ def read_table(directory: Path, columns: list[str] | None, *, partitioned: bool 
 
     if partitioned:
         if not any(directory.rglob("*.parquet")):
-            raise EmptyStagingModel(
+            raise EmptyPartitionedTable(
                 f"{directory} holds no partitions, so there is no schema to land. "
-                f"Run the staging build first."
+                f"Run the ingest load first."
             )
         partitioning = ds.HivePartitioning(
             pa.schema([(PARTITION_COLUMN, pa.string())])
@@ -205,9 +212,9 @@ def copy_rows(cursor, schema: str, model: str, table) -> None:
                 copy.write_row(row)
 
 
-def load_model(connection, staging_dir, raw_dir, schema: str, model: str) -> int:
+def load_model(connection, raw_dir, schema: str, model: str) -> int:
     """Drop, create and copy one model, in one transaction."""
-    directory = parquet_dir(staging_dir, raw_dir, model)
+    directory = parquet_dir(raw_dir, model)
     table = read_table(directory, columns_for(model),
                        partitioned=model in PARTITIONED_MODELS)
     definition = ", ".join(
@@ -222,7 +229,7 @@ def load_model(connection, staging_dir, raw_dir, schema: str, model: str) -> int
     return table.num_rows
 
 
-def load_all(staging_dir, raw_dir, schema: str | None = None,
+def load_all(raw_dir, schema: str | None = None,
              connection=None, models=None) -> dict[str, int]:
     """Every model, into the landing schema. Returns what each one landed."""
     values = db.settings()
@@ -231,7 +238,7 @@ def load_all(staging_dir, raw_dir, schema: str | None = None,
     connection = connection or db.connection_from(values)
     try:
         return {
-            model: load_model(connection, staging_dir, raw_dir, schema, model)
+            model: load_model(connection, raw_dir, schema, model)
             for model in (models or MODELS)
         }
     finally:
@@ -241,13 +248,12 @@ def load_all(staging_dir, raw_dir, schema: str | None = None,
 
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(prog="transform.load", description=__doc__)
-    parser.add_argument("--staging", default="data/staging")
     parser.add_argument("--raw", default="data/raw")
     parser.add_argument("--schema", default=None,
                         help="the landing schema; defaults to POSTGRES_LANDING_SCHEMA")
     args = parser.parse_args(argv)
 
-    landed = load_all(args.staging, args.raw, args.schema)
+    landed = load_all(args.raw, args.schema)
     for model, rows in landed.items():
         print(f"{model}: {rows} rows")
     return 0

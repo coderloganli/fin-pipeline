@@ -1,6 +1,6 @@
 """Command line entry point.
 
-    python -m generator --seed 42 --periods 2026-01:2026-12                         --entries-per-period 100000 --out data/source
+    python -m eval.generator --seed 42 --periods 2026-01:2026-12                         --entries-per-period 100000 --out data/source
 
 Step four drives scale from here, so row count, date range and output directory are
 all parameters rather than constants.
@@ -24,7 +24,7 @@ SWITCHES = (
 
 
 def main(argv: list[str] | None = None) -> None:
-    parser = argparse.ArgumentParser(prog="generator", description=__doc__)
+    parser = argparse.ArgumentParser(prog="eval.generator", description=__doc__)
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--periods", default="2026-01:2026-12", help="YYYY-MM:YYYY-MM")
     parser.add_argument("--entries-per-period", type=int, default=1_000)

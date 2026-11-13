@@ -160,7 +160,7 @@ def downstream_impact(tables: list[str] | None = None) -> str:
     """The models a change to these source tables would break.
 
     dbt's graph starts at the Postgres landing tables; the hop from a CSV to one of
-    them happens inside `transform/spark/` and appears in no manifest. So each contract
+    them is the copy `transform/load.py` performs, which is no model. So each contract
     declares the dbt sources it feeds, and this walks the manifest downward from
     them. See docs/adr/0035.
 

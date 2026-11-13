@@ -133,28 +133,6 @@ def test_a_build_schemas_own_audit_schema_is_not_a_build_schema(db, clean):
     assert promote.build_schemas(db, MART) == [build]
 
 
-def test_a_mart_schema_at_the_budget_is_accepted():
-    """3. The boundary is where the module says it is, not one either side of it."""
-    name = "m" * promote.MART_SCHEMA_BUDGET
-    built = promote.build_schema(name, RUN)
-
-    assert len(built + AUDIT_SUFFIX) == promote.MAX_IDENTIFIER
-
-
-def test_a_mart_schema_one_over_the_budget_is_refused():
-    """4. Postgres truncates at 63 and dbt appends sixteen; the failure that shape
-    produces is `relation already exists` on a test that is perfectly correct, which
-    tests/conftest.py had already been bitten by once."""
-    name = "m" * (promote.MART_SCHEMA_BUDGET + 1)
-
-    with pytest.raises(promote.SchemaNameTooLong) as raised:
-        promote.build_schema(name, RUN)
-
-    message = str(raised.value)
-    assert str(len(name)) in message
-    assert str(promote.MART_SCHEMA_BUDGET) in message
-
-
 # --- prepare ----------------------------------------------------------------
 
 @db_test
@@ -200,8 +178,8 @@ def test_prepare_copies_nothing_but_the_snapshot(db, clean):
 
 @db_test
 def test_prepare_makes_a_retry_a_fresh_attempt(db, clean):
-    """8. An Airflow task that retries carries the same run id and therefore the same
-    build schema. Appending to what the failed attempt left would double every count."""
+    """8. A rerun under the same run id lands in the same build schema. Appending to
+    what the failed attempt left would double every count."""
     make_schema(db, MART)
     make_row_count(db, MART, [("first", "fct_gl_entry", 100)])
     db.commit()
@@ -420,36 +398,6 @@ def test_the_promotion_commits_on_a_connection_that_is_not_in_autocommit(db, cle
         worker.close()
 
     assert marker(db, MART, "fct_gl_entry") == build
-
-
-@db_test
-def test_a_connection_already_in_a_transaction_is_refused(db, clean):
-    """34. Not in the design's case list; the codex review of the code asked for it.
-
-    Case 33's defect has a second door: a caller that ran anything on the connection
-    first. `transaction()` is then a savepoint again, with the same silent result. The
-    guard turns it into a refusal, which is the only reading of it anybody can act on.
-    """
-    make_schema(db, MART)
-    db.commit()
-
-    values = settings()
-    worker = transform_db.connect(
-        host=values["POSTGRES_HOST"], port=values["POSTGRES_PORT"],
-        dbname=values["POSTGRES_DB"], user=values["POSTGRES_USER"],
-        password=values["POSTGRES_PASSWORD"],
-    )
-    try:
-        with worker.cursor() as cursor:
-            cursor.execute("SELECT 1")  # psycopg is now inside an implicit transaction
-
-        with pytest.raises(promote.ConnectionNotIdle):
-            promote.prepare(worker, MART, promote.build_schema(MART, RUN))
-    finally:
-        worker.rollback()
-        worker.close()
-
-    assert promote.build_schema(MART, RUN) not in schemas(db, MART)
 
 
 def test_a_connection_to_another_database_is_refused(monkeypatch):

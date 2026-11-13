@@ -5,7 +5,7 @@ Cases 15, 16 and 18-30 of task.md.
 docs/adr/0050 puts `anomaly_flag` in a schema of its own, written after the mart has
 been published, because a model that fails must not be able to stop the mart being
 published. docs/adr/0051 trains on the mart rather than the landing layer, so the model
-only ever sees figures that passed all six gates. docs/adr/0054 is what CI gates here:
+only ever sees figures that passed all five gates. docs/adr/0054 is what CI gates here:
 behaviour, plus the anomalies the generator planted.
 
 The cases that need a mart use the suite's own schemas; the two that only need the
@@ -293,7 +293,7 @@ def test_a_missing_mart_is_reported_with_the_command_that_builds_it(db):
 
 # --- cases 29 and 30: the anomalies the generator planted -------------------
 #
-# Both shapes are planted on the first cost centre - `centres[0]` in generator/entries.py
+# Both shapes are planted on the first cost centre - `centres[0]` in eval/generator/entries.py
 # - so the whole key is assertable. Asserting the account alone would pass on a flag for
 # the same account in some other cost centre, which is a different row and not the one
 # that was planted.
@@ -322,7 +322,7 @@ def test_the_planted_concentrated_rise_reaches_the_queue(planted):
     """Case 29. The one gate here that is about effect rather than behaviour, and it is
     defensible because the answer is constructed rather than judged: the generator put
     the rise there, so a model that misses it has stopped working. See docs/adr/0054."""
-    from generator.dimensions import GROWTH_DEBIT_ACCOUNT
+    from eval.generator.dimensions import GROWTH_DEBIT_ACCOUNT
 
     flagged = {(r["account_code"], r["cost_center_code"], r["accounting_period"])
                for r in planted([PLANTED_PERIOD])}
@@ -338,7 +338,7 @@ def test_the_planted_long_tail_reaches_the_queue(planted):
     """Case 30. The shape sorting by amount cannot find: a flat entry count against
     rising amounts. It has to reach the queue by the same route as the concentrated
     one, because the whole comparison downstream depends on both being there."""
-    from generator.dimensions import LONG_TAIL_DEBIT_ACCOUNT
+    from eval.generator.dimensions import LONG_TAIL_DEBIT_ACCOUNT
 
     flagged = {(r["account_code"], r["cost_center_code"], r["accounting_period"])
                for r in planted([PLANTED_PERIOD])}

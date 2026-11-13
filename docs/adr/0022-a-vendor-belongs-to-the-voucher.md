@@ -22,7 +22,7 @@ the same rule and is never empty.
 `vendor_code` is declared `nullable: true`; an empty CSV field is null, which the
 contracts already say.
 
-**The dimension comes from a stream of its own.** `generator/streams.py` gains
+**The dimension comes from a stream of its own.** `eval/generator/streams.py` gains
 `VENDORS = "vendors"`, and building `dim_vendor` is the only thing that draws from it.
 
 **The assignment itself draws nothing.** A voucher's supplier and wording are chosen by

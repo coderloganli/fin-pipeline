@@ -1,5 +1,12 @@
 # Selective recomputation bounds what is written, not what is read
 
+> **Superseded (2026-10-04).** The mart is rebuilt whole on every run. Rebuilding tens
+> of thousands of rows in Postgres costs seconds, so bounding what gets written buys
+> nothing - the cost this record was answering belonged to rewriting Parquet partitions,
+> not to the data. The half that survives is the closure itself: `transform/periods.py`
+> still derives which periods a change reaches, and `judge` still reads it to decide
+> what to re-judge.
+
 summary: A backfill rewrites only the dirty staging partitions, but still reads the
 whole fact table for the two columns that decide the dense grid and the account type;
 the acceptance criterion is about modification times, and reading is columnar.
